@@ -8,9 +8,11 @@
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use aws_sdk_s3::primitives::ByteStream;
+use ferro_stash_codec::{create_codec, Codec};
 use ferro_stash_core::condition::Condition;
 use ferro_stash_core::error::{FerroStashError, Result};
 use ferro_stash_core::event::Event;
@@ -48,12 +50,21 @@ pub enum RotationStrategy {
     SizeAndTime,
 }
 
+/// Hard cap on buffered lines so an idle/never-rotating stream cannot grow the
+/// in-RAM buffer without bound between `output()` calls (see `should_rotate`).
+const S3_MAX_BUFFERED_LINES: usize = 1_000_000;
+
 #[derive(Debug)]
 pub struct S3Output {
     config: S3OutputConfig,
     condition: Option<Condition>,
+    /// Codec used to serialize each event before buffering.
+    codec: Box<dyn Codec>,
     /// In-memory buffer for events pending upload.
     buffer: Mutex<Vec<String>>,
+    /// When the current (post-rotation) buffer first received a line; drives
+    /// time-based rotation. `None` while the buffer is empty.
+    buffer_started: Mutex<Option<Instant>>,
     /// Bytes written to the current file.
     current_bytes: AtomicU64,
     /// Sequence number for file naming.
@@ -99,6 +110,10 @@ impl S3Output {
         let endpoint = settings.get_string("endpoint");
         let force_path_style = settings.get_bool("force_path_style").unwrap_or(false);
 
+        // Build the codec used to serialize event payloads (config error => fail loud),
+        // mirroring the kafka/redis outputs. Honors `codec => plain`/`line`/`json`/…
+        let codec_impl = create_codec(&codec, settings)?;
+
         Ok(Self {
             config: S3OutputConfig {
                 bucket,
@@ -115,7 +130,9 @@ impl S3Output {
                 force_path_style,
             },
             condition,
+            codec: codec_impl,
             buffer: Mutex::new(Vec::new()),
+            buffer_started: Mutex::new(None),
             current_bytes: AtomicU64::new(0),
             sequence: AtomicU64::new(0),
             client: OnceCell::new(),
@@ -236,6 +253,22 @@ impl S3Output {
         Ok(())
     }
 
+    /// Serialize an event to a buffer line via the configured codec.
+    ///
+    /// The codec yields bytes; S3 lines are stored as `String`, so non-UTF-8
+    /// codec output is lossily decoded (the default `plain`/`json` codecs always
+    /// produce UTF-8).
+    fn encode_line(&self, event: &Event) -> Result<String> {
+        let bytes = self
+            .codec
+            .encode(event)
+            .map_err(|e| FerroStashError::Output {
+                plugin: "s3".to_string(),
+                message: format!("codec encode error: {e}"),
+            })?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
     /// Generate an S3 key for the current file.
     fn generate_key(&self) -> String {
         let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
@@ -243,13 +276,101 @@ impl S3Output {
         format!("{}{}-{:04}.log", self.config.prefix, ts, seq)
     }
 
-    /// Check if the buffer should be rotated (flushed) based on size.
-    fn should_rotate(&self) -> bool {
-        match self.config.rotation_strategy {
-            RotationStrategy::Size | RotationStrategy::SizeAndTime => {
-                self.current_bytes.load(Ordering::Relaxed) as usize >= self.config.size_file
+    /// Whether the current buffer has aged past `time_file` seconds.
+    ///
+    /// `started` is the instant the current (post-rotation) buffer first received
+    /// a line; `None` means the buffer is empty, so nothing to rotate on time.
+    fn time_elapsed(&self, started: Option<Instant>) -> bool {
+        match started {
+            Some(start) => start.elapsed().as_secs() >= self.config.time_file,
+            None => false,
+        }
+    }
+
+    /// Check if the buffer should be rotated (flushed).
+    ///
+    /// Size-based rotation fires for `Size`/`SizeAndTime` when the byte counter
+    /// reaches `size_file`. Time-based rotation fires for `Time`/`SizeAndTime`
+    /// when the buffer has aged past `time_file` seconds.
+    ///
+    /// NOTE (idle-timer residual): rotation is only evaluated when `output()`
+    /// runs (i.e. when events arrive). A buffer that goes idle after a partial
+    /// fill will not rotate on a wall-clock timer — it rotates on the *next*
+    /// `output()` call after `time_file` has elapsed, or on `flush()`/`close()`.
+    /// A fully-correct background idle-flush timer is out of scope here.
+    fn should_rotate(&self, started: Option<Instant>, buffered_lines: usize) -> bool {
+        let size_hit = matches!(
+            self.config.rotation_strategy,
+            RotationStrategy::Size | RotationStrategy::SizeAndTime
+        ) && self.current_bytes.load(Ordering::Relaxed) as usize
+            >= self.config.size_file;
+
+        let time_hit = matches!(
+            self.config.rotation_strategy,
+            RotationStrategy::Time | RotationStrategy::SizeAndTime
+        ) && self.time_elapsed(started);
+
+        // Safety net against unbounded RAM growth for a stream that never trips
+        // size/time rotation (e.g. `Time` strategy with a very long interval and
+        // a steady trickle of events): force a rotation once the buffer is huge.
+        let cap_hit = buffered_lines >= S3_MAX_BUFFERED_LINES;
+
+        size_hit || time_hit || cap_hit
+    }
+
+    /// Lock the line buffer, mapping a poisoned lock to a plugin error.
+    fn lock_buffer(&self) -> Result<std::sync::MutexGuard<'_, Vec<String>>> {
+        self.buffer.lock().map_err(|e| FerroStashError::Output {
+            plugin: "s3".to_string(),
+            message: format!("buffer lock poisoned: {e}"),
+        })
+    }
+
+    /// Lock the buffer-start timestamp, mapping a poisoned lock to a plugin error.
+    fn lock_started(&self) -> Result<std::sync::MutexGuard<'_, Option<Instant>>> {
+        self.buffer_started
+            .lock()
+            .map_err(|e| FerroStashError::Output {
+                plugin: "s3".to_string(),
+                message: format!("buffer-start lock poisoned: {e}"),
+            })
+    }
+
+    /// Upload a detached payload; on failure, restore it (and its byte count) to
+    /// the front of the buffer so events are never lost on a transient error.
+    ///
+    /// The pipeline can then retry or DLQ on the next `output()`/`flush()`. Any
+    /// events buffered concurrently during the failed upload are preserved by
+    /// re-prepending the detached lines ahead of them.
+    async fn upload_or_restore(
+        &self,
+        key: &str,
+        payload: Vec<String>,
+        detached_bytes: u64,
+    ) -> Result<()> {
+        match self.upload(key, &payload).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // Restore the payload ahead of anything buffered while we awaited.
+                let mut buf = self.lock_buffer()?;
+                let mut started = self.lock_started()?;
+                if buf.is_empty() {
+                    *buf = payload;
+                } else {
+                    let mut restored = payload;
+                    restored.append(&mut buf);
+                    *buf = restored;
+                }
+                self.current_bytes
+                    .fetch_add(detached_bytes, Ordering::Relaxed);
+                // Re-arm the rotation timer if it was cleared by the take. Residual:
+                // this resets the clock to "now" rather than the original first-write
+                // time, so a failed time-rotation effectively restarts the interval.
+                if started.is_none() && !buf.is_empty() {
+                    *started = Some(Instant::now());
+                }
+                Err(e)
             }
-            RotationStrategy::Time => false, // Time-based rotation handled externally
         }
     }
 }
@@ -261,65 +382,69 @@ impl OutputPlugin for S3Output {
     }
 
     async fn output(&self, events: Vec<Event>) -> Result<()> {
+        // Encode events via the configured codec *before* taking the lock so a
+        // codec error fails without mutating buffer state.
+        let mut new_lines: Vec<(String, u64)> = Vec::with_capacity(events.len());
+        for event in &events {
+            let line = self.encode_line(event)?;
+            let line_bytes = line.len() as u64;
+            new_lines.push((line, line_bytes));
+        }
+
         // Buffer the events and, if rotation triggers, detach the payload to upload.
         // The lock is released before the (async) upload so we never hold a
-        // std::sync::Mutex across an await point.
-        let rotated: Option<(String, Vec<String>)> = {
-            let mut buf =
-                self.buffer
-                    .lock()
-                    .map_err(|e| FerroStashError::Output {
-                        plugin: "s3".to_string(),
-                        message: format!("buffer lock poisoned: {e}"),
-                    })?;
+        // std::sync::Mutex across an await point. We record the detached byte count
+        // so it can be restored if the upload fails.
+        let rotated: Option<(String, Vec<String>, u64)> = {
+            let mut buf = self.lock_buffer()?;
+            let mut started = self.lock_started()?;
 
-            for event in &events {
-                let line = event.to_json_string();
-                let line_bytes = line.len() as u64;
+            for (line, line_bytes) in new_lines {
+                // Stamp the buffer's first-write time so time-rotation can fire.
+                if started.is_none() {
+                    *started = Some(Instant::now());
+                }
                 buf.push(line);
                 self.current_bytes.fetch_add(line_bytes, Ordering::Relaxed);
             }
 
-            // Check for size-based rotation.
-            if self.should_rotate() {
+            // Check for size-/time-/cap-based rotation.
+            if self.should_rotate(*started, buf.len()) {
                 let key = self.generate_key();
                 let payload = std::mem::take(&mut *buf);
-                self.current_bytes.store(0, Ordering::Relaxed);
-                Some((key, payload))
+                let detached_bytes = self.current_bytes.swap(0, Ordering::Relaxed);
+                *started = None;
+                Some((key, payload, detached_bytes))
             } else {
                 None
             }
         };
 
-        if let Some((key, payload)) = rotated {
-            self.upload(&key, &payload).await?;
+        if let Some((key, payload, detached_bytes)) = rotated {
+            self.upload_or_restore(&key, payload, detached_bytes).await?;
         }
 
         Ok(())
     }
 
     async fn flush(&self) -> Result<()> {
-        let rotated: Option<(String, Vec<String>)> = {
-            let mut buf =
-                self.buffer
-                    .lock()
-                    .map_err(|e| FerroStashError::Output {
-                        plugin: "s3".to_string(),
-                        message: format!("buffer lock poisoned: {e}"),
-                    })?;
+        let rotated: Option<(String, Vec<String>, u64)> = {
+            let mut buf = self.lock_buffer()?;
+            let mut started = self.lock_started()?;
 
             if buf.is_empty() {
                 None
             } else {
                 let key = self.generate_key();
                 let payload = std::mem::take(&mut *buf);
-                self.current_bytes.store(0, Ordering::Relaxed);
-                Some((key, payload))
+                let detached_bytes = self.current_bytes.swap(0, Ordering::Relaxed);
+                *started = None;
+                Some((key, payload, detached_bytes))
             }
         };
 
-        if let Some((key, payload)) = rotated {
-            self.upload(&key, &payload).await?;
+        if let Some((key, payload, detached_bytes)) = rotated {
+            self.upload_or_restore(&key, payload, detached_bytes).await?;
         }
 
         Ok(())
@@ -344,6 +469,7 @@ mod tests {
         routing::put,
         Router,
     };
+    use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
     use tokio::net::TcpListener;
 
@@ -536,6 +662,199 @@ mod tests {
         assert!(path.ends_with(".gz"), "gzip key should end with .gz: {path}");
         assert_eq!(enc.as_deref(), Some("gzip"));
         assert_eq!(&body[..2], &[0x1f, 0x8b], "body should be gzip-compressed");
+    }
+
+    /// Spawns a mock S3-compatible endpoint that always fails PUT object requests
+    /// with HTTP 500 (records the attempt count). Returns the base URL.
+    async fn spawn_failing_mock_s3() -> (String, Arc<AtomicUsize>) {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let handle = Arc::clone(&attempts);
+        let app = Router::new().route(
+            "/:bucket/*key",
+            put(move || {
+                let handle = Arc::clone(&handle);
+                async move {
+                    handle.fetch_add(1, Ordering::SeqCst);
+                    (StatusCode::INTERNAL_SERVER_ERROR, "boom")
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+        (format!("http://{addr}"), attempts)
+    }
+
+    #[tokio::test]
+    async fn test_s3_output_upload_failure_preserves_buffer() {
+        // Regression for finding #1: a transient PutObject error must NOT lose the
+        // buffered events — they stay in the buffer (and byte count) for retry/DLQ.
+        let (endpoint, attempts) = spawn_failing_mock_s3().await;
+        let settings = serde_json::json!({
+            "bucket": "b",
+            "prefix": "p/",
+            "endpoint": endpoint,
+            "force_path_style": true,
+            "access_key_id": "test",
+            "secret_access_key": "test",
+            "rotation_strategy": "size",
+            // Force rotation on the first event.
+            "size_file": 1,
+        });
+        let output = S3Output::from_config(&settings, None).expect("config");
+
+        // Rotation path: output() triggers an upload that fails.
+        let result = output.output(vec![Event::new("keep-me")]).await;
+        assert!(result.is_err(), "upload failure must surface an error");
+        assert!(attempts.load(Ordering::SeqCst) >= 1, "PutObject was attempted");
+
+        // The event is preserved in the buffer (not lost) and bytes are restored.
+        let buf = output.buffer.lock().expect("lock");
+        assert_eq!(buf.len(), 1, "buffered event must be retained on failure");
+        assert!(buf[0].contains("keep-me"));
+        assert!(
+            output.current_bytes.load(Ordering::Relaxed) > 0,
+            "byte counter must be restored on failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_s3_output_flush_failure_preserves_buffer() {
+        // Same protection on the flush() path.
+        let (endpoint, _attempts) = spawn_failing_mock_s3().await;
+        let settings = serde_json::json!({
+            "bucket": "b",
+            "prefix": "p/",
+            "endpoint": endpoint,
+            "force_path_style": true,
+            "access_key_id": "test",
+            "secret_access_key": "test",
+            // Large size so output() only buffers; flush() does the failing upload.
+            "size_file": 9_999_999,
+            "rotation_strategy": "size",
+        });
+        let output = S3Output::from_config(&settings, None).expect("config");
+
+        output
+            .output(vec![Event::new("flush-keep")])
+            .await
+            .expect("buffer only");
+        let result = output.flush().await;
+        assert!(result.is_err(), "flush upload failure must surface an error");
+
+        let buf = output.buffer.lock().expect("lock");
+        assert_eq!(buf.len(), 1, "flush failure must retain the event");
+        assert!(buf[0].contains("flush-keep"));
+    }
+
+    #[tokio::test]
+    async fn test_s3_output_time_rotation_fires() {
+        // Regression for finding #2: with a 0s time_file, the buffered events must
+        // rotate (upload) on the next output() call for both Time and SizeAndTime.
+        for strategy in ["time", "size_and_time"] {
+            let (endpoint, captured) = spawn_mock_s3().await;
+            let settings = serde_json::json!({
+                "bucket": "b",
+                "prefix": "p/",
+                "endpoint": endpoint,
+                "force_path_style": true,
+                "access_key_id": "test",
+                "secret_access_key": "test",
+                "rotation_strategy": strategy,
+                // Never rotate on size; rotate purely on elapsed time.
+                "size_file": 9_999_999,
+                "time_file": 0,
+            });
+            let output = S3Output::from_config(&settings, None).expect("config");
+
+            // First call buffers and stamps the start time; time_file=0 means the
+            // elapsed check is already satisfied, so it rotates immediately.
+            output
+                .output(vec![Event::new("tick")])
+                .await
+                .expect("output");
+
+            assert!(
+                output.buffer.lock().expect("lock").is_empty(),
+                "time rotation ({strategy}) must drain the buffer",
+            );
+            let objects = captured.lock().expect("lock");
+            assert_eq!(
+                objects.len(),
+                1,
+                "time rotation ({strategy}) must upload one object",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_s3_output_honors_plain_codec() {
+        // Regression for finding #3: the configured codec is used to serialize
+        // events. The `plain` codec emits the raw message (+newline), not JSON.
+        let (endpoint, captured) = spawn_mock_s3().await;
+        let settings = serde_json::json!({
+            "bucket": "b",
+            "prefix": "p/",
+            "endpoint": endpoint,
+            "force_path_style": true,
+            "access_key_id": "test",
+            "secret_access_key": "test",
+            "codec": "plain",
+        });
+        let output = S3Output::from_config(&settings, None).expect("config");
+
+        output
+            .output(vec![Event::new("plain-line")])
+            .await
+            .expect("output");
+        output.flush().await.expect("flush");
+
+        let objects = captured.lock().expect("lock");
+        assert_eq!(objects.len(), 1);
+        let body = String::from_utf8_lossy(&objects[0].2);
+        // Plain codec => raw message, no JSON braces/quotes around it.
+        assert!(body.contains("plain-line"), "body was {body}");
+        assert!(
+            !body.contains("\"message\""),
+            "plain codec must not emit JSON keys: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_s3_output_honors_json_codec() {
+        // The json codec produces a JSON object per event.
+        let (endpoint, captured) = spawn_mock_s3().await;
+        let settings = serde_json::json!({
+            "bucket": "b",
+            "prefix": "p/",
+            "endpoint": endpoint,
+            "force_path_style": true,
+            "access_key_id": "test",
+            "secret_access_key": "test",
+            "codec": "json",
+        });
+        let output = S3Output::from_config(&settings, None).expect("config");
+
+        output
+            .output(vec![Event::new("json-line")])
+            .await
+            .expect("output");
+        output.flush().await.expect("flush");
+
+        let objects = captured.lock().expect("lock");
+        assert_eq!(objects.len(), 1);
+        let body = String::from_utf8_lossy(&objects[0].2);
+        assert!(body.contains("\"message\""), "json codec body: {body}");
+        assert!(body.contains("json-line"), "json codec body: {body}");
+    }
+
+    #[test]
+    fn test_s3_output_unknown_codec_rejected() {
+        // An unknown codec must fail loudly at config time (like kafka/redis).
+        let settings = serde_json::json!({ "bucket": "b", "codec": "no-such-codec" });
+        assert!(S3Output::from_config(&settings, None).is_err());
     }
 
     /// Live smoke test against real S3 (or an S3-compatible store).

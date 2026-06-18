@@ -59,7 +59,9 @@ impl DatadogOutput {
         let codec = settings
             .get_string("codec")
             .unwrap_or_else(|| "json".to_string());
-        let batch_size = settings.get_u64("batch_size").unwrap_or(50) as usize;
+        // The parser accepts `batch_size => 0`, but `chunks(0)` panics. A batch of
+        // zero events is meaningless, so clamp to a minimum of 1.
+        let batch_size = (settings.get_u64("batch_size").unwrap_or(50) as usize).max(1);
         let use_ssl = settings.get_bool("use_ssl").unwrap_or(true);
         let source = settings
             .get_string("source")
@@ -171,6 +173,9 @@ impl DatadogOutput {
                     "message": message,
                     "ddsource": self.config.source,
                     "hostname": hostname,
+                    // Datadog reads the event time from `timestamp`/`date`; without it
+                    // the intake stamps ingest time instead of the actual event time.
+                    "timestamp": event.timestamp.to_rfc3339(),
                 });
 
                 if !self.config.service.is_empty() {
@@ -181,11 +186,12 @@ impl DatadogOutput {
                     entry["ddtags"] = serde_json::Value::String(self.config.tags.join(","));
                 }
 
-                // Include extra fields from the event.
+                // Include extra fields from the event, preserving their JSON types so
+                // numbers/booleans/objects stay native (string-coercion breaks facets).
                 for (key, value) in event.fields() {
                     if key != "message" && key != "host" && key != "@timestamp" && key != "@version"
                     {
-                        entry[key] = serde_json::Value::String(value.to_string_lossy());
+                        entry[key] = serde_json::Value::from(value.clone());
                     }
                 }
 
@@ -297,6 +303,57 @@ mod tests {
         assert_eq!(parsed[0]["ddsource"], "myapp");
         assert_eq!(parsed[0]["service"], "web");
         assert_eq!(parsed[0]["ddtags"], "env:test");
+    }
+
+    #[test]
+    fn test_datadog_batch_size_zero_rejected() {
+        // `batch_size => 0` would panic in `chunks(0)`; it must be clamped to 1.
+        let settings = serde_json::json!({ "api_key": "key", "batch_size": 0 });
+        let output = DatadogOutput::from_config(&settings, None).expect("config");
+        assert_eq!(output.config.batch_size, 1, "batch_size 0 must clamp to 1");
+    }
+
+    #[tokio::test]
+    async fn test_datadog_batch_size_zero_does_not_panic() {
+        // End-to-end guard: a 0 batch_size config must produce a working chunk
+        // iterator (1 POST for 1 event) rather than panicking.
+        let (host, requests, _key) = spawn_mock_intake(StatusCode::ACCEPTED).await;
+        let settings = serde_json::json!({
+            "api_key": "key",
+            "host": host,
+            "use_ssl": false,
+            "batch_size": 0,
+        });
+        let output = DatadogOutput::from_config(&settings, None).expect("config");
+        let result = output.output(vec![Event::new("ok")]).await;
+        assert!(result.is_ok());
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_datadog_payload_preserves_types_and_timestamp() {
+        let settings = serde_json::json!({ "api_key": "key" });
+        let output = DatadogOutput::from_config(&settings, None).expect("config");
+
+        let mut event = Event::new("typed");
+        event.set("count", ferro_stash_core::event::EventValue::Integer(42));
+        event.set("ok", ferro_stash_core::event::EventValue::Boolean(true));
+        let payload = output.format_datadog_payload(&[event]);
+        let parsed: Vec<serde_json::Value> =
+            serde_json::from_str(&payload).expect("valid JSON array");
+
+        // Numeric field stays numeric; boolean stays boolean (not string-coerced).
+        assert!(parsed[0]["count"].is_number(), "count must stay numeric");
+        assert_eq!(parsed[0]["count"], 42);
+        assert!(parsed[0]["ok"].is_boolean(), "ok must stay boolean");
+        assert_eq!(parsed[0]["ok"].as_bool(), Some(true));
+
+        // A timestamp attribute is emitted (so Datadog uses event time, not ingest).
+        assert!(
+            parsed[0]["timestamp"].is_string(),
+            "timestamp attribute must be present"
+        );
+        assert!(!parsed[0]["timestamp"].as_str().unwrap_or("").is_empty());
     }
 
     #[tokio::test]

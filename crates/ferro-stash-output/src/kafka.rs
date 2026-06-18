@@ -94,13 +94,40 @@ impl std::fmt::Debug for KafkaOutput {
 
 impl KafkaOutput {
     pub fn from_config(settings: &serde_json::Value, condition: Option<Condition>) -> Result<Self> {
-        let bootstrap_servers = settings
-            .get("bootstrap_servers")
-            .and_then(|v| v.as_str())
-            .unwrap_or("localhost:9092")
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .collect();
+        // `bootstrap_servers` accepts both the array form
+        // (`["b1:9092", "b2:9092"]`) and a comma-separated string
+        // (`"b1:9092,b2:9092"`). An empty/whitespace-only value is a config error
+        // rather than a silent fall-back to localhost.
+        let bootstrap_servers: Vec<String> = match settings.get("bootstrap_servers") {
+            Some(serde_json::Value::Array(arr)) => arr
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect(),
+            Some(serde_json::Value::String(s)) => s
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect(),
+            // Not configured at all => default broker (preserves prior behavior).
+            None => vec!["localhost:9092".to_string()],
+            // Any other JSON type is a misconfiguration.
+            Some(_) => {
+                return Err(FerroStashError::Output {
+                    plugin: "kafka".to_string(),
+                    message: "bootstrap_servers must be a string or array of strings".to_string(),
+                })
+            }
+        };
+        if bootstrap_servers.is_empty() {
+            return Err(FerroStashError::Output {
+                plugin: "kafka".to_string(),
+                message: "bootstrap_servers is empty".to_string(),
+            });
+        }
 
         let topic = settings
             .get_string("topic")
@@ -311,6 +338,41 @@ mod tests {
     fn test_kafka_output_missing_topic() {
         let settings = serde_json::json!({});
         assert!(KafkaOutput::from_config(&settings, None).is_err());
+    }
+
+    #[test]
+    fn test_kafka_bootstrap_servers_array_form() {
+        // The array form must be parsed (previously silently fell back to localhost).
+        let settings = serde_json::json!({
+            "topic": "t",
+            "bootstrap_servers": ["b1:9092", "b2:9092", " b3:9092 "],
+        });
+        let output = KafkaOutput::from_config(&settings, None).expect("config");
+        assert_eq!(
+            output.config.bootstrap_servers,
+            vec!["b1:9092", "b2:9092", "b3:9092"]
+        );
+    }
+
+    #[test]
+    fn test_kafka_bootstrap_servers_empty_rejected() {
+        // An empty string or empty array must error, not silently use localhost.
+        let empty_str = serde_json::json!({ "topic": "t", "bootstrap_servers": "" });
+        assert!(KafkaOutput::from_config(&empty_str, None).is_err());
+
+        let empty_arr = serde_json::json!({ "topic": "t", "bootstrap_servers": [] });
+        assert!(KafkaOutput::from_config(&empty_arr, None).is_err());
+
+        let blanks = serde_json::json!({ "topic": "t", "bootstrap_servers": "  , ," });
+        assert!(KafkaOutput::from_config(&blanks, None).is_err());
+    }
+
+    #[test]
+    fn test_kafka_bootstrap_servers_default() {
+        // Unconfigured => default localhost broker (prior behavior preserved).
+        let settings = serde_json::json!({ "topic": "t" });
+        let output = KafkaOutput::from_config(&settings, None).expect("config");
+        assert_eq!(output.config.bootstrap_servers, vec!["localhost:9092"]);
     }
 
     #[test]
