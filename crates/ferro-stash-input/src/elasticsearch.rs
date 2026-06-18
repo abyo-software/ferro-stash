@@ -10,7 +10,6 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use ferro_stash_core::bounded_snippet;
 use ferro_stash_core::error::{FerroStashError, Result};
 use ferro_stash_core::event::{Event, EventValue};
 use ferro_stash_core::plugin::InputPlugin;
@@ -476,10 +475,18 @@ async fn es_status_error(
     status: reqwest::StatusCode,
     response: reqwest::Response,
 ) -> FerroStashError {
-    // `text()` consumes the body; on a transport error mid-read fall back to an
-    // empty snippet rather than masking the (more important) status code.
-    let body = response.text().await.unwrap_or_default();
-    let snippet = bounded_snippet(&body, ERROR_BODY_SNIPPET_LIMIT);
+    // Bound the READ, not just the snippet: `text()` would buffer the entire
+    // body first, so a hostile/misconfigured ES returning a multi-GB error body
+    // could OOM before truncation. `read_bounded_body_stream` reads at most
+    // `limit + 1` bytes from the chunk stream and returns a char-boundary-safe
+    // bounded snippet. `bytes_stream()` consumes `response` (same as `text()`).
+    // A transport error mid-read yields whatever was collected so far rather
+    // than masking the (more important) status code. (DD round-8 finding.)
+    let snippet = ferro_stash_core::read_bounded_body_stream(
+        Box::pin(response.bytes_stream()),
+        ERROR_BODY_SNIPPET_LIMIT,
+    )
+    .await;
     FerroStashError::Input {
         plugin: "elasticsearch".to_string(),
         message: format!("{op} request failed with HTTP status {status}: {snippet}"),

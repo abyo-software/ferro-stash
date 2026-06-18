@@ -4,7 +4,6 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use ferro_stash_core::bounded_snippet;
 use ferro_stash_core::condition::Condition;
 use ferro_stash_core::error::{FerroStashError, Result};
 use ferro_stash_core::event::Event;
@@ -201,10 +200,11 @@ impl OutputPlugin for HttpOutput {
             }
 
             let status = response.status();
-            let body = bounded_snippet(
-                &response.text().await.unwrap_or_default(),
+            let body = ferro_stash_core::read_bounded_body_stream(
+                Box::pin(response.bytes_stream()),
                 crate::ERROR_BODY_SNIPPET_LIMIT,
-            );
+            )
+            .await;
             warn!(status = %status, body = %body, attempt, "HTTP output error");
             last_error = Some(format!("HTTP {status}"));
             if !(status.is_server_error() || status.as_u16() == 429) || attempt >= self.retry_count

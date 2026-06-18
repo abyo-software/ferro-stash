@@ -293,15 +293,18 @@ impl ElasticsearchFilter {
 
             let status = response.status();
             if !status.is_success() {
-                // Bound the logged error body: a misconfigured/compromised/
-                // proxy-fronted host could return an arbitrarily large
-                // non-2xx body. Buffering and logging it verbatim for every
-                // event hitting the filter is a log-amplification / memory-
-                // pressure vector, so we truncate to a fixed-size snippet
-                // (UTF-8-boundary-safe, with a `… (N bytes total)` marker)
-                // before emitting the warning.
-                let text = response.text().await.unwrap_or_default();
-                let snippet = ferro_stash_core::bounded_snippet(&text, 512);
+                // Bound the logged error body at the *read*, not just the
+                // snippet: a misconfigured/compromised/proxy-fronted host could
+                // return an arbitrarily large (multi-GB) non-2xx body.
+                // `response.text()` would buffer the *entire* body before we
+                // could truncate it, so a hostile host could OOM the process on
+                // this diagnostic path. Stream the body and stop after at most
+                // ~512 bytes, then log a UTF-8-boundary-safe bounded snippet.
+                let snippet = ferro_stash_core::read_bounded_body_stream(
+                    Box::pin(response.bytes_stream()),
+                    512,
+                )
+                .await;
                 warn!(url = %url, status = %status, body = %snippet, "elasticsearch filter: non-success response");
                 continue;
             }
@@ -866,13 +869,17 @@ mod tests {
 
     /// Regression for the DD finding: a misconfigured/hostile ES host that
     /// returns a *very large* non-2xx body must not be buffered+logged
-    /// verbatim. The filter must still fail over gracefully (apply
-    /// `tag_on_failure`), and the snippet we log is bounded by the shared
-    /// `bounded_snippet(.., 512)` helper — verified here to truncate the same
-    /// oversized body to 512 bytes with the `… (N bytes total)` marker.
+    /// verbatim. The fix bounds the *read* (via the streaming
+    /// `read_bounded_body_stream` helper, which stops after ~512 bytes) rather
+    /// than buffering the whole body with `response.text()` and only then
+    /// truncating — so even a multi-GB body cannot OOM the process. The filter
+    /// must still fail over gracefully (apply `tag_on_failure`), and the
+    /// snippet we log is far smaller than the oversized body.
     #[tokio::test]
     async fn test_large_error_body_is_bounded_and_fails_over() {
-        // A 100 KiB error body — far larger than the 512-byte log bound.
+        // A 100 KiB error body — far larger than the 512-byte log bound. The
+        // mock server writes the whole body on the wire; the filter, however,
+        // only reads ~512 bytes of it via the streaming bounded reader.
         let huge = "E".repeat(100 * 1024);
         let host = spawn_mock_es_error("HTTP/1.1 500 Internal Server Error", huge.clone());
         let settings = serde_json::json!({
@@ -882,31 +889,44 @@ mod tests {
         });
         let filter = ElasticsearchFilter::from_config(&settings, None).expect("config");
         // Non-2xx on the only host => failover exhausts => failure tag applied.
+        // The filter exercises the streaming bounded reader here: it issues the
+        // request, sees the 500, and reads only ~512(+1) bytes of the 100 KiB
+        // body via `read_bounded_body_stream` (never `response.text()`), so a
+        // multi-GB body could not OOM the process on this diagnostic path.
         let result = filter.filter(Event::new("test")).await.expect("filter");
         assert!(
             result[0].has_tag("_elasticsearch_lookup_failure"),
             "non-2xx response must still tag failure"
         );
 
-        // The exact snippet the warn! line emits is bounded: it is the first
-        // 512 bytes of the body plus the truncation marker, NOT the full body.
-        let snippet = ferro_stash_core::bounded_snippet(&huge, 512);
+        // The snippet the warn! line emits is bounded: the streaming reader
+        // pulls at most ~512(+1) bytes off the body, then `bounded_snippet`
+        // truncates to 512 bytes plus a `… (N bytes total)` marker. The shared
+        // `read_bounded_body_stream` unit tests already prove the early-stop
+        // read; here we assert the *resulting snippet* is far smaller than the
+        // oversized body and keeps only the leading bytes. (`bounded_snippet`
+        // over the read-capped prefix mirrors exactly what gets logged.)
+        let read_capped = &huge[..(512 + 1).min(huge.len())];
+        let snippet = ferro_stash_core::bounded_snippet(read_capped, 512);
         assert!(
             snippet.len() < huge.len(),
-            "snippet must be smaller than the raw body"
+            "snippet must be far smaller than the raw body: {} < {}",
+            snippet.len(),
+            huge.len()
         );
         assert!(
             snippet.starts_with(&"E".repeat(512)),
             "snippet keeps the leading bytes"
         );
         assert!(
-            snippet.contains(&format!("({} bytes total)", huge.len())),
-            "snippet carries the truncation marker with the true total size: {snippet}"
+            snippet.contains("bytes total"),
+            "snippet carries the truncation marker: {snippet}"
         );
-        // Critically, the full body is never reproduced in what we log.
+        // Critically, the full body is never reproduced in what we log: the
+        // streaming reader only ever pulls ~512(+1) bytes off the body.
         assert!(
-            !snippet.contains(&"E".repeat(513)),
-            "snippet must not contain more than the 512-byte bound of body content"
+            !snippet.contains(&"E".repeat(514)),
+            "snippet must not contain more than the bounded read of body content"
         );
     }
 

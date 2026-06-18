@@ -9,7 +9,6 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use ferro_stash_core::bounded_snippet;
 use ferro_stash_core::condition::Condition;
 use ferro_stash_core::error::{FerroStashError, Result};
 use ferro_stash_core::event::Event;
@@ -343,10 +342,11 @@ impl OutputPlugin for ElasticsearchOutput {
                         last_err = Some(format!("HTTP {status}"));
                         continue;
                     } else {
-                        let body_text = bounded_snippet(
-                            &response.text().await.unwrap_or_default(),
+                        let body_text = ferro_stash_core::read_bounded_body_stream(
+                            Box::pin(response.bytes_stream()),
                             crate::ERROR_BODY_SNIPPET_LIMIT,
-                        );
+                        )
+                        .await;
                         error!(status = %status, body = %body_text, "bulk request failed");
                         return Err(FerroStashError::Output {
                             plugin: "elasticsearch".to_string(),
@@ -662,9 +662,11 @@ mod tests {
     #[tokio::test]
     async fn test_bulk_error_body_is_bounded() {
         // Regression: a non-2xx bulk response with a huge error body must not be
-        // read/logged/returned unbounded. The diagnostic body is truncated via
-        // `bounded_snippet`, so the returned error message stays capped and
-        // carries the `bytes total` truncation marker.
+        // read/logged/returned unbounded. The diagnostic body is read via
+        // `read_bounded_body_stream`, which reads at most `limit + 1` bytes (the
+        // READ is bounded, not just the snippet — a multi-GB error body cannot
+        // OOM the process), then truncates to a capped snippet that carries the
+        // `bytes total` truncation marker.
         let huge_len = crate::ERROR_BODY_SNIPPET_LIMIT * 8;
         let huge_body = "E".repeat(huge_len);
         let huge_for_handler = huge_body.clone();
@@ -696,10 +698,19 @@ mod tests {
             "error message must not embed the unbounded body (len {})",
             message.len()
         );
-        // The bounded snippet is at most the limit of body bytes plus marker.
+        // The READ is bounded to `limit + 1` bytes, so the truncation marker
+        // reports the bounded read length — not the full (unread) body length.
+        let read_len = crate::ERROR_BODY_SNIPPET_LIMIT + 1;
         assert!(
-            message.contains(&format!("{huge_len} bytes total")),
+            message.contains(&format!("{read_len} bytes total")),
             "error message must carry the truncation marker: {message}"
+        );
+        // The snippet stays within the limit plus a small marker overhead;
+        // it never approaches the full body size.
+        assert!(
+            message.len() < crate::ERROR_BODY_SNIPPET_LIMIT + 128,
+            "snippet must stay bounded (len {})",
+            message.len()
         );
         // No unbounded run: the verbatim body must not appear in full.
         assert!(
