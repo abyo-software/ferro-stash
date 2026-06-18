@@ -426,6 +426,27 @@ async fn run_pq_drainer(
     sig: ShutdownSignal,
     inputs_done: Arc<AtomicBool>,
 ) {
+    // Reclaim fully-consumed segments on a small cadence rather than after
+    // every single pop: `gc` re-lists/re-reads segment files, so running it
+    // each event would be wasteful. Running it every `GC_EVERY` successful
+    // pops, plus once on each empty-poll branch, keeps consumed segment files
+    // (and their bytes) from accumulating. Without this, `total_bytes` is
+    // monotonic and `enqueue` eventually wedges at `max_bytes` even though
+    // events are being consumed, silently defeating the crash-durability
+    // guarantee (the producer fallback would route everything to the in-memory
+    // channel). It also bounds the per-`pop` re-scan cost (consumed segments
+    // are deleted instead of re-read/re-decompressed every call).
+    const GC_EVERY: u32 = 256;
+    let mut pops_since_gc: u32 = 0;
+    // `gc` only removes segments whose every entry is already read
+    // (`seq < read_seq`), so it never drops un-consumed events; failures are
+    // non-fatal (next cadence retries), so we only warn.
+    let run_gc = |pq: &SharedPersistentQueue| {
+        if let Err(e) = pq.gc() {
+            warn!(error = %e, "PQ gc error");
+        }
+    };
+
     loop {
         if sig.is_shutdown() {
             break;
@@ -435,11 +456,22 @@ async fn run_pq_drainer(
                 if tx.send(event).await.is_err() {
                     break;
                 }
+                pops_since_gc += 1;
+                if pops_since_gc >= GC_EVERY {
+                    run_gc(&pq_drain);
+                    pops_since_gc = 0;
+                }
             }
             Ok(None) => {
-                // PQ is currently empty. If inputs are done, no more events can
-                // ever arrive, so drain-then-exit (we already popped until empty
-                // above, so it is safe to leave now without dropping events).
+                // PQ is currently empty. Reclaim any segments fully consumed by
+                // the pops above before sleeping or exiting.
+                if pops_since_gc > 0 {
+                    run_gc(&pq_drain);
+                    pops_since_gc = 0;
+                }
+                // If inputs are done, no more events can ever arrive, so
+                // drain-then-exit (we already popped until empty above, so it
+                // is safe to leave now without dropping events).
                 if inputs_done.load(Ordering::SeqCst) {
                     break;
                 }
@@ -452,7 +484,9 @@ async fn run_pq_drainer(
             }
         }
     }
-    // Checkpoint on exit
+    // Final reclamation + checkpoint on exit so the last consumed segments are
+    // released and the read cursor is durable.
+    run_gc(&pq_drain);
     if let Err(e) = pq_drain.checkpoint() {
         warn!(error = %e, "PQ checkpoint error on shutdown");
     }

@@ -403,10 +403,31 @@ impl PersistentQueue {
         Ok(segments)
     }
 
-    fn gc(&mut self) -> Result<()> {
+    /// Reclaim fully-consumed segment files.
+    ///
+    /// A segment is removed only when EVERY entry in it has `seq < read_seq`
+    /// (its highest sequence number is below the read cursor), so no un-read
+    /// data is ever discarded. Removing a segment decrements `total_bytes`,
+    /// which is what keeps `enqueue` from permanently wedging at `max_bytes`
+    /// in a long-running pipeline that is actively consuming events, and bounds
+    /// the per-`dequeue` re-scan cost (consumed segments are gone).
+    ///
+    /// The currently-open write segment is never collected: its `BufWriter`
+    /// may hold un-flushed bytes (so its on-disk image can read as empty/stale),
+    /// and deleting the file out from under the live writer would lose data.
+    pub fn gc(&mut self) -> Result<()> {
+        let active_segment = Path::new(&self.config.path)
+            .join(format!("segment_{:08}.seg", self.segment_index));
         let segments = self.list_segments()?;
         for seg_path in segments {
-            // Check if all entries in this segment are consumed
+            // Never reclaim the active (currently-written) segment.
+            if self.current_segment.is_some() && seg_path == active_segment {
+                continue;
+            }
+            // Check if all entries in this segment are consumed. `extract_max_seq`
+            // returns the highest `seq` present; an empty/unparsable segment
+            // yields 0, which is only reclaimed once `read_seq > 0` (nothing
+            // un-read can be there to lose).
             let max_seq = self.extract_max_seq(&seg_path);
             if max_seq < self.read_seq {
                 let size = fs::metadata(&seg_path).map(|m| m.len()).unwrap_or(0);
@@ -562,6 +583,24 @@ impl SharedPersistentQueue {
             .lock()
             .map_err(|e| FerroStashError::Pipeline(format!("PQ lock poisoned: {e}")))?
             .checkpoint()
+    }
+
+    /// Reclaim fully-consumed segment files (segments whose every entry has
+    /// `seq < read_seq`), decrementing `total_bytes`.
+    ///
+    /// Uses the queue's already-advanced internal read cursor, so a drainer that
+    /// consumes via [`SharedPersistentQueue::pop`] can call this directly without
+    /// tracking the sequence itself. Un-read data is never removed.
+    pub fn gc(&self) -> Result<()> {
+        self.inner
+            .lock()
+            .map_err(|e| FerroStashError::Pipeline(format!("PQ lock poisoned: {e}")))?
+            .gc()
+    }
+
+    /// Current total bytes held on disk by segment files.
+    pub fn total_bytes(&self) -> u64 {
+        self.inner.lock().map_or(0, |g| g.total_bytes())
     }
 
     /// Flush and close.
@@ -1207,5 +1246,245 @@ mod tests {
                 "cycle {cycle} event mismatch"
             );
         }
+    }
+
+    // ---- GC / segment-reclamation regression tests (DD round-23) ----
+
+    /// Counts the number of `segment_*` files currently on disk.
+    fn count_segment_files(path: &str) -> usize {
+        fs::read_dir(path)
+            .map(|entries| {
+                entries
+                    .filter_map(std::result::Result::ok)
+                    .filter(|e| {
+                        e.file_name().to_string_lossy().starts_with("segment_")
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn test_pq_gc_reclaims_total_bytes_after_consumption() {
+        // Regression (a): once events are consumed, `gc` must reclaim the
+        // segment bytes so `total_bytes` does not stay monotonic. Without
+        // reclamation, `total_bytes` would hit `max_bytes` and `enqueue` would
+        // wedge forever even though the queue is being drained.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = PqConfig {
+            path: dir.path().to_string_lossy().to_string(),
+            segment_size: 5, // small segments so several get fully consumed
+            ..Default::default()
+        };
+        let mut pq = PersistentQueue::open(config).expect("open");
+
+        // Fill several full segments, then start a fresh one so earlier
+        // segments are no longer the active write segment.
+        for i in 0..25 {
+            pq.enqueue(&format!(r#"{{"msg":"event {i}"}}"#))
+                .expect("enqueue");
+        }
+        let bytes_before = pq.total_bytes();
+        assert!(bytes_before > 0, "should have written bytes");
+
+        // Consume everything.
+        let batch = pq.dequeue(25).expect("dequeue");
+        assert_eq!(batch.len(), 25);
+        assert_eq!(pq.pending(), 0);
+
+        // gc must reclaim the consumed (non-active) segments.
+        pq.gc().expect("gc");
+        assert!(
+            pq.total_bytes() < bytes_before,
+            "gc must reclaim consumed segment bytes (before={bytes_before}, after={})",
+            pq.total_bytes()
+        );
+    }
+
+    #[test]
+    fn test_pq_gc_deletes_consumed_segment_files() {
+        // Regression (b): consumed (fully-read, non-active) segment files must
+        // be deleted from disk, not merely accounted for.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_string_lossy().to_string();
+        let config = PqConfig {
+            path: path.clone(),
+            segment_size: 5,
+            ..Default::default()
+        };
+        let mut pq = PersistentQueue::open(config).expect("open");
+
+        for i in 0..25 {
+            pq.enqueue(&format!(r#"{{"msg":"event {i}"}}"#))
+                .expect("enqueue");
+        }
+        let files_before = count_segment_files(&path);
+        assert!(files_before > 1, "should have rotated multiple segments");
+
+        let batch = pq.dequeue(25).expect("dequeue");
+        assert_eq!(batch.len(), 25);
+
+        pq.gc().expect("gc");
+        let files_after = count_segment_files(&path);
+        assert!(
+            files_after < files_before,
+            "gc must delete consumed segment files (before={files_before}, after={files_after})"
+        );
+    }
+
+    #[test]
+    fn test_pq_gc_does_not_remove_unread_data() {
+        // Regression (c): gc must NOT remove segments that still contain
+        // un-read entries (`seq >= read_seq`), even partially-read ones.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_string_lossy().to_string();
+        let config = PqConfig {
+            path: path.clone(),
+            segment_size: 5,
+            ..Default::default()
+        };
+        let mut pq = PersistentQueue::open(config).expect("open");
+
+        for i in 0..25 {
+            pq.enqueue(&format!(r#"{{"msg":"event {i}"}}"#))
+                .expect("enqueue");
+        }
+
+        // Consume only the first 12 — segment boundaries (size 5) mean the
+        // 3rd segment (seqs 10..14) is only partially read.
+        let consumed = pq.dequeue(12).expect("dequeue");
+        assert_eq!(consumed.len(), 12);
+        assert_eq!(pq.pending(), 13);
+
+        pq.gc().expect("gc");
+
+        // The remaining 13 un-read events must still be fully recoverable.
+        let remaining = pq.dequeue(100).expect("dequeue remaining");
+        assert_eq!(
+            remaining.len(),
+            13,
+            "gc must not drop the 13 un-read events"
+        );
+        for (idx, entry) in remaining.iter().enumerate() {
+            let expected = 12 + idx; // events 12..24 should remain
+            assert!(
+                entry.contains(&format!("event {expected}")),
+                "remaining event {idx} should be 'event {expected}', got {entry}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pq_does_not_wedge_when_consumed_via_gc() {
+        // Regression: a producer must be able to keep enqueuing well past a
+        // `max_bytes`-worth of cumulative throughput as long as events are
+        // consumed and reclaimed. Without gc wiring, `total_bytes` is monotonic
+        // and `enqueue` returns "queue full" after one `max_bytes` of lifetime
+        // throughput even though `pending()` stays near zero.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = PqConfig {
+            path: dir.path().to_string_lossy().to_string(),
+            segment_size: 4,
+            max_bytes: 4_096, // small cap; cumulative throughput will far exceed it
+            ..Default::default()
+        };
+        let mut pq = PersistentQueue::open(config).expect("open");
+
+        // Each event is ~30+ bytes; 4096 cap holds ~100 events of standing
+        // backlog. Push+drain 2000 events: cumulative bytes (~60KB) >> max_bytes,
+        // so this would wedge without reclamation.
+        for i in 0..2_000 {
+            pq.enqueue(&format!(r#"{{"msg":"throughput-event-{i}"}}"#))
+                .unwrap_or_else(|e| {
+                    panic!("enqueue {i} wedged at max_bytes despite consumption: {e}")
+                });
+            // Consume immediately and reclaim periodically.
+            let _ = pq.dequeue(1).expect("dequeue");
+            if i % 8 == 0 {
+                pq.gc().expect("gc");
+            }
+        }
+        // Final drain + gc; queue should be empty and well under max_bytes.
+        pq.gc().expect("final gc");
+        assert_eq!(pq.pending(), 0, "all events should be consumed");
+        assert!(
+            pq.total_bytes() < 4_096,
+            "total_bytes ({}) must stay under max_bytes after reclamation",
+            pq.total_bytes()
+        );
+    }
+
+    #[test]
+    fn test_pq_ack_reclaims_consumed_segments() {
+        // `ack(up_to_seq)` sets the read cursor, checkpoints, and gcs in one
+        // call. After acking past fully-consumed segments their files and
+        // bytes must be reclaimed.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_string_lossy().to_string();
+        let config = PqConfig {
+            path: path.clone(),
+            segment_size: 5,
+            ..Default::default()
+        };
+        let mut pq = PersistentQueue::open(config).expect("open");
+
+        for i in 0..25 {
+            pq.enqueue(&format!(r#"{{"msg":"event {i}"}}"#))
+                .expect("enqueue");
+        }
+        let files_before = count_segment_files(&path);
+        let bytes_before = pq.total_bytes();
+
+        // Ack the first 20 events (seqs 0..19 consumed; cursor at 20).
+        pq.ack(20).expect("ack");
+        let files_after = count_segment_files(&path);
+        assert!(
+            files_after < files_before,
+            "ack must reclaim fully-consumed segment files"
+        );
+        assert!(
+            pq.total_bytes() < bytes_before,
+            "ack must reclaim consumed bytes"
+        );
+
+        // The remaining 5 events (seqs 20..24) must still be readable.
+        let remaining = pq.dequeue(100).expect("dequeue remaining");
+        assert_eq!(remaining.len(), 5, "ack must not drop un-acked events");
+        assert!(remaining[0].contains("event 20"));
+    }
+
+    #[test]
+    fn test_pq_gc_preserves_active_write_segment() {
+        // The currently-open write segment must never be reclaimed even if its
+        // on-disk image looks empty (un-flushed BufWriter) and read_seq > 0.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_string_lossy().to_string();
+        let config = PqConfig {
+            path: path.clone(),
+            segment_size: 5,
+            ..Default::default()
+        };
+        let mut pq = PersistentQueue::open(config).expect("open");
+
+        // Fill and consume one full segment, then write one more event into a
+        // fresh (active) segment WITHOUT flushing.
+        for i in 0..6 {
+            pq.enqueue(&format!(r#"{{"msg":"event {i}"}}"#))
+                .expect("enqueue");
+        }
+        // Read the first 6 so read_seq advances past the first full segment.
+        let _ = pq.dequeue(5).expect("dequeue");
+        // gc with an active, possibly-unflushed segment must not delete it and
+        // must not lose the un-read event(s).
+        pq.gc().expect("gc with active segment");
+
+        // The 6th event (seq 5) must still be readable from the active segment.
+        let remaining = pq.dequeue(100).expect("dequeue after gc");
+        assert_eq!(
+            remaining.len(),
+            1,
+            "the un-read event in the active segment must survive gc"
+        );
+        assert!(remaining[0].contains("event 5"));
     }
 }

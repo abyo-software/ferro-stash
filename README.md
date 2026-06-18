@@ -411,6 +411,16 @@ Data sources → FerroStash → FerroSearch → Applications
 - **Enterprise features absent.** No centralized/Kibana management, no
   X-Pack security, no keystore. A persistent queue and DLQ exist in the
   core crate but are not a full Logstash-parity feature set.
+- **Persistent queue is a durable buffer, not at-least-once delivery.**
+  `queue.type: persisted` checkpoints the read position when an event is
+  *dequeued for processing*, not after the output acknowledges it. So the
+  PQ guarantees durability for events that are **queued but not yet read**
+  across a restart, but an event that has been read and then fails at the
+  output is **not** replayed from the PQ on restart. For delivery
+  durability through output failures, enable the **dead-letter queue**
+  (failed events are written to the DLQ and can be replayed via the
+  `dead_letter_queue` input). Full at-least-once PQ semantics
+  (checkpoint-after-output-ack) is a roadmap item, not yet implemented.
 - **Single developer; no production deployments.** Bus factor 1; no
   operational history. Performance numbers come from one benchmark
   environment.
