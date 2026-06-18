@@ -8,7 +8,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use ferro_stash_codec::{create_codec, Codec};
+use ferro_stash_codec::{create_codec_from_settings, resolve_codec, Codec};
 use ferro_stash_core::condition::Condition;
 use ferro_stash_core::error::{FerroStashError, Result};
 use ferro_stash_core::event::Event;
@@ -137,9 +137,9 @@ impl KafkaOutput {
             })?;
 
         let key = settings.get_string("key");
-        let codec = settings
-            .get_string("codec")
-            .unwrap_or_else(|| "plain".to_string());
+        // Resolve the codec name from both DSL forms so the recorded name matches
+        // the codec that is actually built below.
+        let (codec, _) = resolve_codec(settings, "plain");
         let compression_type = settings
             .get("compression_type")
             .and_then(|v| v.as_str())
@@ -153,8 +153,12 @@ impl KafkaOutput {
             .unwrap_or_else(|| "1".to_string());
         let retries = settings.get_u64("retries").unwrap_or(3) as usize;
 
-        // Build the codec used to serialize event payloads (config error => fail loud).
-        let codec_impl = create_codec(&codec, settings)?;
+        // Build the codec used to serialize event payloads (config error => fail
+        // loud). `create_codec_from_settings` handles both the string form
+        // (`codec => json`) and the descriptor form (`codec => json { ... }`),
+        // which `get_string("codec")` cannot see — without it the descriptor form
+        // would silently fall back to the default codec and drop its sub-settings.
+        let codec_impl = create_codec_from_settings(settings, "plain")?;
 
         Ok(Self {
             config: KafkaOutputConfig {
@@ -395,6 +399,32 @@ mod tests {
         // Unknown codec must fail loudly at config time.
         let settings = serde_json::json!({ "topic": "t", "codec": "no-such-codec" });
         assert!(KafkaOutput::from_config(&settings, None).is_err());
+    }
+
+    #[test]
+    fn test_kafka_descriptor_form_codec_honored() {
+        // The DSL form `codec => json { ... }` is parsed to an object carrying a
+        // `_plugin` discriminator. `get_string("codec")` returns None for it, which
+        // used to silently fall back to the default `plain` codec. The descriptor
+        // form must build the NAMED codec (json), not the default.
+        let settings = serde_json::json!({
+            "topic": "t",
+            "codec": { "_plugin": "json", "pretty": true },
+        });
+        let output = KafkaOutput::from_config(&settings, None).expect("config");
+        assert_eq!(output.config.codec, "json", "descriptor codec name resolved");
+
+        // The built codec serializes as JSON (descriptor honored end-to-end).
+        let bytes = output.encode(&Event::new("hi")).expect("encode");
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("\"message\""), "json codec body: {text}");
+
+        // An unknown codec inside the descriptor form still fails loudly.
+        let bad = serde_json::json!({
+            "topic": "t",
+            "codec": { "_plugin": "no-such-codec" },
+        });
+        assert!(KafkaOutput::from_config(&bad, None).is_err());
     }
 
     #[tokio::test]

@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use aws_sdk_s3::primitives::ByteStream;
-use ferro_stash_codec::{create_codec, Codec};
+use ferro_stash_codec::{create_codec_from_settings, resolve_codec, Codec};
 use ferro_stash_core::condition::Condition;
 use ferro_stash_core::error::{FerroStashError, Result};
 use ferro_stash_core::event::Event;
@@ -91,9 +91,9 @@ impl S3Output {
         let access_key_id = settings.get_string("access_key_id");
         let secret_access_key = settings.get_string("secret_access_key");
         let time_file = settings.get_u64("time_file").unwrap_or(900); // 15 min default
-        let codec = settings
-            .get_string("codec")
-            .unwrap_or_else(|| "plain".to_string());
+        // Resolve the codec name from both DSL forms so the recorded name matches
+        // the codec that is actually built below.
+        let (codec, _) = resolve_codec(settings, "plain");
         let encoding = settings
             .get_string("encoding")
             .unwrap_or_else(|| "none".to_string());
@@ -110,9 +110,13 @@ impl S3Output {
         let endpoint = settings.get_string("endpoint");
         let force_path_style = settings.get_bool("force_path_style").unwrap_or(false);
 
-        // Build the codec used to serialize event payloads (config error => fail loud),
-        // mirroring the kafka/redis outputs. Honors `codec => plain`/`line`/`json`/…
-        let codec_impl = create_codec(&codec, settings)?;
+        // Build the codec used to serialize event payloads (config error => fail
+        // loud), mirroring the kafka/redis outputs. `create_codec_from_settings`
+        // honors both the string form (`codec => json`) and the descriptor form
+        // (`codec => json { ... }`); `get_string("codec")` cannot see the
+        // descriptor form, so without this it would silently fall back to the
+        // default codec and drop its sub-settings.
+        let codec_impl = create_codec_from_settings(settings, "plain")?;
 
         Ok(Self {
             config: S3OutputConfig {
@@ -854,6 +858,48 @@ mod tests {
     fn test_s3_output_unknown_codec_rejected() {
         // An unknown codec must fail loudly at config time (like kafka/redis).
         let settings = serde_json::json!({ "bucket": "b", "codec": "no-such-codec" });
+        assert!(S3Output::from_config(&settings, None).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_s3_descriptor_form_codec_honored() {
+        // The DSL descriptor form `codec => json { ... }` (object with `_plugin`)
+        // must build the NAMED codec, not the default `plain`. `get_string("codec")`
+        // returns None for it, which used to silently fall back to the default.
+        let (endpoint, captured) = spawn_mock_s3().await;
+        let settings = serde_json::json!({
+            "bucket": "b",
+            "prefix": "p/",
+            "endpoint": endpoint,
+            "force_path_style": true,
+            "access_key_id": "test",
+            "secret_access_key": "test",
+            "codec": { "_plugin": "json" },
+        });
+        let output = S3Output::from_config(&settings, None).expect("config");
+        assert_eq!(output.config.codec, "json", "descriptor codec name resolved");
+
+        output
+            .output(vec![Event::new("desc-line")])
+            .await
+            .expect("output");
+        output.flush().await.expect("flush");
+
+        let objects = captured.lock().expect("lock");
+        assert_eq!(objects.len(), 1);
+        let body = String::from_utf8_lossy(&objects[0].2);
+        // json codec => JSON keys present (descriptor honored, not the plain default).
+        assert!(body.contains("\"message\""), "json codec body: {body}");
+        assert!(body.contains("desc-line"), "json codec body: {body}");
+    }
+
+    #[test]
+    fn test_s3_descriptor_form_unknown_codec_rejected() {
+        // An unknown codec inside the descriptor form still fails loudly.
+        let settings = serde_json::json!({
+            "bucket": "b",
+            "codec": { "_plugin": "no-such-codec" },
+        });
         assert!(S3Output::from_config(&settings, None).is_err());
     }
 

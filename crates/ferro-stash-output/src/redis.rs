@@ -6,7 +6,7 @@
 //! `PUBLISH` per event. Serialization is driven by the configured codec.
 
 use async_trait::async_trait;
-use ferro_stash_codec::{create_codec, Codec};
+use ferro_stash_codec::{create_codec_from_settings, resolve_codec, Codec};
 use ferro_stash_core::condition::Condition;
 use ferro_stash_core::error::{FerroStashError, Result};
 use ferro_stash_core::event::Event;
@@ -48,7 +48,10 @@ impl RedisOutputDataType {
 }
 
 /// Redis output configuration — mirrors the Logstash redis output settings.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is implemented manually so the `password` secret is never rendered in
+/// logs/diagnostics (`{:?}` prints `Some("***")` / `None`, not the plaintext).
+#[derive(Clone)]
 pub struct RedisOutputConfig {
     pub host: String,
     pub port: u16,
@@ -61,6 +64,27 @@ pub struct RedisOutputConfig {
     pub batch_events: usize,
     pub congestion_interval: u64,
     pub congestion_threshold: usize,
+}
+
+impl std::fmt::Debug for RedisOutputConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Redact the password so neither this struct nor any wrapper (e.g.
+        // `RedisOutput`'s Debug) can leak the secret via `{:?}`.
+        let password = self.password.as_ref().map(|_| "***");
+        f.debug_struct("RedisOutputConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("key", &self.key)
+            .field("data_type", &self.data_type)
+            .field("db", &self.db)
+            .field("password", &password)
+            .field("codec", &self.codec)
+            .field("batch", &self.batch)
+            .field("batch_events", &self.batch_events)
+            .field("congestion_interval", &self.congestion_interval)
+            .field("congestion_threshold", &self.congestion_threshold)
+            .finish()
+    }
 }
 
 pub struct RedisOutput {
@@ -104,16 +128,20 @@ impl RedisOutput {
 
         let db = settings.get_u64("db").unwrap_or(0) as u32;
         let password = settings.get_string("password");
-        let codec = settings
-            .get_string("codec")
-            .unwrap_or_else(|| "json".to_string());
+        // Resolve the codec name from both DSL forms so the recorded name matches
+        // the codec that is actually built below.
+        let (codec, _) = resolve_codec(settings, "json");
         let batch = settings.get_bool("batch").unwrap_or(false);
         let batch_events = settings.get_u64("batch_events").unwrap_or(50) as usize;
         let congestion_interval = settings.get_u64("congestion_interval").unwrap_or(1);
         let congestion_threshold = settings.get_u64("congestion_threshold").unwrap_or(0) as usize;
 
         // Build the codec used to serialize events (config error => fail loudly).
-        let codec_impl = create_codec(&codec, settings)?;
+        // `create_codec_from_settings` handles both the string form
+        // (`codec => json`) and the descriptor form (`codec => json { ... }`);
+        // `get_string("codec")` cannot see the descriptor form, so without this it
+        // would silently fall back to the default codec and drop its sub-settings.
+        let codec_impl = create_codec_from_settings(settings, "json")?;
 
         Ok(Self {
             config: RedisOutputConfig {
@@ -321,6 +349,59 @@ mod tests {
         // Unknown codec must fail loudly at config time.
         let settings = serde_json::json!({ "key": "k", "codec": "definitely-not-a-codec" });
         assert!(RedisOutput::from_config(&settings, None).is_err());
+    }
+
+    #[test]
+    fn test_redis_descriptor_form_codec_honored() {
+        // The DSL descriptor form `codec => plain { ... }` (object with `_plugin`)
+        // must build the NAMED codec, not the default `json`. `get_string("codec")`
+        // returns None for it, which used to silently fall back to the default.
+        let settings = serde_json::json!({
+            "key": "k",
+            "codec": { "_plugin": "plain" },
+        });
+        let output = RedisOutput::from_config(&settings, None).expect("config");
+        assert_eq!(output.config.codec, "plain", "descriptor codec name resolved");
+
+        // The built codec serializes as plain text (no JSON keys), proving the
+        // descriptor form was honored end-to-end rather than defaulting to json.
+        let bytes = output.encode(&Event::new("hi")).expect("encode");
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(!text.contains("\"message\""), "plain codec body: {text}");
+
+        // An unknown codec inside the descriptor form still fails loudly.
+        let bad = serde_json::json!({
+            "key": "k",
+            "codec": { "_plugin": "no-such-codec" },
+        });
+        assert!(RedisOutput::from_config(&bad, None).is_err());
+    }
+
+    #[test]
+    fn test_redis_config_debug_redacts_password() {
+        // The password secret must never appear in Debug output (config or wrapper).
+        let settings = serde_json::json!({
+            "key": "k",
+            "host": "redis.prod",
+            "password": "super-secret-pw",
+        });
+        let output = RedisOutput::from_config(&settings, None).expect("config");
+
+        let config_dbg = format!("{:?}", output.config);
+        assert!(
+            !config_dbg.contains("super-secret-pw"),
+            "config Debug leaked the password: {config_dbg}"
+        );
+        assert!(config_dbg.contains("***"), "config Debug must mark redaction");
+        // Non-secret fields are still visible for diagnostics.
+        assert!(config_dbg.contains("redis.prod"), "host should remain visible");
+
+        // The wrapper's Debug (which prints the config) must also not leak it.
+        let output_dbg = format!("{output:?}");
+        assert!(
+            !output_dbg.contains("super-secret-pw"),
+            "output Debug leaked the password: {output_dbg}"
+        );
     }
 
     #[tokio::test]

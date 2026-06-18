@@ -21,7 +21,10 @@ const DATADOG_MAX_ATTEMPTS: usize = 4;
 const DATADOG_BACKOFF_BASE_MS: u64 = 250;
 
 /// Datadog output configuration — mirrors the Logstash datadog output settings.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is implemented manually so the `api_key` secret is never rendered in
+/// logs/diagnostics (`{:?}` prints `"***"`, not the plaintext key).
+#[derive(Clone)]
 pub struct DatadogOutputConfig {
     pub api_key: String,
     pub host: String,
@@ -31,6 +34,23 @@ pub struct DatadogOutputConfig {
     pub source: String,
     pub service: String,
     pub tags: Vec<String>,
+}
+
+impl std::fmt::Debug for DatadogOutputConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Redact the API key so neither this struct nor any wrapper (e.g.
+        // `DatadogOutput`'s derived Debug) can leak the secret via `{:?}`.
+        f.debug_struct("DatadogOutputConfig")
+            .field("api_key", &"***")
+            .field("host", &self.host)
+            .field("codec", &self.codec)
+            .field("batch_size", &self.batch_size)
+            .field("use_ssl", &self.use_ssl)
+            .field("source", &self.source)
+            .field("service", &self.service)
+            .field("tags", &self.tags)
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -169,33 +189,52 @@ impl DatadogOutput {
                     .map(|v| v.to_string_lossy())
                     .unwrap_or_default();
 
-                let mut entry = serde_json::json!({
-                    "message": message,
-                    "ddsource": self.config.source,
-                    "hostname": hostname,
-                    // Datadog reads the event time from `timestamp`/`date`; without it
-                    // the intake stamps ingest time instead of the actual event time.
-                    "timestamp": event.timestamp.to_rfc3339(),
-                });
+                let mut entry = serde_json::Map::new();
 
-                if !self.config.service.is_empty() {
-                    entry["service"] = serde_json::Value::String(self.config.service.clone());
-                }
-
-                if !self.config.tags.is_empty() {
-                    entry["ddtags"] = serde_json::Value::String(self.config.tags.join(","));
-                }
-
-                // Include extra fields from the event, preserving their JSON types so
-                // numbers/booleans/objects stay native (string-coercion breaks facets).
+                // Include extra fields from the event first, preserving their JSON
+                // types so numbers/booleans/objects stay native (string-coercion
+                // breaks facets). The reserved Datadog attributes are written
+                // *after* this merge so an event field literally named `timestamp`,
+                // `ddsource`, `ddtags`, `hostname`, `service`, or `message` (very
+                // common in parsed logs) can never clobber the event-derived
+                // reserved values — otherwise Datadog would fall back to ingest
+                // time (re-opening the round-1 timestamp fix).
                 for (key, value) in event.fields() {
                     if key != "message" && key != "host" && key != "@timestamp" && key != "@version"
                     {
-                        entry[key] = serde_json::Value::from(value.clone());
+                        entry.insert(key.clone(), serde_json::Value::from(value.clone()));
                     }
                 }
 
-                entry
+                // Reserved attributes always win (written last).
+                entry.insert("message".to_string(), serde_json::Value::String(message));
+                entry.insert(
+                    "ddsource".to_string(),
+                    serde_json::Value::String(self.config.source.clone()),
+                );
+                entry.insert("hostname".to_string(), serde_json::Value::String(hostname));
+                // Datadog reads the event time from `timestamp`/`date`; without it
+                // the intake stamps ingest time instead of the actual event time.
+                entry.insert(
+                    "timestamp".to_string(),
+                    serde_json::Value::String(event.timestamp.to_rfc3339()),
+                );
+
+                if !self.config.service.is_empty() {
+                    entry.insert(
+                        "service".to_string(),
+                        serde_json::Value::String(self.config.service.clone()),
+                    );
+                }
+
+                if !self.config.tags.is_empty() {
+                    entry.insert(
+                        "ddtags".to_string(),
+                        serde_json::Value::String(self.config.tags.join(",")),
+                    );
+                }
+
+                serde_json::Value::Object(entry)
             })
             .collect();
 
@@ -328,6 +367,93 @@ mod tests {
         let result = output.output(vec![Event::new("ok")]).await;
         assert!(result.is_ok());
         assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_datadog_reserved_attrs_win_over_user_fields() {
+        // Regression: an event field literally named `timestamp` / `service` /
+        // `ddsource` / `ddtags` / `hostname` / `message` must NOT clobber the
+        // event-derived reserved attributes (which would re-open the round-1
+        // timestamp fix and let user data override Datadog reserved attributes).
+        let settings = serde_json::json!({
+            "api_key": "key",
+            "source": "myapp",
+            "service": "web",
+            "tags": ["env:test"],
+        });
+        let output = DatadogOutput::from_config(&settings, None).expect("config");
+
+        let mut event = Event::new("real message");
+        // User fields colliding with reserved attributes.
+        event.set(
+            "timestamp",
+            ferro_stash_core::event::EventValue::String("1999-01-01T00:00:00Z".into()),
+        );
+        event.set(
+            "service",
+            ferro_stash_core::event::EventValue::String("user-service".into()),
+        );
+        event.set(
+            "ddsource",
+            ferro_stash_core::event::EventValue::String("user-source".into()),
+        );
+        event.set(
+            "ddtags",
+            ferro_stash_core::event::EventValue::String("user:tag".into()),
+        );
+        event.set(
+            "hostname",
+            ferro_stash_core::event::EventValue::String("user-host".into()),
+        );
+
+        let payload = output.format_datadog_payload(&[event.clone()]);
+        let parsed: Vec<serde_json::Value> =
+            serde_json::from_str(&payload).expect("valid JSON array");
+
+        // The event-derived timestamp must win, not the user's 1999 string.
+        assert_eq!(
+            parsed[0]["timestamp"], event.timestamp.to_rfc3339(),
+            "event timestamp must win over a user `timestamp` field"
+        );
+        assert_ne!(parsed[0]["timestamp"], "1999-01-01T00:00:00Z");
+
+        // Config-derived reserved attributes win over the user fields.
+        assert_eq!(parsed[0]["service"], "web");
+        assert_eq!(parsed[0]["ddsource"], "myapp");
+        assert_eq!(parsed[0]["ddtags"], "env:test");
+        assert_eq!(parsed[0]["message"], "real message");
+        // `hostname` is event-derived (from `host`, here absent) and must not be
+        // overridden by a user `hostname` field.
+        assert_ne!(parsed[0]["hostname"], "user-host");
+    }
+
+    #[test]
+    fn test_datadog_config_debug_redacts_api_key() {
+        // The api_key secret must never appear in Debug output.
+        let settings = serde_json::json!({
+            "api_key": "super-secret-key",
+            "host": "intake.example.com",
+        });
+        let output = DatadogOutput::from_config(&settings, None).expect("config");
+
+        let config_dbg = format!("{:?}", output.config);
+        assert!(
+            !config_dbg.contains("super-secret-key"),
+            "config Debug leaked the api_key: {config_dbg}"
+        );
+        assert!(config_dbg.contains("***"), "config Debug must mark redaction");
+        // Non-secret fields stay visible for diagnostics.
+        assert!(
+            config_dbg.contains("intake.example.com"),
+            "host should remain visible"
+        );
+
+        // The wrapper's Debug (which prints the config) must also not leak it.
+        let output_dbg = format!("{output:?}");
+        assert!(
+            !output_dbg.contains("super-secret-key"),
+            "output Debug leaked the api_key: {output_dbg}"
+        );
     }
 
     #[test]
