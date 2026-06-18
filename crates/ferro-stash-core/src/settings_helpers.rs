@@ -52,10 +52,16 @@ pub trait SettingsExt {
     fn get_string(&self, key: &str) -> Option<String>;
     /// Read a TCP/UDP port, validating it is in `1..=65535`.
     ///
-    /// Returns `Ok(default)` when the key is absent, and `Err(message)` when a
-    /// value is present but out of range — so `port => 70000` fails loudly at
-    /// config time instead of silently truncating (`as u16`) to a wrong port.
+    /// Returns `Ok(default)` when the key is absent/null, and `Err(message)`
+    /// when a value is PRESENT but invalid (non-integer, negative, or out of
+    /// `1..=65535`) — so `port => 70000` / `port => "638O"` fail loudly at
+    /// config time instead of silently truncating or falling back to default.
     fn get_port(&self, key: &str, default: u16) -> Result<u16, String>;
+    /// Read a `u32` config value (e.g. a Redis DB index), validating range.
+    /// `Ok(default)` when absent/null; `Err(message)` when present but invalid
+    /// or `> u32::MAX` — so a value like `db => 4294967296` fails loudly
+    /// instead of truncating (`as u32`) to a wrong/0 value.
+    fn get_u32(&self, key: &str, default: u32) -> Result<u32, String>;
 }
 
 impl SettingsExt for Value {
@@ -63,12 +69,23 @@ impl SettingsExt for Value {
         self.get(key).and_then(as_u64_flexible)
     }
     fn get_port(&self, key: &str, default: u16) -> Result<u16, String> {
-        match self.get(key).and_then(as_u64_flexible) {
-            None => Ok(default),
-            Some(v) if (1..=65535).contains(&v) => Ok(v as u16),
-            Some(v) => Err(format!(
-                "{key} must be a port in 1..=65535, got {v}"
-            )),
+        match self.get(key) {
+            None | Some(Value::Null) => Ok(default),
+            Some(v) => match as_u64_flexible(v) {
+                Some(n) if (1..=65535).contains(&n) => Ok(n as u16),
+                _ => Err(format!("{key} must be a port in 1..=65535, got {v}")),
+            },
+        }
+    }
+    fn get_u32(&self, key: &str, default: u32) -> Result<u32, String> {
+        match self.get(key) {
+            None | Some(Value::Null) => Ok(default),
+            Some(v) => match as_u64_flexible(v) {
+                Some(n) if n <= u64::from(u32::MAX) => Ok(n as u32),
+                _ => Err(format!(
+                    "{key} must be an integer in 0..=4294967295, got {v}"
+                )),
+            },
         }
     }
     fn get_i64(&self, key: &str) -> Option<i64> {
@@ -88,6 +105,42 @@ impl SettingsExt for Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn get_port_absent_uses_default() {
+        assert_eq!(serde_json::json!({}).get_port("port", 6379), Ok(6379));
+        assert_eq!(serde_json::json!({"port": null}).get_port("port", 6379), Ok(6379));
+    }
+
+    #[test]
+    fn get_port_valid_in_range() {
+        assert_eq!(serde_json::json!({"port": 9200}).get_port("port", 1), Ok(9200));
+        // Logstash DSL string form.
+        assert_eq!(serde_json::json!({"port": "6390"}).get_port("port", 1), Ok(6390));
+    }
+
+    #[test]
+    fn get_port_present_but_invalid_errors() {
+        // Out of range, non-numeric string, negative, zero, and wrong type all error
+        // (present-but-invalid must NOT silently fall back to the default).
+        for bad in [
+            serde_json::json!({"port": 70000}),
+            serde_json::json!({"port": "638O"}),
+            serde_json::json!({"port": -1}),
+            serde_json::json!({"port": 0}),
+            serde_json::json!({"port": true}),
+        ] {
+            assert!(bad.get_port("port", 6379).is_err(), "should reject {bad}");
+        }
+    }
+
+    #[test]
+    fn get_u32_absent_default_valid_and_overflow() {
+        assert_eq!(serde_json::json!({}).get_u32("db", 0), Ok(0));
+        assert_eq!(serde_json::json!({"db": 5}).get_u32("db", 0), Ok(5));
+        assert!(serde_json::json!({"db": 4_294_967_296u64}).get_u32("db", 0).is_err());
+        assert!(serde_json::json!({"db": "x"}).get_u32("db", 0).is_err());
+    }
 
     #[test]
     fn test_u64_from_number() {

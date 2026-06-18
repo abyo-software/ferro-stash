@@ -131,7 +131,14 @@ impl RedisOutput {
             RedisOutputDataType::from_str_config,
         );
 
-        let db = settings.get_u64("db").unwrap_or(0) as u32;
+        // Validate the DB index instead of truncating via `as u32` — a value like
+        // 4294967296 would silently wrap to 0 and write to the WRONG Redis DB.
+        let db = settings
+            .get_u32("db", 0)
+            .map_err(|message| FerroStashError::Output {
+                plugin: "redis".to_string(),
+                message,
+            })?;
         let password = settings.get_string("password");
         // Resolve the codec name from both DSL forms so the recorded name matches
         // the codec that is actually built below.
@@ -359,6 +366,18 @@ mod tests {
             .expect_err("out-of-range port must be rejected");
         let msg = format!("{err}");
         assert!(msg.contains("70000"), "error should mention the bad port: {msg}");
+    }
+
+    #[test]
+    fn test_redis_output_db_out_of_range_rejected() {
+        // An out-of-range db index (> u32::MAX, e.g. 4294967296) must fail loudly
+        // at config time rather than silently truncating (4294967296 as u32 == 0)
+        // and writing events to the WRONG Redis DB (silent data contamination).
+        let settings = serde_json::json!({ "key": "k", "db": 4_294_967_296u64 });
+        let err = RedisOutput::from_config(&settings, None)
+            .expect_err("out-of-range db must be rejected");
+        let msg = format!("{err}");
+        assert!(msg.contains("db"), "error should mention the db setting: {msg}");
     }
 
     #[test]

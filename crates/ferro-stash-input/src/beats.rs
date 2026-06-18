@@ -24,6 +24,39 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+/// Upper bound on a single on-the-wire Beats frame body announced by an
+/// attacker-controlled 32-bit length prefix.
+///
+/// The Lumberjack/Beats protocol carries no authentication, so any client that
+/// can reach the listening port can announce an arbitrary `payload_len` (up to
+/// `0xFFFF_FFFF` ≈ 4 GiB). Pre-allocating a zero-filled buffer of that size
+/// *before* the body arrives is an unauthenticated remote OOM amplifier (a
+/// ~10-byte header → ~4 GiB allocation; many connections multiply it). We
+/// refuse to allocate for any announced length above this ceiling and drop the
+/// connection instead. 100 MB mirrors Logstash's beats input default
+/// (`client_inactivity_timeout` aside, its max message size is in this range)
+/// and is comfortably above any legitimate batch.
+const MAX_BEATS_FRAME_BYTES: usize = 100_000_000;
+
+/// Upper bound on the *decompressed* size of a `C` (compressed) frame.
+///
+/// zlib is a defense gap independent of the wire-length cap: a small compressed
+/// `payload_len` (which itself passes [`MAX_BEATS_FRAME_BYTES`]) can expand to
+/// gigabytes (a "zip bomb"). We cap the decoder's output so a malicious stream
+/// cannot inflate past this bound. Allow a small multiple of the frame cap
+/// because legitimate inner frames compress well; anything beyond is hostile.
+const MAX_DECOMPRESSED_BYTES: usize = 4 * MAX_BEATS_FRAME_BYTES;
+
+/// Returns `true` if an attacker-announced on-the-wire length is within the
+/// allocation cap and therefore safe to allocate a buffer for.
+///
+/// Factored out as a pure function so the cap policy is unit-testable without a
+/// live socket (see the `beats` tests).
+#[inline]
+fn beats_len_within_cap(announced: usize) -> bool {
+    announced <= MAX_BEATS_FRAME_BYTES
+}
+
 #[derive(Debug)]
 pub struct BeatsInput {
     host: String,
@@ -88,7 +121,7 @@ impl InputPlugin for BeatsInput {
                             let tx = sender.clone();
                             let tags = self.tags.clone();
                             tokio::spawn(async move {
-                                if let Err(e) = handle_beats_connection(stream, tx, tags).await {
+                                if let Err(e) = handle_beats_connection(stream, peer, tx, tags).await {
                                     warn!(peer = %peer, error = %e, "Beats connection error");
                                 }
                             });
@@ -109,6 +142,7 @@ impl InputPlugin for BeatsInput {
 
 async fn handle_beats_connection(
     mut stream: tokio::net::TcpStream,
+    peer: std::net::SocketAddr,
     sender: mpsc::Sender<Event>,
     tags: Vec<String>,
 ) -> Result<()> {
@@ -139,6 +173,16 @@ async fn handle_beats_connection(
                 // JSON frame: 4-byte seq + 4-byte payload_len + payload
                 let seq = stream.read_u32().await.map_err(FerroStashError::Io)?;
                 let payload_len = stream.read_u32().await.map_err(FerroStashError::Io)? as usize;
+
+                if !beats_len_within_cap(payload_len) {
+                    warn!(
+                        peer = %peer,
+                        payload_len,
+                        cap = MAX_BEATS_FRAME_BYTES,
+                        "Beats J frame length exceeds cap; dropping connection"
+                    );
+                    return Ok(());
+                }
 
                 if payload_len > buf.len() {
                     buf.resize(payload_len, 0);
@@ -175,6 +219,15 @@ async fn handle_beats_connection(
                 let mut event = Event::empty();
                 for _ in 0..pair_count {
                     let key_len = stream.read_u32().await.map_err(FerroStashError::Io)? as usize;
+                    if !beats_len_within_cap(key_len) {
+                        warn!(
+                            peer = %peer,
+                            key_len,
+                            cap = MAX_BEATS_FRAME_BYTES,
+                            "Beats D frame key length exceeds cap; dropping connection"
+                        );
+                        return Ok(());
+                    }
                     let mut key_buf = vec![0u8; key_len];
                     stream
                         .read_exact(&mut key_buf)
@@ -182,6 +235,15 @@ async fn handle_beats_connection(
                         .map_err(FerroStashError::Io)?;
 
                     let val_len = stream.read_u32().await.map_err(FerroStashError::Io)? as usize;
+                    if !beats_len_within_cap(val_len) {
+                        warn!(
+                            peer = %peer,
+                            val_len,
+                            cap = MAX_BEATS_FRAME_BYTES,
+                            "Beats D frame value length exceeds cap; dropping connection"
+                        );
+                        return Ok(());
+                    }
                     let mut val_buf = vec![0u8; val_len];
                     stream
                         .read_exact(&mut val_buf)
@@ -207,14 +269,30 @@ async fn handle_beats_connection(
                 // Compressed frame: 4-byte payload_len + zlib-compressed inner frames
                 let payload_len = stream.read_u32().await.map_err(FerroStashError::Io)? as usize;
 
+                if !beats_len_within_cap(payload_len) {
+                    warn!(
+                        peer = %peer,
+                        payload_len,
+                        cap = MAX_BEATS_FRAME_BYTES,
+                        "Beats C frame compressed length exceeds cap; dropping connection"
+                    );
+                    return Ok(());
+                }
+
                 let mut compressed = vec![0u8; payload_len];
                 stream
                     .read_exact(&mut compressed)
                     .await
                     .map_err(FerroStashError::Io)?;
 
-                // Decompress with zlib
-                let mut decoder = flate2::read::ZlibDecoder::new(&compressed[..]);
+                // Decompress with zlib, bounding the *output* so a zip-bomb
+                // (small compressed body → gigabytes decompressed) cannot
+                // exhaust memory. `take` caps how many bytes the decoder may
+                // produce; if the limit is hit we cannot trust the stream and
+                // drop the connection. We read one byte past the cap to detect
+                // overrun (a fully-consumed cap-sized stream is ambiguous).
+                let mut decoder =
+                    flate2::read::ZlibDecoder::new(&compressed[..]).take(MAX_DECOMPRESSED_BYTES as u64 + 1);
                 let mut decompressed = Vec::new();
                 decoder
                     .read_to_end(&mut decompressed)
@@ -222,6 +300,15 @@ async fn handle_beats_connection(
                         plugin: "beats".to_string(),
                         message: format!("zlib decompress error: {e}"),
                     })?;
+                if decompressed.len() > MAX_DECOMPRESSED_BYTES {
+                    warn!(
+                        peer = %peer,
+                        decompressed_len = decompressed.len(),
+                        cap = MAX_DECOMPRESSED_BYTES,
+                        "Beats C frame decompressed size exceeds cap (possible zip bomb); dropping connection"
+                    );
+                    return Ok(());
+                }
 
                 // Parse inner frames from decompressed data
                 let parsed = parse_inner_frames(&decompressed)?;
@@ -506,5 +593,78 @@ mod tests {
         // Missing payload_len and payload
         let parsed = parse_inner_frames(&data).expect("parse");
         assert_eq!(parsed.len(), 0);
+    }
+
+    #[test]
+    fn test_beats_len_cap_rejects_oversize() {
+        // Regression (HIGH): an attacker-announced frame length above the cap
+        // must be rejected so we never pre-allocate a multi-GiB buffer from a
+        // ~10-byte header (unauthenticated remote OOM). 0xFFFF_FFFF ≈ 4 GiB.
+        let attacker_announced = u32::MAX as usize; // 4_294_967_295
+        assert!(
+            !beats_len_within_cap(attacker_announced),
+            "a ~4 GiB announced length must be refused (no allocation)"
+        );
+        // One byte over the cap is also refused.
+        assert!(!beats_len_within_cap(MAX_BEATS_FRAME_BYTES + 1));
+    }
+
+    #[test]
+    fn test_beats_len_cap_accepts_legitimate() {
+        // A legitimate small frame and an exactly-at-cap frame are allowed.
+        assert!(beats_len_within_cap(0));
+        assert!(beats_len_within_cap(65_536));
+        assert!(beats_len_within_cap(MAX_BEATS_FRAME_BYTES));
+    }
+
+    // The decompression bound must be a finite ceiling strictly larger than the
+    // wire-length cap (so legitimate well-compressing inner frames are allowed).
+    // Checked at compile time to avoid a runtime constant assertion.
+    const _: () = assert!(MAX_DECOMPRESSED_BYTES > MAX_BEATS_FRAME_BYTES);
+
+    #[test]
+    fn test_beats_zip_bomb_decompression_is_bounded() {
+        // Regression (HIGH, zlib-bomb): a small compressed body that expands to
+        // far more than MAX_DECOMPRESSED_BYTES must be caught by the `take`
+        // bound used in the C-frame handler, so the connection is dropped
+        // instead of inflating to gigabytes. We reproduce the exact decoder
+        // pipeline (ZlibDecoder + take(cap + 1)) against a highly-compressible
+        // payload and assert the overrun is detected.
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        // Use a small local cap to keep the test fast; the production constant
+        // is exercised by the same `take`-based logic below.
+        let test_cap: usize = 1_000_000; // 1 MB
+        let raw = vec![0u8; test_cap + 10_000]; // > cap, but trivially compressible
+
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(&raw).expect("compress");
+        let compressed = encoder.finish().expect("finish");
+        // The bomb: a tiny compressed body vs a large decompressed one.
+        assert!(
+            compressed.len() < test_cap,
+            "test payload should compress well: {} bytes",
+            compressed.len()
+        );
+
+        // Mirror the C-frame decode: decoder.take(cap + 1).read_to_end(...).
+        let mut decoder =
+            flate2::read::ZlibDecoder::new(&compressed[..]).take(test_cap as u64 + 1);
+        let mut decompressed = Vec::new();
+        decoder.read_to_end(&mut decompressed).expect("decode");
+
+        // The overrun check (len > cap) must fire — the connection would be
+        // dropped, and memory stays bounded at cap + 1 (not the full raw size).
+        assert!(
+            decompressed.len() > test_cap,
+            "the bound must observe more than the cap so the overrun is detected"
+        );
+        assert!(
+            decompressed.len() <= test_cap + 1,
+            "decoder output must be bounded to cap + 1, got {}",
+            decompressed.len()
+        );
     }
 }
