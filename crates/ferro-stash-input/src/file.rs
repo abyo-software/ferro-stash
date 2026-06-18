@@ -83,15 +83,23 @@ impl FileInput {
             .and_then(|v| v.as_str())
             .map(String::from);
 
+        // Clamp both intervals to a minimum of 1s. A DSL-accepted
+        // `discover_interval => 0` would feed `Duration::from_secs(0)` to
+        // `tokio::time::interval` (see `run`), which PANICS
+        // ("`period` must be non-zero") and aborts the file input task. Same
+        // zero-period class as heartbeat (DD round-20). `stat_interval` is
+        // clamped for parity / future-proofing.
         let stat_interval_secs = settings
             .get("stat_interval")
             .and_then(ferro_stash_core::settings_helpers::as_u64_flexible)
-            .unwrap_or(1);
+            .unwrap_or(1)
+            .max(1);
 
         let discover_interval_secs = settings
             .get("discover_interval")
             .and_then(ferro_stash_core::settings_helpers::as_u64_flexible)
-            .unwrap_or(15);
+            .unwrap_or(15)
+            .max(1);
 
         let delimiter = settings
             .get("delimiter")
@@ -388,6 +396,33 @@ mod tests {
     fn test_file_config_missing_path() {
         let settings = serde_json::json!({});
         assert!(FileInput::from_config(&settings).is_err());
+    }
+
+    #[test]
+    fn test_file_config_zero_intervals_clamped() {
+        // A DSL-accepted `discover_interval => 0` / `stat_interval => 0` must be
+        // clamped to >=1 so the `tokio::time::interval` timer in `run` is never
+        // built with a zero period (which would panic and abort the task).
+        let settings = serde_json::json!({
+            "path": "/tmp/test.log",
+            "discover_interval": 0,
+            "stat_interval": 0
+        });
+        let input = FileInput::from_config(&settings).expect("config");
+        assert_eq!(input.discover_interval_secs, 1);
+        assert_eq!(input.stat_interval_secs, 1);
+    }
+
+    #[test]
+    fn test_file_config_intervals_preserved() {
+        let settings = serde_json::json!({
+            "path": "/tmp/test.log",
+            "discover_interval": 30,
+            "stat_interval": 5
+        });
+        let input = FileInput::from_config(&settings).expect("config");
+        assert_eq!(input.discover_interval_secs, 30);
+        assert_eq!(input.stat_interval_secs, 5);
     }
 
     #[test]

@@ -24,10 +24,17 @@ impl HeartbeatInput {
             .and_then(|v| v.as_str())
             .unwrap_or("ok")
             .to_string();
+        // Clamp the interval to a minimum of 1s. A DSL-accepted `interval => 0`
+        // would feed `Duration::from_secs(0)` to `tokio::time::interval`, which
+        // PANICS ("`period` must be non-zero") and aborts the heartbeat task.
+        // Sibling plugins already guard this (s3 floors at MIN_POLL_INTERVAL_SECS,
+        // generator gates `interval_ms > 0`, datadog `.max(1)`); heartbeat was
+        // missed. (DD round-20 Finding #1.)
         let interval_secs = settings
             .get("interval")
             .and_then(ferro_stash_core::settings_helpers::as_u64_flexible)
-            .unwrap_or(60);
+            .unwrap_or(60)
+            .max(1);
         let count = settings
             .get("count")
             .and_then(ferro_stash_core::settings_helpers::as_u64_flexible);
@@ -133,6 +140,44 @@ mod tests {
         let settings = serde_json::json!({});
         let input = HeartbeatInput::from_config(&settings).expect("config");
         assert_eq!(input.name(), "heartbeat");
+    }
+
+    #[test]
+    fn test_heartbeat_zero_interval_clamped() {
+        // A DSL-accepted `interval => 0` must be clamped to >=1 so the timer
+        // is never built with a zero period.
+        let settings = serde_json::json!({ "interval": 0 });
+        let input = HeartbeatInput::from_config(&settings).expect("config");
+        assert_eq!(input.interval_secs, 1);
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_zero_interval_does_not_panic() {
+        // Regression: `interval => 0` previously panicked `tokio::time::interval`
+        // ("`period` must be non-zero") and aborted the task. With the clamp the
+        // timer is built with >=1s and `run()` produces events normally.
+        let settings = serde_json::json!({
+            "message": "beat",
+            "interval": 0,
+            "count": 1
+        });
+        let mut input = HeartbeatInput::from_config(&settings).expect("config");
+        assert_eq!(input.interval_secs, 1);
+        let (tx, mut rx) = mpsc::channel(10);
+        let (_ctrl, sig) = ferro_stash_core::shutdown::ShutdownController::new();
+
+        // Bounded so the test cannot hang even if the clamp regresses.
+        let handle = tokio::spawn(async move { input.run(tx, sig).await });
+        let res = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        let join = res.expect("run() should complete (no panic / no zero-period stall)");
+        // The task itself must not have panicked.
+        assert!(join.is_ok(), "heartbeat task panicked: {join:?}");
+
+        let mut count = 0;
+        while rx.try_recv().is_ok() {
+            count += 1;
+        }
+        assert_eq!(count, 1);
     }
 
     #[tokio::test]

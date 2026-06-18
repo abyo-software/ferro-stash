@@ -218,6 +218,29 @@ impl ElasticsearchInput {
         req
     }
 
+    /// Best-effort close of an open Point-in-Time context.
+    ///
+    /// PIT contexts consume server-side search resources and live until their
+    /// `keep_alive` (5m) expires. This MUST run on every `run_search` exit path
+    /// after a PIT was opened — otherwise a repeatable search-side error
+    /// (invalid query, expired privilege, downstream channel closed) opens a
+    /// fresh PIT every poll and leaks contexts server-side until they age out
+    /// (DD round-20 Finding #3). The close is best-effort: a failure is logged,
+    /// never propagated, and never masks the original `run_search` result.
+    async fn close_pit(&self, host: &str, pit: &str) {
+        let close_url = format!("{}/_pit", host.trim_end_matches('/'));
+        let close_req = self
+            .build_request(
+                self.client
+                    .delete(&close_url)
+                    .json(&serde_json::json!({ "id": pit })),
+            )
+            .await;
+        if let Err(e) = close_req.send().await {
+            debug!(error = %e, "failed to close PIT (non-fatal)");
+        }
+    }
+
     async fn run_search(&self, sender: &mpsc::Sender<Event>) -> Result<()> {
         let host = self.next_host();
 
@@ -288,200 +311,221 @@ impl ElasticsearchInput {
         } else {
             format!("{}/{}/_search", host.trim_end_matches('/'), self.index)
         };
-        let mut search_after: Option<serde_json::Value> = None;
-        let mut last_tracking_value: Option<String> = None;
-        let mut total_docs = 0usize;
-        // Belt-and-braces ceiling on the number of full pages a single search
-        // invocation will fetch. The cursor-advance guard below already breaks a
-        // non-advancing loop, but a (hypothetical) cursor that *changes* every
-        // page yet never terminates — e.g. a hostile upstream rotating the
-        // `sort` value endlessly — would otherwise spin without bound. Capping
-        // pages bounds the worst case regardless. With the 1000-doc default page
-        // size this still permits ~10M documents per invocation, far beyond any
-        // legitimate scheduled poll. The scheduled / once mode re-runs later.
-        const MAX_PAGES_PER_INVOCATION: usize = 10_000;
-        let mut pages = 0usize;
+        // The paginating loop is extracted into an inner async block so that the
+        // PIT (opened above) is closed on EVERY exit path — including the non-2xx
+        // search error, the body read/parse errors (`?`), and the
+        // downstream-channel-closed early return. Previously those early returns
+        // bypassed the PIT-close block, so a repeatable search-side error leaked
+        // a fresh PIT every poll until each aged out at `keep_alive=5m`
+        // (DD round-20 Finding #3). The block's `Result<Option<String>>` carries
+        // the last tracking value to persist on success; errors propagate after
+        // the common close epilogue. `pit_id` is captured by `&mut` so the
+        // epilogue closes the LATEST id even when ES rotated it mid-loop.
+        let pit_for_loop = &mut pit_id;
+        let paginate = async {
+            let mut search_after: Option<serde_json::Value> = None;
+            let mut last_tracking_value: Option<String> = None;
+            let mut total_docs = 0usize;
+            // Belt-and-braces ceiling on the number of full pages a single search
+            // invocation will fetch. The cursor-advance guard below already breaks
+            // a non-advancing loop, but a (hypothetical) cursor that *changes*
+            // every page yet never terminates — e.g. a hostile upstream rotating
+            // the `sort` value endlessly — would otherwise spin without bound.
+            // Capping pages bounds the worst case regardless. With the 1000-doc
+            // default page size this still permits ~10M documents per invocation,
+            // far beyond any legitimate scheduled poll. The scheduled / once mode
+            // re-runs later.
+            const MAX_PAGES_PER_INVOCATION: usize = 10_000;
+            let mut pages = 0usize;
 
-        loop {
-            pages += 1;
-            if pages > MAX_PAGES_PER_INVOCATION {
-                warn!(
-                    pages = pages - 1,
-                    total_docs,
-                    "elasticsearch search hit per-invocation page ceiling; \
-                     stopping this search (will resume on the next run)"
-                );
-                break;
-            }
+            loop {
+                pages += 1;
+                if pages > MAX_PAGES_PER_INVOCATION {
+                    warn!(
+                        pages = pages - 1,
+                        total_docs,
+                        "elasticsearch search hit per-invocation page ceiling; \
+                         stopping this search (will resume on the next run)"
+                    );
+                    break;
+                }
 
-            let mut body = serde_json::json!({
-                "query": query,
-                "size": self.scroll_size,
-                "sort": sort,
-            });
-
-            // Include PIT if available
-            if let Some(ref pit) = pit_id {
-                body["pit"] = serde_json::json!({
-                    "id": pit,
-                    "keep_alive": "5m"
+                let mut body = serde_json::json!({
+                    "query": query,
+                    "size": self.scroll_size,
+                    "sort": sort,
                 });
-            }
 
-            if let Some(ref sa) = search_after {
-                body["search_after"] = sa.clone();
-            }
+                // Include PIT if available
+                if let Some(ref pit) = *pit_for_loop {
+                    body["pit"] = serde_json::json!({
+                        "id": pit,
+                        "keep_alive": "5m"
+                    });
+                }
 
-            let req = self.client.post(&url).json(&body);
-            let req = self.build_request(req).await;
+                if let Some(ref sa) = search_after {
+                    body["search_after"] = sa.clone();
+                }
 
-            let response = req.send().await.map_err(|e| FerroStashError::Input {
-                plugin: "elasticsearch".to_string(),
-                message: format!("search error: {e}"),
-            })?;
+                let req = self.client.post(&url).json(&body);
+                let req = self.build_request(req).await;
 
-            // An ES error response (401/403/404/429/5xx) is still valid JSON but
-            // has no `hits.hits`. Without this check the loop would parse it,
-            // find an empty hit list, break, and return Ok(())  silently
-            // ingesting nothing while masking an auth/index/server failure
-            // (in scheduled mode the failure is never even logged). Mirror the
-            // `if !status.is_success()` check used by the ES OUTPUT/FILTER
-            // plugins and fail loudly. (DD round-6 Finding #1.)
-            let status = response.status();
-            if !status.is_success() {
-                return Err(es_status_error("search", status, response).await);
-            }
-
-            // Cap the success-path body read. `response.json()` would buffer the
-            // whole 200 body unconditionally, so a huge/hostile response could
-            // OOM the process. Read at most `MAX_RESPONSE_BYTES`; an over-limit
-            // (Err) body surfaces as a loud `Input` error (like the non-2xx
-            // path) rather than being silently truncated/buffered. The status
-            // check above already ran (it borrows `response`); `bytes_stream()`
-            // consumes `response`, exactly as `.json()` did.
-            let bytes = ferro_stash_core::read_capped_body(
-                Box::pin(response.bytes_stream()),
-                MAX_RESPONSE_BYTES,
-            )
-            .await
-            .map_err(|e| FerroStashError::Input {
-                plugin: "elasticsearch".to_string(),
-                message: format!("search response read error: {e}"),
-            })?;
-            let result: serde_json::Value =
-                serde_json::from_slice(&bytes).map_err(|e| FerroStashError::Input {
+                let response = req.send().await.map_err(|e| FerroStashError::Input {
                     plugin: "elasticsearch".to_string(),
-                    message: format!("response parse error: {e}"),
+                    message: format!("search error: {e}"),
                 })?;
 
-            // Update PIT id if returned (ES can rotate it between pages)
-            if let Some(new_pit) = result["pit_id"].as_str() {
-                pit_id = Some(new_pit.to_string());
-            }
+                // An ES error response (401/403/404/429/5xx) is still valid JSON
+                // but has no `hits.hits`. Without this check the loop would parse
+                // it, find an empty hit list, break, and return Ok(()) silently
+                // ingesting nothing while masking an auth/index/server failure
+                // (in scheduled mode the failure is never even logged). Mirror the
+                // `if !status.is_success()` check used by the ES OUTPUT/FILTER
+                // plugins and fail loudly. (DD round-6 Finding #1.) The PIT is
+                // still closed by the epilogue after this early `return Err`
+                // (DD round-20 Finding #3).
+                let status = response.status();
+                if !status.is_success() {
+                    return Err(es_status_error("search", status, response).await);
+                }
 
-            let hits = result["hits"]["hits"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
+                // Cap the success-path body read. `response.json()` would buffer
+                // the whole 200 body unconditionally, so a huge/hostile response
+                // could OOM the process. Read at most `MAX_RESPONSE_BYTES`; an
+                // over-limit (Err) body surfaces as a loud `Input` error (like the
+                // non-2xx path) rather than being silently truncated/buffered. The
+                // status check above already ran (it borrows `response`);
+                // `bytes_stream()` consumes `response`, exactly as `.json()` did.
+                let bytes = ferro_stash_core::read_capped_body(
+                    Box::pin(response.bytes_stream()),
+                    MAX_RESPONSE_BYTES,
+                )
+                .await
+                .map_err(|e| FerroStashError::Input {
+                    plugin: "elasticsearch".to_string(),
+                    message: format!("search response read error: {e}"),
+                })?;
+                let result: serde_json::Value =
+                    serde_json::from_slice(&bytes).map_err(|e| FerroStashError::Input {
+                        plugin: "elasticsearch".to_string(),
+                        message: format!("response parse error: {e}"),
+                    })?;
 
-            if hits.is_empty() {
-                break;
-            }
+                // Update PIT id if returned (ES can rotate it between pages)
+                if let Some(new_pit) = result["pit_id"].as_str() {
+                    *pit_for_loop = Some(new_pit.to_string());
+                }
 
-            for hit in &hits {
-                let source = hit
-                    .get("_source")
+                let hits = result["hits"]["hits"]
+                    .as_array()
                     .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                let mut event = Event::from_json(source);
+                    .unwrap_or_default();
 
-                // Set metadata
-                if let Some(index) = hit.get("_index").and_then(|v| v.as_str()) {
-                    event.set("_index", EventValue::String(index.to_string()));
-                }
-                if let Some(id) = hit.get("_id").and_then(|v| v.as_str()) {
-                    event.set("_id", EventValue::String(id.to_string()));
-                }
-                for tag in &self.tags {
-                    event.add_tag(tag);
+                if hits.is_empty() {
+                    break;
                 }
 
-                // Track last value
-                if let Some(ref field) = self.tracking_field {
-                    if let Some(val) = hit.get("_source").and_then(|s| s.get(field)) {
-                        last_tracking_value = Some(val.to_string().trim_matches('"').to_string());
+                for hit in &hits {
+                    let source = hit
+                        .get("_source")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    let mut event = Event::from_json(source);
+
+                    // Set metadata
+                    if let Some(index) = hit.get("_index").and_then(|v| v.as_str()) {
+                        event.set("_index", EventValue::String(index.to_string()));
+                    }
+                    if let Some(id) = hit.get("_id").and_then(|v| v.as_str()) {
+                        event.set("_id", EventValue::String(id.to_string()));
+                    }
+                    for tag in &self.tags {
+                        event.add_tag(tag);
+                    }
+
+                    // Track last value
+                    if let Some(ref field) = self.tracking_field {
+                        if let Some(val) = hit.get("_source").and_then(|s| s.get(field)) {
+                            last_tracking_value =
+                                Some(val.to_string().trim_matches('"').to_string());
+                        }
+                    }
+
+                    // Downstream channel closed: stop early but still close the
+                    // PIT in the epilogue. Preserve any tracking value gathered so
+                    // far (DD round-20 Finding #3).
+                    if sender.send(event).await.is_err() {
+                        return Ok(last_tracking_value);
+                    }
+                    total_docs += 1;
+                }
+
+                if hits.len() < self.scroll_size {
+                    break; // last (partial) page — no more pages
+                }
+
+                // Compute the next `search_after` cursor from the last hit's
+                // `sort`. A strictly-correct ES always emits a `sort` array (with
+                // the `_id` tiebreaker), so on the happy path this advances every
+                // full page.
+                //
+                // Cursor-advance guard (DD round-16 MEDIUM): if a malformed /
+                // hostile / proxied upstream returns a FULL page
+                // (`hits.len() >= scroll_size`) whose last hit has NO `sort`,
+                // `next_sort` is `None`; re-issuing the request without
+                // `search_after` would replay the IDENTICAL page, re-emitting the
+                // same docs forever. Likewise, a cursor that does not change from
+                // the previous iteration would replay the same page. In either
+                // case we cannot make progress, so warn and stop this search
+                // invocation cleanly. The scheduled / once mode runs again later.
+                let next_sort = hits.last().and_then(|h| h.get("sort").cloned());
+                match next_sort {
+                    None => {
+                        warn!(
+                            total_docs,
+                            "elasticsearch returned a full page whose last hit has \
+                             no `sort` cursor; stopping this search to avoid \
+                             replaying the same page (malformed/hostile upstream?)"
+                        );
+                        break;
+                    }
+                    Some(ref ns) if Some(ns) == search_after.as_ref() => {
+                        warn!(
+                            total_docs,
+                            "elasticsearch `search_after` cursor did not advance \
+                             between pages; stopping this search to avoid replaying \
+                             the same page (malformed/hostile upstream?)"
+                        );
+                        break;
+                    }
+                    Some(ns) => {
+                        search_after = Some(ns);
                     }
                 }
-
-                if sender.send(event).await.is_err() {
-                    return Ok(());
-                }
-                total_docs += 1;
             }
 
-            if hits.len() < self.scroll_size {
-                break; // last (partial) page — no more pages
-            }
+            debug!(docs = total_docs, "elasticsearch search completed");
+            Ok(last_tracking_value)
+        };
 
-            // Compute the next `search_after` cursor from the last hit's `sort`.
-            // A strictly-correct ES always emits a `sort` array (with the `_id`
-            // tiebreaker), so on the happy path this advances every full page.
-            //
-            // Cursor-advance guard (DD round-16 MEDIUM): if a malformed / hostile
-            // / proxied upstream returns a FULL page (`hits.len() >= scroll_size`)
-            // whose last hit has NO `sort`, `next_sort` is `None`; re-issuing the
-            // request without `search_after` would replay the IDENTICAL page,
-            // re-emitting the same docs forever. Likewise, a cursor that does not
-            // change from the previous iteration would replay the same page. In
-            // either case we cannot make progress, so warn and stop this search
-            // invocation cleanly. The scheduled / once mode runs again later.
-            let next_sort = hits.last().and_then(|h| h.get("sort").cloned());
-            match next_sort {
-                None => {
-                    warn!(
-                        total_docs,
-                        "elasticsearch returned a full page whose last hit has no \
-                         `sort` cursor; stopping this search to avoid replaying \
-                         the same page (malformed/hostile upstream?)"
-                    );
-                    break;
-                }
-                Some(ref ns) if Some(ns) == search_after.as_ref() => {
-                    warn!(
-                        total_docs,
-                        "elasticsearch `search_after` cursor did not advance \
-                         between pages; stopping this search to avoid replaying \
-                         the same page (malformed/hostile upstream?)"
-                    );
-                    break;
-                }
-                Some(ns) => {
-                    search_after = Some(ns);
-                }
-            }
-        }
+        // Run the paginating loop, then ALWAYS close the PIT (best-effort) before
+        // propagating its Result — guaranteeing no PIT leaks on any exit path.
+        let paginate_result: Result<Option<String>> = paginate.await;
 
-        // Close PIT
+        // Common epilogue: close PIT on every path. `pit_id` now holds the latest
+        // (possibly rotated) id thanks to the `&mut` capture above.
         if let Some(ref pit) = pit_id {
-            let close_url = format!("{}/_pit", host.trim_end_matches('/'));
-            let close_req = self
-                .build_request(
-                    self.client
-                        .delete(&close_url)
-                        .json(&serde_json::json!({"id": pit})),
-                )
-                .await;
-            if let Err(e) = close_req.send().await {
-                debug!(error = %e, "failed to close PIT (non-fatal)");
-            }
+            self.close_pit(host, pit).await;
         }
 
-        // Save tracking value
+        // Save the tracking value gathered by the loop, then propagate the inner
+        // Result (Ok on completion / early channel-close, Err on search failure).
+        let last_tracking_value = paginate_result?;
         if let Some(ref value) = last_tracking_value {
             self.save_last_value(value);
         }
 
-        debug!(docs = total_docs, "elasticsearch search completed");
         Ok(())
     }
 
@@ -1252,5 +1296,111 @@ mod tests {
         let settings = serde_json::json!({});
         let input = ElasticsearchInput::from_config(&settings).expect("config");
         assert_eq!(input.hosts, vec!["http://localhost:9200".to_string()]);
+    }
+
+    // ---- DD round-20 Finding #3: PIT must be closed on the search-error path ----
+
+    /// Spawn a mock ES that:
+    ///   - returns a real PIT `id` to the `POST .../_pit?keep_alive=5m` open, so
+    ///     `run_search` proceeds in PIT mode, then
+    ///   - returns `403 Forbidden` to the `POST /_search` (a repeatable
+    ///     search-side error: expired privilege / invalid query), and
+    ///   - records, via the returned flag, whether a `DELETE .../_pit` close was
+    ///     ever received.
+    ///
+    /// Before the close-always restructure, the non-2xx search `return Err`
+    /// bypassed the PIT-close block, so the opened PIT leaked server-side every
+    /// poll until `keep_alive` expired. The fix routes the close through a common
+    /// epilogue that runs on ALL exit paths; this test asserts the DELETE close
+    /// was issued even though the search itself errored.
+    /// Bind the listener synchronously (before spawning the accept loop) and
+    /// return its address plus a flag set when a `DELETE .../_pit` close arrives.
+    /// Binding first (like the sibling `spawn_mock_es`) avoids starving the
+    /// current-thread test runtime — a blocking `recv()` for the address would
+    /// never let the spawned server run.
+    async fn spawn_mock_es_pit_then_search_error()
+    -> (String, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let pit_closed = Arc::new(AtomicBool::new(false));
+        let pit_closed_srv = Arc::clone(&pit_closed);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock listener");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            // PIT-open, the (errored) search, and the PIT-close all hit us; accept
+            // generously so none of them are dropped on the floor.
+            for _ in 0..8u8 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let pit_closed_conn = Arc::clone(&pit_closed_srv);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    let Ok(n) = stream.read(&mut buf).await else {
+                        return;
+                    };
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let request_line = req.lines().next().unwrap_or("");
+                    let (status_line, body) = if request_line.starts_with("DELETE")
+                        && request_line.contains("/_pit")
+                    {
+                        // The close we are asserting on.
+                        pit_closed_conn.store(true, Ordering::SeqCst);
+                        ("HTTP/1.1 200 OK", r#"{"succeeded":true,"num_freed":1}"#.to_string())
+                    } else if request_line.contains("/_pit") {
+                        // PIT open: hand back a real id so the search runs in PIT mode.
+                        ("HTTP/1.1 200 OK", r#"{"id":"pit-abc123"}"#.to_string())
+                    } else {
+                        // The `_search` POST fails with a repeatable 403.
+                        (
+                            "HTTP/1.1 403 Forbidden",
+                            r#"{"error":{"type":"security_exception","reason":"denied"},"status":403}"#
+                                .to_string(),
+                        )
+                    };
+                    let response = format!(
+                        "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.flush().await;
+                });
+            }
+        });
+        (format!("http://{addr}"), pit_closed)
+    }
+
+    #[tokio::test]
+    async fn test_run_search_closes_pit_on_search_error() {
+        use std::sync::atomic::Ordering;
+        let (host, pit_closed) = spawn_mock_es_pit_then_search_error().await;
+        let settings = serde_json::json!({
+            "hosts": [host],
+            "index": "logs",
+        });
+        let input = ElasticsearchInput::from_config(&settings).expect("config");
+        let (tx, mut rx) = mpsc::channel(16);
+
+        // The search errors (403), so run_search must surface Err...
+        let result = tokio::time::timeout(Duration::from_secs(10), input.run_search(&tx)).await;
+        let result = result.expect("run_search must terminate");
+        assert!(
+            result.is_err(),
+            "non-2xx search must return Err, got Ok: {result:?}"
+        );
+
+        // ...AND, despite the error, the opened PIT must have been closed (the
+        // mock observed a DELETE /_pit). Without the close-always epilogue this
+        // would be `false` — a leaked PIT per poll.
+        assert!(
+            pit_closed.load(Ordering::SeqCst),
+            "PIT was opened but never closed on the search-error path (context leak)"
+        );
+
+        // No events were emitted on the error path.
+        assert!(rx.try_recv().is_err(), "no events on the error path");
     }
 }
