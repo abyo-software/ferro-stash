@@ -50,11 +50,26 @@ pub trait SettingsExt {
     fn get_f64(&self, key: &str) -> Option<f64>;
     fn get_bool(&self, key: &str) -> Option<bool>;
     fn get_string(&self, key: &str) -> Option<String>;
+    /// Read a TCP/UDP port, validating it is in `1..=65535`.
+    ///
+    /// Returns `Ok(default)` when the key is absent, and `Err(message)` when a
+    /// value is present but out of range — so `port => 70000` fails loudly at
+    /// config time instead of silently truncating (`as u16`) to a wrong port.
+    fn get_port(&self, key: &str, default: u16) -> Result<u16, String>;
 }
 
 impl SettingsExt for Value {
     fn get_u64(&self, key: &str) -> Option<u64> {
         self.get(key).and_then(as_u64_flexible)
+    }
+    fn get_port(&self, key: &str, default: u16) -> Result<u16, String> {
+        match self.get(key).and_then(as_u64_flexible) {
+            None => Ok(default),
+            Some(v) if (1..=65535).contains(&v) => Ok(v as u16),
+            Some(v) => Err(format!(
+                "{key} must be a port in 1..=65535, got {v}"
+            )),
+        }
     }
     fn get_i64(&self, key: &str) -> Option<i64> {
         self.get(key).and_then(as_i64_flexible)

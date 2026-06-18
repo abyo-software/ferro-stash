@@ -102,14 +102,31 @@ impl std::fmt::Debug for ElasticsearchFilter {
 
 impl ElasticsearchFilter {
     pub fn from_config(settings: &serde_json::Value, condition: Option<Condition>) -> Result<Self> {
-        let hosts = match settings.get("hosts") {
+        let hosts: Vec<String> = match settings.get("hosts") {
             Some(serde_json::Value::Array(a)) => a
                 .iter()
                 .filter_map(|v| v.as_str().map(String::from))
                 .collect(),
             Some(serde_json::Value::String(s)) => vec![s.clone()],
+            // Absent `hosts` key defaults to localhost (preserved behavior).
             _ => vec!["http://localhost:9200".to_string()],
         };
+
+        // An explicitly-empty `hosts` (`hosts => []`) or an array of only
+        // non-strings collapses to zero hosts, which would permanently disable
+        // the filter: `execute_query` would try no hosts, return `None`, and
+        // EVERY event would be tagged `_elasticsearch_lookup_failure` — a
+        // silently-disabled enrichment. The ES input and output plugins already
+        // reject empty hosts at config time; reject it here too for consistency.
+        if hosts.is_empty() {
+            return Err(FerroStashError::Filter {
+                plugin: "elasticsearch".to_string(),
+                message: "`hosts` must contain at least one Elasticsearch host \
+                          (e.g. \"http://localhost:9200\"); an empty list would \
+                          permanently disable the filter."
+                    .to_string(),
+            });
+        }
 
         let index = settings
             .get("index")
@@ -507,6 +524,32 @@ mod tests {
         assert_eq!(filter.index, "logstash-*");
         assert_eq!(filter.result_size, 1);
         assert!(filter.enable_sort);
+    }
+
+    /// An explicitly-empty `hosts` (or an array of only non-strings) is a config
+    /// error rather than a silently-disabled filter (every event would otherwise
+    /// be tagged `_elasticsearch_lookup_failure`). The absent-key default
+    /// (localhost) is preserved — see `test_elasticsearch_default_config`.
+    #[test]
+    fn test_empty_hosts_rejected_at_config_time() {
+        // `hosts => []`
+        let settings = serde_json::json!({ "hosts": [] });
+        let err = ElasticsearchFilter::from_config(&settings, None)
+            .expect_err("empty hosts must be a config error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("hosts"),
+            "error should mention hosts: {msg}"
+        );
+
+        // An array of only non-strings collapses to zero hosts after filtering.
+        let settings = serde_json::json!({ "hosts": [123, true, null] });
+        let err = ElasticsearchFilter::from_config(&settings, None)
+            .expect_err("a non-string hosts array must be a config error");
+        assert!(
+            err.to_string().contains("hosts"),
+            "error should mention hosts"
+        );
     }
 
     #[test]

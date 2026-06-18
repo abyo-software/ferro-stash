@@ -90,7 +90,12 @@ impl RedisInput {
         let host = settings
             .get_string("host")
             .unwrap_or_else(|| "127.0.0.1".to_string());
-        let port = settings.get_u64("port").unwrap_or(6379) as u16;
+        let port = settings
+            .get_port("port", 6379)
+            .map_err(|message| FerroStashError::Input {
+                plugin: "redis".to_string(),
+                message,
+            })?;
 
         let key = settings
             .get_string("key")
@@ -510,6 +515,27 @@ mod tests {
         });
         let input = RedisInput::from_config(&settings).expect("config");
         assert_eq!(input.config.data_type, RedisDataType::PatternChannel);
+    }
+
+    #[test]
+    fn test_redis_config_out_of_range_port_rejected() {
+        // Regression: a port above 65535 must fail loudly at config time rather
+        // than silently truncating via `as u16` (70000 as u16 == 4464).
+        let settings = serde_json::json!({ "key": "events", "port": 70000 });
+        let err = RedisInput::from_config(&settings).expect_err("port 70000 must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("70000") && msg.contains("port"),
+            "expected an out-of-range port error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_redis_config_string_port_in_range_accepted() {
+        // A valid in-range port (string-encoded, Logstash DSL style) is honored.
+        let settings = serde_json::json!({ "key": "events", "port": "6390" });
+        let input = RedisInput::from_config(&settings).expect("config");
+        assert_eq!(input.config.port, 6390);
     }
 
     #[tokio::test]

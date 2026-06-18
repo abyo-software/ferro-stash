@@ -9,16 +9,20 @@
 //! `longitude`, `continent_code`, `region_*`, `postal_code`, `location`,
 //! `timezone`) are written to the target field.
 //!
-//! When no database is configured, the filter falls back to RFC 5737 / private
-//! IP classification so it degrades gracefully (and remains useful in
-//! environments without a `MaxMind` database).
+//! When no database is configured at all, the filter falls back to RFC 5737 /
+//! private IP classification so it degrades gracefully (and remains useful in
+//! environments without a `MaxMind` database). An explicitly-configured
+//! `database` that cannot be opened (typo, missing file, bad permissions) is a
+//! **hard config error** rejected at startup — it does not silently degrade to
+//! classification, which would otherwise emit plausible-but-incomplete
+//! enrichment with no `_geoip_lookup_failure` signal.
 
 use std::net::IpAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use ferro_stash_core::condition::Condition;
-use ferro_stash_core::error::Result;
+use ferro_stash_core::error::{FerroStashError, Result};
 use ferro_stash_core::event::{Event, EventValue};
 use ferro_stash_core::plugin::FilterPlugin;
 
@@ -67,22 +71,29 @@ impl GeoipFilter {
                 },
             );
 
-        // Open the database once at construction. A missing/unreadable file is
-        // a graceful failure (events get tagged at filter time), NOT a hard
-        // config error — this matches Logstash, where a misconfigured geoip
-        // simply tags events rather than aborting the pipeline.
+        // Open the database once at construction. An operator who explicitly
+        // configures a `database` path expects real MaxMind enrichment; if that
+        // path is a typo, missing, or unreadable, silently falling back to the
+        // private/loopback/public classification would produce plausible-but-
+        // incomplete enrichment with NO failure signal (no `_geoip_lookup_failure`
+        // tag). So an explicit-but-broken `database` is a hard, loud startup error
+        // (mirroring the dns-filter `nameserver` fix). Only when `database` is not
+        // configured at all do we fall back to the classification path.
         let reader = if database.is_empty() {
             None
         } else {
             match Reader::open_readfile(&database) {
                 Ok(r) => Some(Arc::new(r)),
                 Err(e) => {
-                    warn!(
-                        database = %database,
-                        error = %e,
-                        "geoip: failed to open MaxMind database; lookups will be tagged as failures"
-                    );
-                    None
+                    return Err(FerroStashError::Filter {
+                        plugin: "geoip".to_string(),
+                        message: format!(
+                            "failed to open MaxMind database {database:?}: {e}. \
+                             Check the `database` path exists and is a readable \
+                             `.mmdb` file, or omit `database` to use the built-in \
+                             private/loopback/public classification fallback."
+                        ),
+                    });
                 }
             }
         };
@@ -452,24 +463,47 @@ mod tests {
         assert!(filter.reader.is_none());
     }
 
-    #[tokio::test]
-    async fn test_geoip_missing_database_file_tags_failure() {
-        // A configured-but-unopenable database is a graceful failure: the
-        // reader is None and lookups tag failure (NOT a hard config error).
+    #[test]
+    fn test_geoip_missing_database_file_rejected_at_config_time() {
+        // A configured-but-unopenable `database` is a HARD config error: it
+        // fails loudly at startup rather than silently degrading to the
+        // classification fallback (which would emit plausible-but-incomplete
+        // enrichment with no `_geoip_lookup_failure` signal). This mirrors the
+        // dns-filter `nameserver` fix.
         let settings = serde_json::json!({
             "source": "ip",
             "database": "/nonexistent/path/to/GeoLite2-City.mmdb"
         });
+        let err = GeoipFilter::from_config(&settings, None)
+            .expect_err("a configured-but-unopenable database must be a config error");
+        match err {
+            FerroStashError::Filter { plugin, message } => {
+                assert_eq!(plugin, "geoip");
+                assert!(
+                    message.contains("MaxMind database"),
+                    "error should mention the database open failure: {message}"
+                );
+                assert!(
+                    message.contains("GeoLite2-City.mmdb"),
+                    "error should name the offending path: {message}"
+                );
+            }
+            other => panic!("expected FerroStashError::Filter, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_geoip_unset_database_uses_classification_fallback() {
+        // No `database` configured at all ⇒ classification fallback applies
+        // (reader is None) and a public IP is enriched, NOT tagged.
+        let settings = serde_json::json!({ "source": "ip" });
         let filter = GeoipFilter::from_config(&settings, None).expect("config");
         assert!(filter.reader.is_none());
         let mut event = Event::new("test");
         event.set("ip", EventValue::String("8.8.8.8".into()));
         let result = filter.filter(event).await.expect("filter");
-        // No reader configured AND a path was given: classification fallback
-        // still runs (reader is None ⇒ fallback), so it is enriched, NOT
-        // tagged. This mirrors graceful degradation: a public IP gets a
-        // network_type rather than a lost event.
         assert!(result[0].get("geoip").is_some());
+        assert!(!result[0].has_tag("_geoip_lookup_failure"));
     }
 
     // ----- Live-smoke test (real MaxMind database) -----

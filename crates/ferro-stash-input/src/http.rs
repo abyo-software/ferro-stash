@@ -10,6 +10,7 @@ use axum::Router;
 use ferro_stash_core::error::{FerroStashError, Result};
 use ferro_stash_core::event::Event;
 use ferro_stash_core::plugin::InputPlugin;
+use ferro_stash_core::settings_helpers::SettingsExt;
 use ferro_stash_core::shutdown::ShutdownSignal;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -31,9 +32,11 @@ impl HttpInput {
             .unwrap_or("0.0.0.0")
             .to_string();
         let port = settings
-            .get("port")
-            .and_then(ferro_stash_core::settings_helpers::as_u64_flexible)
-            .unwrap_or(8080) as u16;
+            .get_port("port", 8080)
+            .map_err(|message| FerroStashError::Input {
+                plugin: "http".to_string(),
+                message,
+            })?;
         let tags = settings
             .get("tags")
             .and_then(|v| v.as_array())
@@ -172,6 +175,20 @@ mod tests {
         assert_eq!(input.host, "0.0.0.0");
         assert_eq!(input.port, 8080);
         assert_eq!(input.response_code, 200);
+    }
+
+    #[test]
+    fn test_http_config_out_of_range_port_rejected() {
+        // Regression: the HTTP *listen* port above 65535 must fail loudly at
+        // config time rather than silently truncating via `as u16`
+        // (70000 as u16 == 4464). `response_code` is a status code, not a port.
+        let settings = serde_json::json!({ "port": 70000 });
+        let err = HttpInput::from_config(&settings).expect_err("port 70000 must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("70000") && msg.contains("port"),
+            "expected an out-of-range port error, got: {msg}"
+        );
     }
 
     #[test]

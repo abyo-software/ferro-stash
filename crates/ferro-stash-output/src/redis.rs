@@ -112,7 +112,12 @@ impl RedisOutput {
         let host = settings
             .get_string("host")
             .unwrap_or_else(|| "127.0.0.1".to_string());
-        let port = settings.get_u64("port").unwrap_or(6379) as u16;
+        let port = settings
+            .get_port("port", 6379)
+            .map_err(|message| FerroStashError::Output {
+                plugin: "redis".to_string(),
+                message,
+            })?;
 
         let key = settings.get_string("key").ok_or_else(|| {
             ferro_stash_core::error::FerroStashError::Output {
@@ -342,6 +347,18 @@ mod tests {
     fn test_redis_output_missing_key() {
         let settings = serde_json::json!({});
         assert!(RedisOutput::from_config(&settings, None).is_err());
+    }
+
+    #[test]
+    fn test_redis_output_port_out_of_range_rejected() {
+        // An out-of-range port (e.g. 70000) must fail loudly at config time
+        // rather than silently truncating (70000 as u16 == 4464) and
+        // connecting to the WRONG endpoint.
+        let settings = serde_json::json!({ "key": "k", "port": 70000 });
+        let err = RedisOutput::from_config(&settings, None)
+            .expect_err("out-of-range port must be rejected");
+        let msg = format!("{err}");
+        assert!(msg.contains("70000"), "error should mention the bad port: {msg}");
     }
 
     #[test]

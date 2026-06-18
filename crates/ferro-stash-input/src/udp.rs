@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use ferro_stash_core::error::{FerroStashError, Result};
 use ferro_stash_core::event::{Event, EventValue};
 use ferro_stash_core::plugin::InputPlugin;
+use ferro_stash_core::settings_helpers::SettingsExt;
 use ferro_stash_core::shutdown::ShutdownSignal;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -25,13 +26,21 @@ impl UdpInput {
             .and_then(|v| v.as_str())
             .unwrap_or("0.0.0.0")
             .to_string();
-        let port = settings
-            .get("port")
-            .and_then(ferro_stash_core::settings_helpers::as_u64_flexible)
-            .ok_or_else(|| FerroStashError::Input {
+        // `port` is required for the UDP input; absence is an error rather than
+        // a default. When present, validate the range so `port => 70000` fails
+        // loudly instead of silently truncating via `as u16`.
+        if settings.get_u64("port").is_none() {
+            return Err(FerroStashError::Input {
                 plugin: "udp".to_string(),
                 message: "port is required".to_string(),
-            })? as u16;
+            });
+        }
+        let port = settings
+            .get_port("port", 0)
+            .map_err(|message| FerroStashError::Input {
+                plugin: "udp".to_string(),
+                message,
+            })?;
         let buffer_size = settings
             .get("buffer_size")
             .and_then(ferro_stash_core::settings_helpers::as_u64_flexible)
@@ -132,6 +141,19 @@ mod tests {
     fn test_udp_config_missing_port() {
         let settings = serde_json::json!({});
         assert!(UdpInput::from_config(&settings).is_err());
+    }
+
+    #[test]
+    fn test_udp_config_out_of_range_port_rejected() {
+        // Regression: a port above 65535 must fail loudly at config time rather
+        // than silently truncating via `as u16` (70000 as u16 == 4464).
+        let settings = serde_json::json!({ "port": 70000 });
+        let err = UdpInput::from_config(&settings).expect_err("port 70000 must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("70000") && msg.contains("port"),
+            "expected an out-of-range port error, got: {msg}"
+        );
     }
 
     #[test]

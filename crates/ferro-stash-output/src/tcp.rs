@@ -6,6 +6,7 @@ use ferro_stash_core::condition::Condition;
 use ferro_stash_core::error::{FerroStashError, Result};
 use ferro_stash_core::event::Event;
 use ferro_stash_core::plugin::OutputPlugin;
+use ferro_stash_core::settings_helpers::SettingsExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
@@ -35,13 +36,22 @@ impl TcpOutput {
                 message: "host is required".to_string(),
             })?
             .to_string();
-        let port = settings
-            .get("port")
-            .and_then(ferro_stash_core::settings_helpers::as_u64_flexible)
-            .ok_or_else(|| FerroStashError::Output {
+        // `port` is mandatory for the TCP output: absence is an error, and a
+        // present-but-out-of-range value must fail loudly (not truncate via
+        // `as u16`). `get_port` validates the range; we reject absence first so
+        // the historical "port is required" error is preserved.
+        if settings.get("port").is_none() {
+            return Err(FerroStashError::Output {
                 plugin: "tcp".to_string(),
                 message: "port is required".to_string(),
-            })? as u16;
+            });
+        }
+        let port = settings
+            .get_port("port", 0)
+            .map_err(|message| FerroStashError::Output {
+                plugin: "tcp".to_string(),
+                message,
+            })?;
         let codec = match settings
             .get("codec")
             .and_then(|v| v.as_str())
@@ -133,6 +143,18 @@ mod tests {
     fn test_tcp_output_missing_port() {
         let settings = serde_json::json!({ "host": "localhost" });
         assert!(TcpOutput::from_config(&settings, None).is_err());
+    }
+
+    #[test]
+    fn test_tcp_output_port_out_of_range_rejected() {
+        // An out-of-range port (e.g. 70000) must fail loudly at config time
+        // rather than silently truncating (70000 as u16 == 4464) and
+        // connecting to the WRONG endpoint.
+        let settings = serde_json::json!({ "host": "localhost", "port": 70000 });
+        let err = TcpOutput::from_config(&settings, None)
+            .expect_err("out-of-range port must be rejected");
+        let msg = format!("{err}");
+        assert!(msg.contains("70000"), "error should mention the bad port: {msg}");
     }
 
     #[test]

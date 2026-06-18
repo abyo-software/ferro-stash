@@ -17,6 +17,7 @@ use async_trait::async_trait;
 use ferro_stash_core::error::{FerroStashError, Result};
 use ferro_stash_core::event::{Event, EventValue};
 use ferro_stash_core::plugin::InputPlugin;
+use ferro_stash_core::settings_helpers::SettingsExt;
 use ferro_stash_core::shutdown::ShutdownSignal;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -38,9 +39,11 @@ impl BeatsInput {
             .unwrap_or("0.0.0.0")
             .to_string();
         let port = settings
-            .get("port")
-            .and_then(ferro_stash_core::settings_helpers::as_u64_flexible)
-            .unwrap_or(5044) as u16;
+            .get_port("port", 5044)
+            .map_err(|message| FerroStashError::Input {
+                plugin: "beats".to_string(),
+                message,
+            })?;
         let tags = settings
             .get("tags")
             .and_then(|v| v.as_array())
