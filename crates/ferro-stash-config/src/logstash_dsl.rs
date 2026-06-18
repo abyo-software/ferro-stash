@@ -933,6 +933,9 @@ impl<'a> DslParser<'a> {
 
 #[cfg(test)]
 mod tests {
+    // Test assertions unwrap `Option`/`Result` to fail loudly on regressions;
+    // `unwrap_used` is denied in production code but allowed here.
+    #![allow(clippy::unwrap_used)]
     use super::*;
 
     #[test]
