@@ -15,6 +15,30 @@ use ferro_stash_core::event::{Event, EventValue};
 
 use crate::Codec;
 
+/// Maximum nesting depth when decoding length-delimited fields as
+/// embedded messages.
+///
+/// `decode_fields` recurses for every length-delimited field that fails
+/// the UTF-8-printable test, treating it as a nested message. Without a
+/// cap, an attacker can chain `0x0a <len> <inner>` frames (tag `0x0a` =
+/// field 1, wire type 2, passes the printable filter at the tag byte;
+/// the inner length byte is a control char that fails the printable
+/// test) so that the nested-message branch fires at every level. Each
+/// level costs only ~2 header bytes, so a sub-MB payload yields
+/// ~15-20K frames — enough to overflow the 2 MiB tokio worker stack and
+/// SIGSEGV the whole pipeline (the `protobuf` codec is fed whole
+/// payloads by the s3/kafka/redis inputs, so this is a remote,
+/// uncatchable DoS).
+///
+/// At the cap we stop recursing and emit the field as a scalar via the
+/// existing non-recursive fallback (hex/string), which bounds the stack.
+///
+/// 64 matches the sibling EDN codec's `MAX_DEPTH` (see `edn.rs`) and the
+/// same cap used by sibling repos (ferrosearch `1af3262`,
+/// ferrodruid `864f3ce`). Any real-world protobuf message nests well
+/// under this; 64 leaves generous headroom while killing the DoS cliff.
+const MAX_DEPTH: usize = 64;
+
 /// Protobuf codec configuration.
 #[derive(Debug, Clone, Default)]
 pub struct ProtobufCodec {
@@ -63,7 +87,11 @@ impl ProtobufCodec {
     }
 
     /// Decode protobuf wire format fields.
-    fn decode_fields(data: &[u8]) -> Vec<(u32, EventValue)> {
+    ///
+    /// `depth` tracks the embedded-message recursion level so the
+    /// nested-message branch cannot drive unbounded recursion (see
+    /// [`MAX_DEPTH`]). The top-level entry starts at depth 0.
+    fn decode_fields(data: &[u8], depth: usize) -> Vec<(u32, EventValue)> {
         let mut fields = Vec::new();
         let mut offset = 0;
 
@@ -136,29 +164,11 @@ impl ProtobufCodec {
                             EventValue::String(s.to_string())
                         } else {
                             // Try as nested message
-                            let nested = Self::decode_fields(bytes);
-                            if nested.is_empty() {
-                                EventValue::String(hex_encode(bytes))
-                            } else {
-                                let mut obj = indexmap::IndexMap::new();
-                                for (num, val) in nested {
-                                    obj.insert(format!("field_{num}"), val);
-                                }
-                                EventValue::Object(obj)
-                            }
+                            Self::decode_nested(bytes, depth)
                         }
                     } else {
                         // Try as nested message
-                        let nested = Self::decode_fields(bytes);
-                        if nested.is_empty() {
-                            EventValue::String(hex_encode(bytes))
-                        } else {
-                            let mut obj = indexmap::IndexMap::new();
-                            for (num, val) in nested {
-                                obj.insert(format!("field_{num}"), val);
-                            }
-                            EventValue::Object(obj)
-                        }
+                        Self::decode_nested(bytes, depth)
                     }
                 }
                 5 => {
@@ -185,6 +195,32 @@ impl ProtobufCodec {
 
         fields
     }
+
+    /// Decode a length-delimited payload as an embedded message,
+    /// recursing one level deeper.
+    ///
+    /// At [`MAX_DEPTH`] we stop recursing and emit the bytes as a hex
+    /// scalar (the same non-recursive fallback used when nested decoding
+    /// yields no fields). This bounds the recursion so a crafted chain
+    /// of nested length-delimited frames cannot overflow the stack.
+    fn decode_nested(bytes: &[u8], depth: usize) -> EventValue {
+        if depth >= MAX_DEPTH {
+            // Depth cap reached — do not recurse. Render the field as a
+            // scalar via the existing non-recursive fallback.
+            return EventValue::String(hex_encode(bytes));
+        }
+
+        let nested = Self::decode_fields(bytes, depth + 1);
+        if nested.is_empty() {
+            EventValue::String(hex_encode(bytes))
+        } else {
+            let mut obj = indexmap::IndexMap::new();
+            for (num, val) in nested {
+                obj.insert(format!("field_{num}"), val);
+            }
+            EventValue::Object(obj)
+        }
+    }
 }
 
 fn hex_encode(data: &[u8]) -> String {
@@ -206,7 +242,7 @@ impl Codec for ProtobufCodec {
             return Err(FerroStashError::Codec("empty protobuf data".to_string()));
         }
 
-        let fields = Self::decode_fields(data);
+        let fields = Self::decode_fields(data, 0);
         if fields.is_empty() {
             return Err(FerroStashError::Codec(
                 "no valid protobuf fields decoded".to_string(),
@@ -401,5 +437,62 @@ mod tests {
         ];
         // No assertion on Ok/Err — only that we don't panic / abort.
         let _ = codec.decode(&corpus);
+    }
+
+    /// Encode a varint into `out`.
+    fn push_varint(out: &mut Vec<u8>, mut v: u64) {
+        loop {
+            let mut byte = (v & 0x7F) as u8;
+            v >>= 7;
+            if v != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if v == 0 {
+                break;
+            }
+        }
+    }
+
+    /// Regression for the DD round-16 HIGH finding: `decode_fields`
+    /// recursed for every length-delimited field that failed the
+    /// UTF-8-printable test, with no depth limit. A crafted chain of
+    /// `0x0a <len> <inner>` frames (tag `0x0a` passes the printable
+    /// filter; the inner length byte is a control char that fails it)
+    /// drove the nested-message branch at every level — a sub-MB payload
+    /// yields ~15-20K frames and overflowed the 2 MiB tokio worker stack
+    /// → SIGSEGV. The [`MAX_DEPTH`] cap must bound the recursion: a
+    /// deeply nested payload decodes WITHOUT overflowing, rendering the
+    /// inner field as a scalar at the cap.
+    #[test]
+    fn test_protobuf_decode_deep_nesting_bounded() {
+        const LEVELS: usize = 5000;
+
+        // Innermost payload: field 1, wire type 2, value "x" (a
+        // printable string). Its length byte (0x01) is a control char,
+        // so each enclosing frame fails the printable test and takes the
+        // nested-message branch.
+        let mut payload: Vec<u8> = vec![0x0a, 0x01, b'x'];
+
+        // Wrap LEVELS times: each wrap is `0x0a <varint len> <inner>`.
+        for _ in 0..LEVELS {
+            let mut frame = vec![0x0a];
+            push_varint(&mut frame, payload.len() as u64);
+            frame.extend_from_slice(&payload);
+            payload = frame;
+        }
+
+        let codec = ProtobufCodec::default();
+        // Must NOT overflow the stack. Bounded recursion returns Ok; the
+        // structure beyond MAX_DEPTH is rendered as a scalar (hex
+        // string) rather than recursing further.
+        let events = codec.decode(&payload).expect("deep nesting must decode");
+        assert_eq!(events.len(), 1, "expected a single event");
+
+        // The top-level field 1 is present (nested object up to the cap).
+        assert!(
+            events[0].has_field("field_1"),
+            "top-level field_1 should be present"
+        );
     }
 }

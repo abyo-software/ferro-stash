@@ -41,6 +41,7 @@ pub struct ElasticsearchOutput {
     document_id: Option<String>,
     routing: Option<String>,
     action: BulkAction,
+    doc_as_upsert: bool,
     retry_count: usize,
     retry_delay_ms: u64,
     timeout_secs: u64,
@@ -65,6 +66,7 @@ impl std::fmt::Debug for ElasticsearchOutput {
             .field("document_id", &self.document_id)
             .field("routing", &self.routing)
             .field("action", &self.action)
+            .field("doc_as_upsert", &self.doc_as_upsert)
             .field("retry_count", &self.retry_count)
             .field("retry_delay_ms", &self.retry_delay_ms)
             .field("timeout_secs", &self.timeout_secs)
@@ -161,6 +163,30 @@ impl ElasticsearchOutput {
             "delete" => BulkAction::Delete,
             _ => BulkAction::Index,
         };
+        // A bulk UPDATE addresses an existing document by `_id`, so it cannot
+        // work without one. Reject an `action => "update"` config that has no
+        // `document_id` source at all — otherwise every batch would produce a
+        // per-item "document missing" / routing error and nothing would ever be
+        // updated. A `document_id` driven by `%{field}` is fine (the id is
+        // resolved per event); we only reject the no-id case. `delete` likewise
+        // needs an `_id`, but its prior contract is left unchanged here.
+        if matches!(action, BulkAction::Update) && document_id.is_none() {
+            return Err(FerroStashError::Output {
+                plugin: "elasticsearch".to_string(),
+                message: "action => \"update\" requires a document_id (set `document_id`, \
+                          e.g. document_id => \"%{id}\"): a bulk update addresses an \
+                          existing document by _id and cannot work without one"
+                    .to_string(),
+            });
+        }
+        // Opt-in `doc_as_upsert => true`: emit `"doc_as_upsert": true` alongside
+        // the partial `doc` so an update to a missing document inserts it
+        // instead of failing. Only meaningful for the `update` action; ignored
+        // for index/create/delete. Defaults to false to preserve prior behavior.
+        let doc_as_upsert = settings
+            .get("doc_as_upsert")
+            .and_then(ferro_stash_core::settings_helpers::as_bool_flexible)
+            .unwrap_or(false);
         let retry_count = settings
             .get("retry_max_interval")
             .and_then(ferro_stash_core::settings_helpers::as_u64_flexible)
@@ -200,6 +226,7 @@ impl ElasticsearchOutput {
             document_id,
             routing,
             action,
+            doc_as_upsert,
             retry_count,
             retry_delay_ms,
             timeout_secs,
@@ -243,10 +270,36 @@ impl ElasticsearchOutput {
             body.push_str(&serde_json::to_string(&action_obj).unwrap_or_default());
             body.push('\n');
 
-            // Document line
-            if !matches!(self.action, BulkAction::Delete) {
-                body.push_str(&event.to_json_string());
-                body.push('\n');
+            // Source line.
+            //
+            // `delete` has no source line. `index`/`create` send the raw
+            // document. `update` is different: the bulk UPDATE source line must
+            // be a set of partial-update instructions, NOT the raw document. ES
+            // expects `{"doc": {...}}` (or `{"script": ...}`); sending the raw
+            // event there yields a per-item "Validation Failed: script or doc
+            // is missing" error for EVERY document, so a normal
+            // `action => "update"` config would fail/retry/DLQ every batch and
+            // nothing would ever be updated. Wrap the event body in `doc`
+            // (optionally with `doc_as_upsert`) so the partial update is valid.
+            match self.action {
+                BulkAction::Delete => {}
+                BulkAction::Update => {
+                    let mut update_body = serde_json::Map::new();
+                    update_body.insert("doc".to_string(), event.to_json());
+                    if self.doc_as_upsert {
+                        update_body.insert(
+                            "doc_as_upsert".to_string(),
+                            serde_json::Value::Bool(true),
+                        );
+                    }
+                    let update_obj = serde_json::Value::Object(update_body);
+                    body.push_str(&serde_json::to_string(&update_obj).unwrap_or_default());
+                    body.push('\n');
+                }
+                BulkAction::Index | BulkAction::Create => {
+                    body.push_str(&event.to_json_string());
+                    body.push('\n');
+                }
             }
         }
 
@@ -1170,6 +1223,141 @@ mod tests {
         assert!(
             result.is_ok(),
             "a within-cap, error-free 200 body must still succeed: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_build_bulk_body_update_wraps_source_in_doc() {
+        // Round-16 regression: `action => "update"` must emit a partial-update
+        // source line `{"doc": {...}}`, NOT the raw event JSON. Sending the raw
+        // document is rejected per-item by ES ("script or doc is missing"), so
+        // every batch would fail/retry/DLQ. The update body must carry the event
+        // under `doc` (and must NOT be the bare event object).
+        let settings = serde_json::json!({
+            "hosts": ["http://localhost:9200"],
+            "index": "test-index",
+            "action": "update",
+            "document_id": "%{id}",
+        });
+        let output = ElasticsearchOutput::from_config(&settings, None).expect("config");
+        let mut event = Event::new("hello");
+        event.set("id", EventValue::String("doc1".into()));
+        let body = output.build_bulk_body(&[event]);
+
+        // Two lines: action metadata + source. The source line is the 2nd.
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 2, "update emits an action + a source line: {body}");
+        assert!(lines[0].contains(r#""update""#), "action line must be update: {body}");
+
+        let source: serde_json::Value =
+            serde_json::from_str(lines[1]).expect("source line must be valid JSON");
+        // The source MUST be `{"doc": {...}}` — i.e. the top-level object has a
+        // `doc` key wrapping the event, not the raw event fields at top level.
+        let doc = source
+            .get("doc")
+            .and_then(serde_json::Value::as_object)
+            .expect("update source line must wrap the event under `doc`");
+        // The wrapped doc carries the actual event payload (the `message`/`id`),
+        // proving it's the event body and not an empty/sentinel object.
+        assert!(
+            doc.contains_key("message") || doc.contains_key("id"),
+            "the wrapped doc must contain the event fields: {body}"
+        );
+        // The raw event must NOT appear at the top level (would be the bug).
+        assert!(
+            source.get("message").is_none(),
+            "the raw event must not be at the top level (only under `doc`): {body}"
+        );
+        // doc_as_upsert defaults off, so it must be absent unless opted in.
+        assert!(
+            source.get("doc_as_upsert").is_none(),
+            "doc_as_upsert must be absent by default: {body}"
+        );
+    }
+
+    #[test]
+    fn test_build_bulk_body_update_doc_as_upsert_opt_in() {
+        // With `doc_as_upsert => true`, the update source line carries both the
+        // partial `doc` and `"doc_as_upsert": true` so a missing document is
+        // inserted instead of failing.
+        let settings = serde_json::json!({
+            "hosts": ["http://localhost:9200"],
+            "index": "test-index",
+            "action": "update",
+            "document_id": "%{id}",
+            "doc_as_upsert": true,
+        });
+        let output = ElasticsearchOutput::from_config(&settings, None).expect("config");
+        let mut event = Event::new("hello");
+        event.set("id", EventValue::String("doc1".into()));
+        let body = output.build_bulk_body(&[event]);
+
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 2, "update emits an action + a source line: {body}");
+        let source: serde_json::Value =
+            serde_json::from_str(lines[1]).expect("source line must be valid JSON");
+        assert!(
+            source.get("doc").and_then(serde_json::Value::as_object).is_some(),
+            "update source must still wrap the event under `doc`: {body}"
+        );
+        assert_eq!(
+            source.get("doc_as_upsert").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "doc_as_upsert => true must emit `\"doc_as_upsert\": true`: {body}"
+        );
+    }
+
+    #[test]
+    fn test_config_update_without_document_id_rejected() {
+        // An `action => "update"` config with NO `document_id` source can never
+        // work (a bulk update addresses a document by `_id`), so it must be
+        // rejected at config time rather than failing every batch at runtime.
+        let no_id = serde_json::json!({
+            "hosts": ["http://localhost:9200"],
+            "index": "test",
+            "action": "update",
+        });
+        assert!(
+            ElasticsearchOutput::from_config(&no_id, None).is_err(),
+            "update action without document_id must be rejected at config time"
+        );
+
+        // A dynamic `%{field}` document_id is fine — resolved per event.
+        let with_id = serde_json::json!({
+            "hosts": ["http://localhost:9200"],
+            "index": "test",
+            "action": "update",
+            "document_id": "%{id}",
+        });
+        assert!(
+            ElasticsearchOutput::from_config(&with_id, None).is_ok(),
+            "update action with a document_id must be accepted"
+        );
+    }
+
+    #[test]
+    fn test_build_bulk_body_index_still_sends_raw_doc() {
+        // Guard: index/create must be unchanged — the source line is the raw
+        // event document, NOT wrapped under `doc`.
+        let settings = serde_json::json!({
+            "hosts": ["http://localhost:9200"],
+            "index": "test-index",
+            "action": "index",
+        });
+        let output = ElasticsearchOutput::from_config(&settings, None).expect("config");
+        let body = output.build_bulk_body(&[Event::new("hello")]);
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 2, "index emits an action + a source line: {body}");
+        let source: serde_json::Value =
+            serde_json::from_str(lines[1]).expect("source line must be valid JSON");
+        // The raw event (message) is at the top level; there is no `doc` wrapper.
+        assert!(
+            source.get("message").is_some(),
+            "index source must be the raw event document: {body}"
+        );
+        assert!(
+            source.get("doc").is_none(),
+            "index source must NOT wrap the event under `doc`: {body}"
         );
     }
 }

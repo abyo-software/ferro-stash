@@ -71,6 +71,40 @@ impl CsvCodec {
             target,
         })
     }
+
+    /// Reconstruct a single record's source text from its parsed fields,
+    /// using the same separator/quote the parser used so the resulting
+    /// `message` is faithful to the record (and record-sized, not
+    /// full-input-sized).
+    ///
+    /// Uses the `csv` writer so quoting matches the parser's dialect. On
+    /// the (unexpected) event of a writer error, falls back to a plain
+    /// separator-join — never panics (production path: no
+    /// `unwrap`/`expect`).
+    fn reconstruct_record(&self, record: &csv::StringRecord) -> String {
+        let mut wtr = csv::WriterBuilder::new()
+            .delimiter(self.separator)
+            .quote(self.quote)
+            // The writer appends a record terminator we trim off below;
+            // keep it as the default `\n` so behaviour is deterministic.
+            .from_writer(Vec::new());
+
+        let faithful = wtr
+            .write_record(record.iter())
+            .ok()
+            .and_then(|()| wtr.flush().ok())
+            .and_then(|()| wtr.into_inner().ok())
+            .map(|bytes| String::from_utf8_lossy(&bytes).trim_end().to_string());
+
+        faithful.unwrap_or_else(|| {
+            // Fallback: join fields with the configured separator.
+            let sep = String::from_utf8_lossy(&[self.separator]).into_owned();
+            record
+                .iter()
+                .collect::<Vec<_>>()
+                .join(&sep)
+        })
+    }
 }
 
 impl Codec for CsvCodec {
@@ -85,7 +119,6 @@ impl Codec for CsvCodec {
             .quote(self.quote)
             .from_reader(data);
 
-        let raw = String::from_utf8_lossy(data);
         let mut events = Vec::new();
 
         for record_result in reader.records() {
@@ -101,7 +134,15 @@ impl Codec for CsvCodec {
                 };
                 event.set(key, EventValue::String(field.to_string()));
             }
-            event.set_message(raw.trim_end());
+            // Each event's `message` is ITS OWN record's text, not the
+            // entire input. Previously this set `message` to a fresh
+            // full-input copy per event, which is both semantically wrong
+            // (every event got the whole input) and O(N×R) live memory
+            // (R full-input copies retained simultaneously → O(N²) for
+            // many short records → OOM). Reconstruct the record from its
+            // own fields using the configured separator/quote so the
+            // message is faithful and record-sized.
+            event.set_message(self.reconstruct_record(&record));
             events.push(event);
         }
 
@@ -215,5 +256,65 @@ mod tests {
             .expect("no events");
         assert_eq!(event.get("a"), Some(&EventValue::String("foo".into())));
         assert_eq!(event.get("b"), Some(&EventValue::String("bar".into())));
+    }
+
+    /// DD round-16 MEDIUM finding: each event's `message` must be ITS OWN
+    /// record's text, not the entire multi-record input (the old code set
+    /// `message = raw_full_input.trim_end()` per event, which was wrong
+    /// and O(N×R) live memory). With multiple records, each event's
+    /// `message` should be that record's own line.
+    #[test]
+    fn test_csv_per_record_message() {
+        let codec = CsvCodec {
+            columns: vec!["name".into(), "age".into()],
+            ..Default::default()
+        };
+        let events = codec
+            .decode(b"Alice,30\nBob,25\nCarol,40")
+            .expect("decode");
+        assert_eq!(events.len(), 3, "expected one event per record");
+
+        assert_eq!(
+            events[0].get("message"),
+            Some(&EventValue::String("Alice,30".into())),
+            "event message must be its own record, not the full input"
+        );
+        assert_eq!(
+            events[1].get("message"),
+            Some(&EventValue::String("Bob,25".into()))
+        );
+        assert_eq!(
+            events[2].get("message"),
+            Some(&EventValue::String("Carol,40".into()))
+        );
+    }
+
+    /// The reconstructed per-record message must be faithful to the
+    /// configured dialect: a field containing the separator is quoted
+    /// using the configured quote char, matching how the parser read it.
+    #[test]
+    fn test_csv_per_record_message_quoting() {
+        let codec = CsvCodec {
+            columns: vec!["a".into(), "b".into()],
+            ..Default::default()
+        };
+        // Second field contains a comma, so it was quoted on input.
+        let events = codec
+            .decode(b"plain,\"has,comma\"")
+            .expect("decode");
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].get("a"),
+            Some(&EventValue::String("plain".into()))
+        );
+        assert_eq!(
+            events[0].get("b"),
+            Some(&EventValue::String("has,comma".into()))
+        );
+        // The message round-trips the quoting of the embedded separator.
+        assert_eq!(
+            events[0].get("message"),
+            Some(&EventValue::String("plain,\"has,comma\"".into()))
+        );
     }
 }

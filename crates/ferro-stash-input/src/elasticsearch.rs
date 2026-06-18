@@ -291,8 +291,29 @@ impl ElasticsearchInput {
         let mut search_after: Option<serde_json::Value> = None;
         let mut last_tracking_value: Option<String> = None;
         let mut total_docs = 0usize;
+        // Belt-and-braces ceiling on the number of full pages a single search
+        // invocation will fetch. The cursor-advance guard below already breaks a
+        // non-advancing loop, but a (hypothetical) cursor that *changes* every
+        // page yet never terminates — e.g. a hostile upstream rotating the
+        // `sort` value endlessly — would otherwise spin without bound. Capping
+        // pages bounds the worst case regardless. With the 1000-doc default page
+        // size this still permits ~10M documents per invocation, far beyond any
+        // legitimate scheduled poll. The scheduled / once mode re-runs later.
+        const MAX_PAGES_PER_INVOCATION: usize = 10_000;
+        let mut pages = 0usize;
 
         loop {
+            pages += 1;
+            if pages > MAX_PAGES_PER_INVOCATION {
+                warn!(
+                    pages = pages - 1,
+                    total_docs,
+                    "elasticsearch search hit per-invocation page ceiling; \
+                     stopping this search (will resume on the next run)"
+                );
+                break;
+            }
+
             let mut body = serde_json::json!({
                 "query": query,
                 "size": self.scroll_size,
@@ -398,13 +419,45 @@ impl ElasticsearchInput {
                 total_docs += 1;
             }
 
-            // Get search_after from last hit's sort
-            if let Some(last_hit) = hits.last() {
-                search_after = last_hit.get("sort").cloned();
+            if hits.len() < self.scroll_size {
+                break; // last (partial) page — no more pages
             }
 
-            if hits.len() < self.scroll_size {
-                break; // no more pages
+            // Compute the next `search_after` cursor from the last hit's `sort`.
+            // A strictly-correct ES always emits a `sort` array (with the `_id`
+            // tiebreaker), so on the happy path this advances every full page.
+            //
+            // Cursor-advance guard (DD round-16 MEDIUM): if a malformed / hostile
+            // / proxied upstream returns a FULL page (`hits.len() >= scroll_size`)
+            // whose last hit has NO `sort`, `next_sort` is `None`; re-issuing the
+            // request without `search_after` would replay the IDENTICAL page,
+            // re-emitting the same docs forever. Likewise, a cursor that does not
+            // change from the previous iteration would replay the same page. In
+            // either case we cannot make progress, so warn and stop this search
+            // invocation cleanly. The scheduled / once mode runs again later.
+            let next_sort = hits.last().and_then(|h| h.get("sort").cloned());
+            match next_sort {
+                None => {
+                    warn!(
+                        total_docs,
+                        "elasticsearch returned a full page whose last hit has no \
+                         `sort` cursor; stopping this search to avoid replaying \
+                         the same page (malformed/hostile upstream?)"
+                    );
+                    break;
+                }
+                Some(ref ns) if Some(ns) == search_after.as_ref() => {
+                    warn!(
+                        total_docs,
+                        "elasticsearch `search_after` cursor did not advance \
+                         between pages; stopping this search to avoid replaying \
+                         the same page (malformed/hostile upstream?)"
+                    );
+                    break;
+                }
+                Some(ns) => {
+                    search_after = Some(ns);
+                }
             }
         }
 
@@ -1035,6 +1088,117 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "no events should be sent on an oversized-body error"
+        );
+    }
+
+    // ---- DD round-16 MEDIUM: non-advancing cursor must not loop forever ----
+
+    /// Spawn a mock ES that:
+    ///   - replies `{}` (no `id`) to the PIT-open POST so the input falls back
+    ///     to plain (non-PIT) search, and
+    ///   - replies `200 OK` to every `_search` POST with a FULL page (exactly
+    ///     `page_size` hits) whose last hit has NO `sort` array.
+    ///
+    /// A strictly-correct ES always emits a `sort` cursor, so this models a
+    /// malformed / hostile / proxied upstream. Before the cursor-advance guard,
+    /// `run_search` would re-issue the identical request forever (the cursor
+    /// stays `None`), re-emitting the same page and climbing `total_docs`
+    /// without bound. The guard must make `run_search` terminate after a single
+    /// search page.
+    ///
+    /// The listener accepts many connections so the test fails loudly (by
+    /// timing out / OOM) rather than passing vacuously if the guard regresses
+    /// and the loop spins; with the guard in place only the PIT-open + one
+    /// search + PIT-close (best-effort) connections are made.
+    async fn spawn_mock_es_full_page_no_sort(page_size: usize) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock listener");
+        let addr = listener.local_addr().expect("local addr");
+        // Build a full page of `page_size` hits where NO hit carries a `sort`
+        // array (so the next cursor is unconditionally `None`).
+        let hits: Vec<serde_json::Value> = (0..page_size)
+            .map(|i| {
+                serde_json::json!({
+                    "_index": "logs",
+                    "_id": format!("doc-{i}"),
+                    "_source": {"n": i},
+                    // intentionally NO "sort" field
+                })
+            })
+            .collect();
+        let search_body = serde_json::json!({ "hits": { "hits": hits } }).to_string();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            // Accept generously: if the guard regressed, the input would keep
+            // POSTing /_search and we'd keep serving the same full page, so the
+            // test would hang/OOM (failing loudly) rather than pass vacuously.
+            for _ in 0..512u32 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let body = search_body.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    let Ok(n) = stream.read(&mut buf).await else {
+                        return;
+                    };
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    // The PIT-open hits `/_pit`; reply with no `id` so the input
+                    // falls back to plain search. Everything else (the `_search`
+                    // POST, the best-effort PIT close) gets the full page body —
+                    // harmless for the close, which ignores the response.
+                    let resp_body = if req.contains("/_pit") {
+                        "{}".to_string()
+                    } else {
+                        body
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                        resp_body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.flush().await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn test_run_search_terminates_on_full_page_without_sort_cursor() {
+        // A full page whose last hit lacks a `sort` cursor would, without the
+        // cursor-advance guard, make `run_search` replay the identical request
+        // forever and re-emit the same docs unboundedly. With the guard it must
+        // return cleanly after ingesting exactly ONE page.
+        let page_size = 5usize;
+        let host = spawn_mock_es_full_page_no_sort(page_size).await;
+        let settings = serde_json::json!({
+            "hosts": [host],
+            "index": "logs",
+            "size": page_size,
+        });
+        let input = ElasticsearchInput::from_config(&settings).expect("config");
+        // Generous channel so sends never block; if the loop spun, `total_docs`
+        // (and the count we drain below) would be unbounded.
+        let (tx, mut rx) = mpsc::channel(10_000);
+
+        // Bound the whole call: if the guard regressed, `run_search` would never
+        // return — surface that as a loud test failure instead of a hang.
+        let result = tokio::time::timeout(Duration::from_secs(10), input.run_search(&tx)).await;
+        let result = result.expect("run_search must terminate, not loop forever");
+        result.expect("run_search should complete Ok on a full page lacking a sort cursor");
+        drop(tx);
+
+        // Exactly one page of docs was emitted — not many pages of duplicates.
+        let mut count = 0usize;
+        while rx.try_recv().is_ok() {
+            count += 1;
+        }
+        assert_eq!(
+            count, page_size,
+            "expected exactly one page ({page_size} docs); a larger count means \
+             the loop replayed the same page (cursor guard regressed)"
         );
     }
 
