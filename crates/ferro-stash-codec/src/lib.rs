@@ -109,6 +109,49 @@ pub fn create_codec(name: &str, settings: &serde_json::Value) -> Result<Box<dyn 
     }
 }
 
+/// Resolves a plugin's `codec` setting into `(name, settings)`, handling both
+/// Logstash DSL forms:
+///
+/// * String form (`codec => json`) → `("json", {})`.
+/// * Descriptor form (`codec => json { target => "data" }`) →
+///   `("json", { "target": "data" })`. The DSL parser represents this as an
+///   object carrying a `_plugin` discriminator; the discriminator is stripped.
+/// * Missing / unrecognized → `(default_name, {})`.
+///
+/// Both input and output plugins use this so codec sub-settings are honored
+/// instead of being silently dropped (a `get_string("codec")` lookup returns
+/// `None` for the descriptor form and falls back to the default codec).
+pub fn resolve_codec(
+    settings: &serde_json::Value,
+    default_name: &str,
+) -> (String, serde_json::Value) {
+    let empty = || serde_json::Value::Object(serde_json::Map::new());
+
+    match settings.get("codec") {
+        Some(serde_json::Value::String(name)) => (name.clone(), empty()),
+        Some(serde_json::Value::Object(map)) => {
+            let name = map
+                .get("_plugin")
+                .and_then(|v| v.as_str())
+                .map_or_else(|| default_name.to_string(), String::from);
+            let mut sub = map.clone();
+            sub.remove("_plugin");
+            (name, serde_json::Value::Object(sub))
+        }
+        _ => (default_name.to_string(), empty()),
+    }
+}
+
+/// Resolves the `codec` setting (both DSL forms) and builds the codec,
+/// threading the codec's own sub-settings through to [`create_codec`].
+pub fn create_codec_from_settings(
+    settings: &serde_json::Value,
+    default_name: &str,
+) -> Result<Box<dyn Codec>> {
+    let (name, sub) = resolve_codec(settings, default_name);
+    create_codec(&name, &sub)
+}
+
 /// Returns the default codec (plain).
 pub fn default_codec() -> Box<dyn Codec> {
     Box::new(plain::PlainCodec::default())
@@ -143,4 +186,52 @@ pub fn supported_codecs() -> Vec<&'static str> {
         "edn",
         "edn_lines",
     ]
+}
+
+#[cfg(test)]
+mod resolve_codec_tests {
+    use super::*;
+
+    #[test]
+    fn resolve_string_form() {
+        let s = serde_json::json!({ "codec": "json" });
+        let (name, sub) = resolve_codec(&s, "plain");
+        assert_eq!(name, "json");
+        assert_eq!(sub, serde_json::json!({}));
+    }
+
+    #[test]
+    fn resolve_descriptor_form_keeps_sub_settings_and_strips_plugin() {
+        let s = serde_json::json!({
+            "codec": { "_plugin": "json", "target": "data", "pretty": true }
+        });
+        let (name, sub) = resolve_codec(&s, "plain");
+        assert_eq!(name, "json");
+        assert_eq!(sub, serde_json::json!({ "target": "data", "pretty": true }));
+        assert!(sub.get("_plugin").is_none());
+    }
+
+    #[test]
+    fn resolve_missing_uses_default() {
+        let (name, sub) = resolve_codec(&serde_json::json!({}), "plain");
+        assert_eq!(name, "plain");
+        assert_eq!(sub, serde_json::json!({}));
+    }
+
+    #[test]
+    fn resolve_descriptor_without_plugin_uses_default_name() {
+        let s = serde_json::json!({ "codec": { "target": "data" } });
+        let (name, sub) = resolve_codec(&s, "plain");
+        assert_eq!(name, "plain");
+        assert_eq!(sub, serde_json::json!({ "target": "data" }));
+    }
+
+    #[test]
+    fn create_from_settings_descriptor_form_builds_named_codec() {
+        // Descriptor form must build the named codec, not the default — this is
+        // the bug the output plugins had with get_string("codec").
+        let s = serde_json::json!({ "codec": { "_plugin": "json" } });
+        let codec = create_codec_from_settings(&s, "plain").expect("codec builds");
+        assert_eq!(codec.name(), "json");
+    }
 }
