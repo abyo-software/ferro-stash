@@ -11,7 +11,7 @@
 //! configured codec. A channel-based test injection point is preserved for unit tests.
 
 use async_trait::async_trait;
-use ferro_stash_codec::{create_codec, Codec};
+use ferro_stash_codec::{create_codec, resolve_codec, Codec};
 use ferro_stash_core::error::{FerroStashError, Result};
 use ferro_stash_core::event::{Event, EventValue};
 use ferro_stash_core::plugin::InputPlugin;
@@ -91,7 +91,7 @@ impl RedisInput {
         let batch_count = settings.get_u64("batch_count").unwrap_or(125) as usize;
         // Resolve the codec name and its sub-settings so they are honored
         // rather than dropped.
-        let (codec, codec_settings) = crate::codec_config::resolve_codec(settings, "json");
+        let (codec, codec_settings) = resolve_codec(settings, "json");
         let timeout = settings.get_u64("timeout").unwrap_or(5);
 
         Ok(Self {

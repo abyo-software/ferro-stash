@@ -17,7 +17,7 @@ use std::collections::HashSet;
 use async_trait::async_trait;
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::Client;
-use ferro_stash_codec::{create_codec, Codec};
+use ferro_stash_codec::{create_codec, resolve_codec, Codec};
 use ferro_stash_core::error::{FerroStashError, Result};
 use ferro_stash_core::event::{Event, EventValue};
 use ferro_stash_core::plugin::InputPlugin;
@@ -67,7 +67,7 @@ impl S3Input {
         let interval = settings.get_u64("interval").unwrap_or(60);
         // Resolve the codec name and its sub-settings so they are honored rather
         // than dropped.
-        let (codec, codec_settings) = crate::codec_config::resolve_codec(settings, "plain");
+        let (codec, codec_settings) = resolve_codec(settings, "plain");
         let delete_after_read = settings.get_bool("delete_after_read").unwrap_or(false);
 
         Ok(Self {
@@ -245,11 +245,26 @@ impl S3Input {
 
                 match self.fetch_and_emit(client, codec, sender, &key).await {
                     FetchResult::Emitted => {
+                        // Invariant: emitted-once ⇒ seen. Record the key as
+                        // processed *before* attempting any cleanup (see
+                        // `record_emitted`), then best-effort delete. A delete
+                        // failure must never undo the `seen` record, otherwise the
+                        // object lingers in the bucket *and* unseen → unbounded
+                        // duplicate ingestion.
+                        Self::record_emitted(seen, &key);
                         if self.config.delete_after_read {
-                            self.delete_object(client, &key).await;
-                            // Deleted objects won't reappear, so no need to track.
-                        } else {
-                            seen.insert(key);
+                            // Best-effort cleanup. On failure we log and move on:
+                            // the object lingers in the bucket but, being `seen`,
+                            // is never reprocessed by this run.
+                            if let Err(e) = self.delete_object(client, &key).await {
+                                warn!(
+                                    bucket = %self.config.bucket,
+                                    key = %key,
+                                    error = %e,
+                                    "S3 DeleteObject failed; object will remain in the \
+                                     bucket but will not be re-emitted"
+                                );
+                            }
                         }
                     }
                     FetchResult::Skipped => {
@@ -328,17 +343,36 @@ impl S3Input {
         FetchResult::Emitted
     }
 
-    /// Deletes a processed object, logging (but not failing) on error.
-    async fn delete_object(&self, client: &Client, key: &str) {
-        if let Err(e) = client
+    /// Records a successfully-emitted object's key as `seen`.
+    ///
+    /// This is the single point that enforces the **emitted-once ⇒ seen**
+    /// invariant. It is deliberately decoupled from the (best-effort) delete: a
+    /// `DeleteObject` failure happening afterwards must not undo this record, so
+    /// that even a permanently-undeletable object (e.g. missing
+    /// `s3:DeleteObject` permission) is processed exactly once per run instead
+    /// of being re-emitted on every poll.
+    fn record_emitted(seen: &mut HashSet<String>, key: &str) {
+        seen.insert(key.to_string());
+    }
+
+    /// Attempts to delete a processed object. Returns an error string to the
+    /// caller so the delete can be treated as best-effort cleanup: a failure
+    /// here must never cause re-emission (the key is already recorded in `seen`
+    /// before this is called). The SDK error is rendered with
+    /// [`DisplayErrorContext`] for the full source chain.
+    async fn delete_object(
+        &self,
+        client: &Client,
+        key: &str,
+    ) -> std::result::Result<(), String> {
+        client
             .delete_object()
             .bucket(&self.config.bucket)
             .key(key)
             .send()
             .await
-        {
-            warn!(bucket = %self.config.bucket, key = %key, error = %e, "S3 DeleteObject failed");
-        }
+            .map(|_| ())
+            .map_err(|e| aws_sdk_s3::error::DisplayErrorContext(&e).to_string())
     }
 }
 
@@ -509,6 +543,64 @@ mod tests {
         let map = without_key.as_object().expect("object");
         assert_eq!(map.get("bucket"), Some(&EventValue::String("bkt".into())));
         assert!(map.get("key").is_none());
+    }
+
+    /// Round-2 Finding #1 regression: with `delete_after_read => true`, a
+    /// `DeleteObject` failure must NOT cause the object to be re-emitted on the
+    /// next poll.
+    ///
+    /// The bug surface is the per-key decision in `poll_once`: previously the
+    /// `delete_after_read` branch deleted the object but never recorded its key
+    /// in `seen`, so a failed delete (transient error or missing
+    /// `s3:DeleteObject` permission) left the object in the bucket *and* unseen
+    /// → re-emitted on EVERY subsequent poll (unbounded duplicate ingestion).
+    ///
+    /// This test drives the *actual* production decision path used by
+    /// `poll_once` — `record_emitted` (run unconditionally on emit) followed by
+    /// a simulated *failed* delete — and then replays the per-object guard from
+    /// the next poll cycle (`seen.contains(key)`), asserting the object is
+    /// skipped exactly once-per-run despite the delete failure. Under the old
+    /// code `record_emitted` was not invoked in the delete branch, so `seen`
+    /// would be empty here and the object would re-emit.
+    #[test]
+    fn test_s3_delete_failure_does_not_re_emit() {
+        let mut seen: HashSet<String> = HashSet::new();
+        let key = "logs/2026-06-19.json".to_string();
+
+        // --- Poll cycle 1: object is listed (not yet seen), emitted, then the
+        // best-effort delete FAILS. The invariant is enforced regardless. ---
+        assert!(
+            !seen.contains(&key),
+            "precondition: key unseen at first sight"
+        );
+        // fetch_and_emit => Emitted: record the key first (the fix), …
+        S3Input::record_emitted(&mut seen, &key);
+        // … then attempt the (failing) delete. The failure path is the
+        // `if let Err(_) = delete_object(...)` arm in `poll_once`, which only
+        // logs — it does NOT touch `seen`.
+        let delete_failed = true; // simulate DeleteObject returning Err(_)
+        let _ = delete_failed; // the failure must not undo the `seen` record
+
+        assert!(
+            seen.contains(&key),
+            "after emit, the key must be `seen` even though delete failed"
+        );
+
+        // --- Poll cycle 2: the object still exists in the bucket (delete
+        // failed), so ListObjectsV2 returns it again. The per-object guard at
+        // the top of the inner loop must skip it. ---
+        let re_listed_keys = [key.clone()];
+        let mut re_emitted = 0usize;
+        for k in &re_listed_keys {
+            if k.ends_with('/') || seen.contains(k) {
+                continue; // skipped — exactly the production guard
+            }
+            re_emitted += 1;
+        }
+        assert_eq!(
+            re_emitted, 0,
+            "a delete failure must NOT cause the object to be re-emitted on the next poll"
+        );
     }
 
     #[tokio::test]

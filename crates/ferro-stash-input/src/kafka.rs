@@ -10,7 +10,7 @@
 //! can exercise the event-emission path without a live broker.
 
 use async_trait::async_trait;
-use ferro_stash_codec::{create_codec, Codec};
+use ferro_stash_codec::{create_codec, resolve_codec, Codec};
 use ferro_stash_core::error::{FerroStashError, Result};
 use ferro_stash_core::event::{Event, EventValue};
 use ferro_stash_core::plugin::InputPlugin;
@@ -140,7 +140,7 @@ impl KafkaInput {
         let consumer_threads = settings.get_u64("consumer_threads").unwrap_or(1) as usize;
         // Resolve the codec name and its sub-settings (e.g. `target`,
         // `pattern`) so they are honored rather than dropped.
-        let (codec, codec_settings) = crate::codec_config::resolve_codec(settings, "plain");
+        let (codec, codec_settings) = resolve_codec(settings, "plain");
         let client_id = settings
             .get_string("client_id")
             .unwrap_or_else(|| "ferro-stash-kafka-input".to_string());
