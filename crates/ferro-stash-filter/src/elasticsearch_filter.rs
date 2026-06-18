@@ -39,7 +39,6 @@ use indexmap::IndexMap;
 use reqwest::Client;
 use tracing::{debug, warn};
 
-#[derive(Debug)]
 pub struct ElasticsearchFilter {
     /// Elasticsearch hosts; tried in order for basic failover.
     hosts: Vec<String>,
@@ -71,6 +70,34 @@ pub struct ElasticsearchFilter {
     /// Shared HTTP client.
     client: Client,
     condition: Option<Condition>,
+}
+
+/// Manual `Debug` impl that redacts secret-bearing fields.
+///
+/// `ElasticsearchFilter` holds `password` and `api_key` plaintext secrets.
+/// A derived `Debug` would print them verbatim (e.g. via `format!("{filter:?}")`
+/// or a `tracing` `{:?}` event), leaking credentials into logs. We render the
+/// presence of each secret without its value (`Some("***")` / `None`) and print
+/// all other fields normally.
+impl std::fmt::Debug for ElasticsearchFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redact = |opt: &Option<String>| opt.as_ref().map(|_| "***");
+        f.debug_struct("ElasticsearchFilter")
+            .field("hosts", &self.hosts)
+            .field("index", &self.index)
+            .field("query_template", &self.query_template)
+            .field("result_size", &self.result_size)
+            .field("fields", &self.fields)
+            .field("enable_sort", &self.enable_sort)
+            .field("target", &self.target)
+            .field("tag_on_failure", &self.tag_on_failure)
+            .field("username", &self.username)
+            .field("password", &redact(&self.password))
+            .field("api_key", &redact(&self.api_key))
+            .field("client", &self.client)
+            .field("condition", &self.condition)
+            .finish()
+    }
 }
 
 impl ElasticsearchFilter {
@@ -681,6 +708,45 @@ mod tests {
         assert_eq!(filter.username, Some("elastic".to_string()));
         assert_eq!(filter.password, Some("changeme".to_string()));
         assert_eq!(filter.api_key, Some("abc123".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_debug_redacts_secrets() {
+        let settings = serde_json::json!({
+            "hosts": ["http://es.example.com:9200"],
+            "index": "secure-index",
+            "user": "elastic",
+            "password": "changeme",
+            "api_key": "abc123"
+        });
+        let filter = ElasticsearchFilter::from_config(&settings, None).expect("config");
+        let dbg = format!("{filter:?}");
+
+        // Plaintext secret values must never appear in the Debug output.
+        assert!(
+            !dbg.contains("changeme"),
+            "password leaked in Debug output: {dbg}"
+        );
+        assert!(
+            !dbg.contains("abc123"),
+            "api_key leaked in Debug output: {dbg}"
+        );
+
+        // Secrets are rendered as a redaction marker, and non-secret fields
+        // (host, index, username) are still printed normally.
+        assert!(dbg.contains("***"), "redaction marker missing: {dbg}");
+        assert!(
+            dbg.contains("es.example.com"),
+            "host missing from Debug output: {dbg}"
+        );
+        assert!(
+            dbg.contains("secure-index"),
+            "index missing from Debug output: {dbg}"
+        );
+        assert!(
+            dbg.contains("elastic"),
+            "username (non-secret) missing from Debug output: {dbg}"
+        );
     }
 
     // ----- Integration test against a tiny raw-HTTP mock server -----

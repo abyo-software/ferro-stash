@@ -19,7 +19,6 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 #[allow(dead_code)]
-#[derive(Debug)]
 pub struct ElasticsearchInput {
     hosts: Vec<String>,
     index: String,
@@ -34,6 +33,27 @@ pub struct ElasticsearchInput {
     last_run_metadata_path: Option<String>,
     client: Client,
     tags: Vec<String>,
+}
+
+// Manual Debug to avoid leaking `password` / `api_key` into logs / error context.
+impl std::fmt::Debug for ElasticsearchInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ElasticsearchInput")
+            .field("hosts", &self.hosts)
+            .field("index", &self.index)
+            .field("query", &self.query)
+            .field("esql_query", &self.esql_query)
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "***"))
+            .field("api_key", &self.api_key.as_ref().map(|_| "***"))
+            .field("schedule", &self.schedule)
+            .field("scroll_size", &self.scroll_size)
+            .field("tracking_field", &self.tracking_field)
+            .field("last_run_metadata_path", &self.last_run_metadata_path)
+            .field("client", &self.client)
+            .field("tags", &self.tags)
+            .finish()
+    }
 }
 
 impl ElasticsearchInput {
@@ -485,6 +505,28 @@ mod tests {
         let settings = serde_json::json!({ "api_key": "my_api_key" });
         let input = ElasticsearchInput::from_config(&settings).expect("config");
         assert_eq!(input.api_key, Some("my_api_key".to_string()));
+    }
+
+    #[test]
+    fn test_es_input_debug_redacts_password_and_api_key() {
+        let settings = serde_json::json!({
+            "index": "my-index",
+            "user": "admin",
+            "password": "hunter2-secret",
+            "api_key": "topsecret-api-key",
+        });
+        let input = ElasticsearchInput::from_config(&settings).expect("config");
+        let dbg = format!("{input:?}");
+        assert!(
+            !dbg.contains("hunter2-secret"),
+            "password leaked in Debug: {dbg}"
+        );
+        assert!(
+            !dbg.contains("topsecret-api-key"),
+            "api_key leaked in Debug: {dbg}"
+        );
+        assert!(dbg.contains("***"), "expected redaction marker in: {dbg}");
+        assert!(dbg.contains("my-index"), "expected index in: {dbg}");
     }
 
     #[test]

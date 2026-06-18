@@ -27,7 +27,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 /// S3 input configuration — mirrors the Logstash S3 input settings.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct S3InputConfig {
     pub bucket: String,
     pub prefix: String,
@@ -40,6 +40,26 @@ pub struct S3InputConfig {
     /// empty object when the codec is named without a settings block.
     pub codec_settings: serde_json::Value,
     pub delete_after_read: bool,
+}
+
+// Manual Debug to avoid leaking `secret_access_key` into logs / error context.
+impl std::fmt::Debug for S3InputConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3InputConfig")
+            .field("bucket", &self.bucket)
+            .field("prefix", &self.prefix)
+            .field("region", &self.region)
+            .field("access_key_id", &self.access_key_id)
+            .field(
+                "secret_access_key",
+                &self.secret_access_key.as_ref().map(|_| "***"),
+            )
+            .field("interval", &self.interval)
+            .field("codec", &self.codec)
+            .field("codec_settings", &self.codec_settings)
+            .field("delete_after_read", &self.delete_after_read)
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -438,6 +458,23 @@ mod tests {
         assert_eq!(input.config.access_key_id.as_deref(), Some("AKIA..."));
         assert_eq!(input.config.interval, 30);
         assert!(input.config.delete_after_read);
+    }
+
+    #[test]
+    fn test_s3_input_config_debug_redacts_secret_access_key() {
+        let settings = serde_json::json!({
+            "bucket": "prod-logs",
+            "access_key_id": "AKIAEXAMPLE",
+            "secret_access_key": "super-secret-value",
+        });
+        let input = S3Input::from_config(&settings).expect("config");
+        let dbg = format!("{:?}", input.config);
+        assert!(
+            !dbg.contains("super-secret-value"),
+            "secret_access_key leaked in Debug: {dbg}"
+        );
+        assert!(dbg.contains("***"), "expected redaction marker in: {dbg}");
+        assert!(dbg.contains("prod-logs"), "expected bucket in: {dbg}");
     }
 
     #[test]

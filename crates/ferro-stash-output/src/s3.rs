@@ -24,7 +24,11 @@ use tokio::sync::OnceCell;
 use tracing::info;
 
 /// S3 output configuration — mirrors the Logstash S3 output settings.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is implemented manually so the `secret_access_key` secret is never
+/// rendered in logs/diagnostics (`{:?}` prints `Some("***")` / `None`, not the
+/// plaintext key).
+#[derive(Clone)]
 pub struct S3OutputConfig {
     pub bucket: String,
     pub prefix: String,
@@ -41,6 +45,29 @@ pub struct S3OutputConfig {
     /// Use path-style addressing (`endpoint/bucket/key`) — required by most
     /// S3-compatible stores.
     pub force_path_style: bool,
+}
+
+impl std::fmt::Debug for S3OutputConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Redact the secret access key so neither this struct nor any wrapper
+        // (e.g. `S3Output`'s derived Debug) can leak the secret via `{:?}`.
+        // `access_key_id` is an identifier, not a secret, so it stays visible.
+        let secret_access_key = self.secret_access_key.as_ref().map(|_| "***");
+        f.debug_struct("S3OutputConfig")
+            .field("bucket", &self.bucket)
+            .field("prefix", &self.prefix)
+            .field("region", &self.region)
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &secret_access_key)
+            .field("time_file", &self.time_file)
+            .field("codec", &self.codec)
+            .field("encoding", &self.encoding)
+            .field("size_file", &self.size_file)
+            .field("rotation_strategy", &self.rotation_strategy)
+            .field("endpoint", &self.endpoint)
+            .field("force_path_style", &self.force_path_style)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -527,6 +554,33 @@ mod tests {
         assert_eq!(output.config.time_file, 300);
         assert_eq!(output.config.encoding, "gzip");
         assert_eq!(output.config.rotation_strategy, RotationStrategy::Size);
+    }
+
+    #[test]
+    fn test_s3_config_debug_redacts_secret_access_key() {
+        // The secret_access_key must never appear in Debug output.
+        let settings = serde_json::json!({
+            "bucket": "prod",
+            "access_key_id": "AKIAEXAMPLE",
+            "secret_access_key": "super-secret-sak",
+        });
+        let output = S3Output::from_config(&settings, None).expect("config");
+
+        let config_dbg = format!("{:?}", output.config);
+        assert!(
+            !config_dbg.contains("super-secret-sak"),
+            "config Debug leaked the secret_access_key: {config_dbg}"
+        );
+        assert!(config_dbg.contains("***"), "config Debug must mark redaction");
+        // Non-secret fields stay visible for diagnostics.
+        assert!(config_dbg.contains("prod"), "bucket should remain visible");
+
+        // The wrapper's Debug (which prints the config) must also not leak it.
+        let output_dbg = format!("{output:?}");
+        assert!(
+            !output_dbg.contains("super-secret-sak"),
+            "output Debug leaked the secret_access_key: {output_dbg}"
+        );
     }
 
     #[test]

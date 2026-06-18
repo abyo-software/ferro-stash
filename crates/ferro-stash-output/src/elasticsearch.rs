@@ -16,8 +16,12 @@ use ferro_stash_core::plugin::OutputPlugin;
 use reqwest::Client;
 use tracing::{debug, error, warn};
 
+/// Elasticsearch output plugin.
+///
+/// `Debug` is implemented manually so the `password` and `api_key` secrets are
+/// never rendered in logs/diagnostics (`{:?}` prints `Some("***")` / `None`,
+/// not the plaintext credentials).
 #[allow(dead_code)]
-#[derive(Debug)]
 pub struct ElasticsearchOutput {
     hosts: Vec<String>,
     index: String,
@@ -34,6 +38,32 @@ pub struct ElasticsearchOutput {
     timeout_secs: u64,
     condition: Option<Condition>,
     host_index: std::sync::atomic::AtomicUsize,
+}
+
+impl std::fmt::Debug for ElasticsearchOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Redact the password and api_key secrets so they can never leak via
+        // `{:?}`. `username` is an identifier, not a secret, so it stays visible.
+        let password = self.password.as_ref().map(|_| "***");
+        let api_key = self.api_key.as_ref().map(|_| "***");
+        f.debug_struct("ElasticsearchOutput")
+            .field("hosts", &self.hosts)
+            .field("index", &self.index)
+            .field("client", &self.client)
+            .field("username", &self.username)
+            .field("password", &password)
+            .field("api_key", &api_key)
+            .field("pipeline", &self.pipeline)
+            .field("document_id", &self.document_id)
+            .field("routing", &self.routing)
+            .field("action", &self.action)
+            .field("retry_count", &self.retry_count)
+            .field("retry_delay_ms", &self.retry_delay_ms)
+            .field("timeout_secs", &self.timeout_secs)
+            .field("condition", &self.condition)
+            .field("host_index", &self.host_index)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -476,6 +506,34 @@ mod tests {
         });
         let output = ElasticsearchOutput::from_config(&settings, None).expect("config");
         assert_eq!(output.api_key, Some("abc123".to_string()));
+    }
+
+    #[test]
+    fn test_elasticsearch_debug_redacts_secrets() {
+        // Neither the password nor the api_key must appear in Debug output.
+        let settings = serde_json::json!({
+            "hosts": ["http://localhost:9200"],
+            "user": "elastic",
+            "password": "super-secret-pw",
+            "api_key": "super-secret-key",
+        });
+        let output = ElasticsearchOutput::from_config(&settings, None).expect("config");
+
+        let output_dbg = format!("{output:?}");
+        assert!(
+            !output_dbg.contains("super-secret-pw"),
+            "Debug leaked the password: {output_dbg}"
+        );
+        assert!(
+            !output_dbg.contains("super-secret-key"),
+            "Debug leaked the api_key: {output_dbg}"
+        );
+        assert!(output_dbg.contains("***"), "Debug must mark redaction");
+        // Non-secret fields stay visible for diagnostics.
+        assert!(
+            output_dbg.contains("elastic"),
+            "username should remain visible"
+        );
     }
 
     #[test]
