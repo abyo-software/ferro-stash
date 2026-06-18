@@ -32,6 +32,9 @@ sha1 = { workspace = true }
 md5 = { workspace = true }
 hmac = { workspace = true }
 hex = { workspace = true }
+reqwest = { workspace = true }
+maxminddb = "0.28.1"
+hickory-resolver = "0.25.2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
