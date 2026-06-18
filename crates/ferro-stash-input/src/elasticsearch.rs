@@ -117,6 +117,14 @@ impl ElasticsearchInput {
             .get("schedule")
             .and_then(|v| v.as_str())
             .map(String::from);
+        // Validate the schedule at config time so an obviously-degenerate value
+        // (e.g. "0" or "*/0 * * * *", which parse to a zero interval) fails
+        // loudly at startup rather than panicking `tokio::time::interval` on the
+        // first scheduled tick. `run()` additionally clamps as a belt-and-braces
+        // safeguard. (DD round-6 Finding #2.)
+        if let Some(ref sched) = schedule {
+            validate_schedule(sched)?;
+        }
         let scroll_size = settings
             .get("size")
             .and_then(ferro_stash_core::settings_helpers::as_u64_flexible)
@@ -285,6 +293,18 @@ impl ElasticsearchInput {
                 message: format!("search error: {e}"),
             })?;
 
+            // An ES error response (401/403/404/429/5xx) is still valid JSON but
+            // has no `hits.hits`. Without this check the loop would parse it,
+            // find an empty hit list, break, and return Ok(())  silently
+            // ingesting nothing while masking an auth/index/server failure
+            // (in scheduled mode the failure is never even logged). Mirror the
+            // `if !status.is_success()` check used by the ES OUTPUT/FILTER
+            // plugins and fail loudly. (DD round-6 Finding #1.)
+            let status = response.status();
+            if !status.is_success() {
+                return Err(es_status_error("search", status, response).await);
+            }
+
             let result: serde_json::Value =
                 response.json().await.map_err(|e| FerroStashError::Input {
                     plugin: "elasticsearch".to_string(),
@@ -389,6 +409,15 @@ impl ElasticsearchInput {
             message: format!("ES|QL error: {e}"),
         })?;
 
+        // Same hazard as `run_search`: an ES error response is valid JSON with
+        // no `values`/`columns`, so without this check the query would yield
+        // zero rows and return Ok(()), masking the failure. (DD round-6
+        // Finding #1.)
+        let status = response.status();
+        if !status.is_success() {
+            return Err(es_status_error("ES|QL", status, response).await);
+        }
+
         let result: serde_json::Value =
             response.json().await.map_err(|e| FerroStashError::Input {
                 plugin: "elasticsearch".to_string(),
@@ -430,6 +459,99 @@ impl ElasticsearchInput {
     }
 }
 
+/// Maximum number of bytes of a non-success ES response body included in the
+/// error message. Bounds the snippet so a large/hostile error body cannot
+/// produce an unbounded log line, while still aiding debugging.
+const ERROR_BODY_SNIPPET_LIMIT: usize = 512;
+
+/// Build a loud `Input` error from a non-success Elasticsearch HTTP response.
+///
+/// Includes the status code and a bounded (`ERROR_BODY_SNIPPET_LIMIT`-byte)
+/// snippet of the response body. Mirrors the `if !status.is_success()` handling
+/// in the ES OUTPUT/FILTER plugins so an auth/index/server failure surfaces as
+/// an error instead of being silently treated as an empty successful search.
+async fn es_status_error(
+    op: &str,
+    status: reqwest::StatusCode,
+    response: reqwest::Response,
+) -> FerroStashError {
+    // `text()` consumes the body; on a transport error mid-read fall back to an
+    // empty snippet rather than masking the (more important) status code.
+    let body = response.text().await.unwrap_or_default();
+    let snippet = bounded_snippet(&body, ERROR_BODY_SNIPPET_LIMIT);
+    FerroStashError::Input {
+        plugin: "elasticsearch".to_string(),
+        message: format!("{op} request failed with HTTP status {status}: {snippet}"),
+    }
+}
+
+/// Truncate `body` to at most `limit` bytes (on a UTF-8 char boundary),
+/// appending a `…` marker when truncation occurs.
+fn bounded_snippet(body: &str, limit: usize) -> String {
+    if body.len() <= limit {
+        return body.to_string();
+    }
+    // Walk back to a char boundary so we never split a multi-byte sequence.
+    let mut end = limit;
+    while end > 0 && !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… ({} bytes total)", &body[..end], body.len())
+}
+
+/// Parse a schedule string into a polling interval in seconds, clamped to a
+/// minimum of 1.
+///
+/// Accepts cron `*/N * * * *` (every N minutes) or a plain seconds count.
+/// Anything unparseable falls back to the 300s (5 minute) default.
+///
+/// The `.max(1)` clamp is load-bearing: `tokio::time::interval` PANICS on a
+/// zero `Duration`, and a zero interval is reachable via `schedule => "0"`
+/// (parses to 0) or `schedule => "*/0 * * * *"` (`*/0` → 0). Clamping here
+/// (and validating in `from_config`) keeps a degenerate schedule from
+/// panicking the input task on its first scheduled tick. (DD round-6
+/// Finding #2.)
+fn schedule_interval_secs(schedule: &str) -> u64 {
+    let s = schedule.trim();
+    let parsed = if let Some(rest) = s.strip_prefix("*/") {
+        // Cron format: */N * * * * → every N minutes
+        let num_str = rest.split_whitespace().next().unwrap_or(rest);
+        num_str.parse::<u64>().ok().map(|n| n.saturating_mul(60))
+    } else {
+        // Try plain seconds
+        s.parse::<u64>().ok()
+    };
+    parsed.unwrap_or(300).max(1)
+}
+
+/// Reject an obviously-degenerate schedule at config time.
+///
+/// A schedule that *parses* to a zero interval (`"0"`, `"*/0 * * * *"`) is
+/// always a configuration error: it would request "poll every 0 seconds",
+/// which is meaningless and (absent the `run()` clamp) panics
+/// `tokio::time::interval`. We fail loudly here so the operator learns at
+/// startup. Unparseable / non-`*/` strings are NOT rejected — they fall back
+/// to the 300s default in `schedule_interval_secs`, preserving prior behavior.
+fn validate_schedule(schedule: &str) -> Result<()> {
+    let s = schedule.trim();
+    let parsed_zero = if let Some(rest) = s.strip_prefix("*/") {
+        let num_str = rest.split_whitespace().next().unwrap_or(rest);
+        num_str.parse::<u64>().ok() == Some(0)
+    } else {
+        s.parse::<u64>().ok() == Some(0)
+    };
+    if parsed_zero {
+        return Err(FerroStashError::Input {
+            plugin: "elasticsearch".to_string(),
+            message: format!(
+                "schedule {schedule:?} resolves to a zero polling interval; \
+                 use a positive number of seconds or a cron `*/N * * * *` with N >= 1"
+            ),
+        });
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl InputPlugin for ElasticsearchInput {
     fn name(&self) -> &'static str {
@@ -449,22 +571,15 @@ impl InputPlugin for ElasticsearchInput {
             return Ok(());
         }
 
-        // Scheduled polling: cron `*/N * * * *` means every N minutes
+        // Scheduled polling: cron `*/N * * * *` means every N minutes.
+        // `schedule_interval_secs` clamps the result to a minimum of 1 so a
+        // degenerate schedule (e.g. "0" or "*/0 * * * *") cannot pass a zero
+        // `Duration` to `tokio::time::interval`, which would PANIC the task on
+        // its first tick. (DD round-6 Finding #2.)
         let interval_secs = self
             .schedule
             .as_deref()
-            .and_then(|s| {
-                let s = s.trim();
-                if let Some(rest) = s.strip_prefix("*/") {
-                    // Cron format: */N * * * * → every N minutes
-                    let num_str = rest.split_whitespace().next().unwrap_or(rest);
-                    num_str.parse::<u64>().ok().map(|n| n * 60) // minutes → seconds
-                } else {
-                    // Try plain seconds
-                    s.parse::<u64>().ok()
-                }
-            })
-            .unwrap_or(300); // default 5 minutes
+            .map_or(300, schedule_interval_secs);
 
         let mut timer = tokio::time::interval(Duration::from_secs(interval_secs));
 
@@ -609,5 +724,203 @@ mod tests {
         });
         let input = ElasticsearchInput::from_config(&settings).expect("config");
         assert_eq!(input.esql_query, Some("FROM logs | LIMIT 10".to_string()));
+    }
+
+    // ---- DD round-6 Finding #2: zero-interval schedule must not panic ----
+
+    #[test]
+    fn test_schedule_interval_secs_clamps_zero_to_one() {
+        // "0" → 0 seconds, "*/0 * * * *" → 0 minutes; both must clamp to >= 1
+        // so `Duration::from_secs` / `tokio::time::interval` never see 0.
+        assert_eq!(schedule_interval_secs("0"), 1);
+        assert_eq!(schedule_interval_secs("*/0 * * * *"), 1);
+        assert_eq!(schedule_interval_secs("*/0"), 1);
+        // Whitespace variants exercise trim().
+        assert_eq!(schedule_interval_secs("  0  "), 1);
+    }
+
+    #[test]
+    fn test_schedule_interval_secs_normal_values() {
+        assert_eq!(schedule_interval_secs("*/5 * * * *"), 300); // 5 minutes
+        assert_eq!(schedule_interval_secs("30"), 30); // 30 seconds
+        assert_eq!(schedule_interval_secs("*/1 * * * *"), 60); // 1 minute
+        // Unparseable falls back to the 5-minute default.
+        assert_eq!(schedule_interval_secs("not-a-schedule"), 300);
+    }
+
+    #[test]
+    fn test_schedule_interval_secs_no_panic_on_construction() {
+        // Reproduces the panic path directly: build a Duration from the clamped
+        // value for a zero schedule. `tokio::time::interval` panics on a zero
+        // period, so a non-zero Duration here proves the clamp protects it.
+        let secs = schedule_interval_secs("*/0 * * * *");
+        assert!(secs >= 1);
+        let _dur = Duration::from_secs(secs); // would feed tokio::time::interval
+    }
+
+    #[test]
+    fn test_es_input_zero_schedule_rejected_at_config() {
+        // Loud-at-startup validation: a schedule that resolves to a zero
+        // interval is a config error, not a first-tick panic.
+        for sched in ["0", "*/0 * * * *", "*/0"] {
+            let settings = serde_json::json!({ "schedule": sched });
+            let err = ElasticsearchInput::from_config(&settings)
+                .expect_err(&format!("schedule {sched:?} must be rejected at config time"));
+            assert!(
+                matches!(err, FerroStashError::Input { ref plugin, .. } if plugin == "elasticsearch"),
+                "expected elasticsearch Input error for {sched:?}, got: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_es_input_valid_schedule_accepted_at_config() {
+        for sched in ["*/5 * * * *", "30", "*/1 * * * *"] {
+            let settings = serde_json::json!({ "schedule": sched });
+            assert!(
+                ElasticsearchInput::from_config(&settings).is_ok(),
+                "schedule {sched:?} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_schedule_rejects_zero() {
+        assert!(validate_schedule("0").is_err());
+        assert!(validate_schedule("*/0 * * * *").is_err());
+        assert!(validate_schedule("*/0").is_err());
+        assert!(validate_schedule("  0 ").is_err());
+    }
+
+    #[test]
+    fn test_validate_schedule_accepts_nonzero_and_unparseable() {
+        assert!(validate_schedule("*/5 * * * *").is_ok());
+        assert!(validate_schedule("30").is_ok());
+        // Unparseable strings fall back to the default and are not rejected.
+        assert!(validate_schedule("garbage").is_ok());
+    }
+
+    // ---- DD round-6 Finding #1: bounded snippet helper ----
+
+    #[test]
+    fn test_bounded_snippet_short_body_unchanged() {
+        assert_eq!(bounded_snippet("short body", 512), "short body");
+    }
+
+    #[test]
+    fn test_bounded_snippet_truncates_long_body() {
+        let body = "x".repeat(1000);
+        let snippet = bounded_snippet(&body, 512);
+        assert!(snippet.starts_with(&"x".repeat(512)));
+        assert!(snippet.contains("1000 bytes total"));
+        // Bounded: snippet is the 512 prefix + a short suffix marker.
+        assert!(snippet.len() < 1000);
+    }
+
+    #[test]
+    fn test_bounded_snippet_respects_char_boundary() {
+        // Multi-byte chars must not be split mid-sequence (would panic on a
+        // non-boundary slice). Each `あ` is 3 bytes; limit 4 falls mid-char.
+        let body = "あああ"; // 9 bytes
+        let snippet = bounded_snippet(body, 4);
+        assert!(snippet.starts_with("あ"));
+        assert!(snippet.contains("9 bytes total"));
+    }
+
+    // ---- DD round-6 Finding #1: non-2xx HTTP responses must error ----
+
+    /// Spawn a one-shot mock HTTP server that replies with the given status
+    /// line + JSON body to the first connection, then returns its address.
+    async fn spawn_mock_es(status_line: &'static str, body: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock listener");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            // Accept a few connections (PIT open + search both hit the server).
+            for _ in 0..4u8 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                // Drain the request (best-effort; we don't parse it).
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let response = format!(
+                    "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn test_run_search_errors_on_non_2xx() {
+        // A 403 with a valid JSON error body must produce Err, NOT Ok with zero
+        // events. Without the status check this would parse the body, find no
+        // `hits.hits`, break, and return Ok(()) — silently ingesting nothing.
+        let host = spawn_mock_es(
+            "HTTP/1.1 403 Forbidden",
+            r#"{"error":{"type":"security_exception","reason":"action denied"},"status":403}"#,
+        )
+        .await;
+        let settings = serde_json::json!({
+            "hosts": [host],
+            "index": "logs",
+        });
+        let input = ElasticsearchInput::from_config(&settings).expect("config");
+        let (tx, mut rx) = mpsc::channel(16);
+        let result = input.run_search(&tx).await;
+        assert!(
+            result.is_err(),
+            "non-2xx search must return Err, got Ok: {result:?}"
+        );
+        if let Err(FerroStashError::Input { plugin, message }) = result {
+            assert_eq!(plugin, "elasticsearch");
+            assert!(message.contains("403"), "status code missing: {message}");
+            assert!(
+                message.contains("security_exception"),
+                "body snippet missing: {message}"
+            );
+        } else {
+            panic!("expected Input error variant");
+        }
+        // No events were emitted.
+        assert!(rx.try_recv().is_err(), "no events should be sent on error");
+    }
+
+    #[tokio::test]
+    async fn test_run_esql_errors_on_non_2xx() {
+        let host = spawn_mock_es(
+            "HTTP/1.1 500 Internal Server Error",
+            r#"{"error":{"type":"server_error","reason":"boom"},"status":500}"#,
+        )
+        .await;
+        let settings = serde_json::json!({
+            "hosts": [host],
+            "esql": "FROM logs | LIMIT 10",
+        });
+        let input = ElasticsearchInput::from_config(&settings).expect("config");
+        let (tx, mut rx) = mpsc::channel(16);
+        // run_esql is reached via run_search when esql_query is set.
+        let result = input.run_search(&tx).await;
+        assert!(
+            result.is_err(),
+            "non-2xx ES|QL must return Err, got Ok: {result:?}"
+        );
+        if let Err(FerroStashError::Input { plugin, message }) = result {
+            assert_eq!(plugin, "elasticsearch");
+            assert!(message.contains("500"), "status code missing: {message}");
+            assert!(
+                message.contains("server_error"),
+                "body snippet missing: {message}"
+            );
+        } else {
+            panic!("expected Input error variant");
+        }
+        assert!(rx.try_recv().is_err(), "no events should be sent on error");
     }
 }
