@@ -63,9 +63,14 @@ WORKDIR /build
 # from /build/ferro-stash/ferro-stash/crates/ferro-stash-ruby, the four `..`
 # hops in `../../../../artichoke-extended` land on /build, so the fork must
 # live at /build/artichoke-extended.
-RUN git clone --depth 1 --branch extended \
+# Pinned to a commit for reproducible image builds (override with
+# --build-arg ARTICHOKE_SHA=... ; bump when the fork advances).
+ARG ARTICHOKE_SHA=245b89427ccbcf98b0c116dbfcf57a097c28b151
+RUN git init -q /build/artichoke-extended \
+    && git -C /build/artichoke-extended remote add origin \
         https://github.com/masumi-ryugo/artichoke-extended.git \
-        /build/artichoke-extended
+    && git -C /build/artichoke-extended fetch --depth 1 origin "$ARTICHOKE_SHA" \
+    && git -C /build/artichoke-extended reset --hard FETCH_HEAD
 
 # Copy the repo into /build/ferro-stash/ferro-stash (one extra nesting level so
 # the four-`..` path dep above reaches /build — this mirrors CI's
