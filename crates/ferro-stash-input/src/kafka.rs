@@ -1,19 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Kafka input plugin — consumes messages from Apache Kafka topics.
 //!
-//! This is a production-shaped stub: config parsing, trait implementation, and the
-//! consumer-loop skeleton are fully wired. The actual Kafka connection is stubbed
-//! (no external kafka crate) and can be swapped for `rdkafka` or a pure-Rust client
-//! by replacing the inner `consume_stub` method.
+//! Backed by `rdkafka`'s async [`StreamConsumer`] (librdkafka under the hood). The
+//! consumer subscribes to the configured topics, decodes each message payload with
+//! the configured codec, and emits the resulting events on the pipeline channel.
+//! Offsets are committed automatically (`enable.auto.commit=true`).
+//!
+//! A channel-based test injection point (`test_receiver`) is preserved so unit tests
+//! can exercise the event-emission path without a live broker.
 
 use async_trait::async_trait;
+use ferro_stash_codec::{create_codec, Codec};
 use ferro_stash_core::error::{FerroStashError, Result};
 use ferro_stash_core::event::{Event, EventValue};
 use ferro_stash_core::plugin::InputPlugin;
 use ferro_stash_core::settings_helpers::SettingsExt;
 use ferro_stash_core::shutdown::ShutdownSignal;
+use rdkafka::config::ClientConfig;
+use rdkafka::consumer::{Consumer, StreamConsumer};
+use rdkafka::message::Message;
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Kafka consumer configuration — mirrors the Logstash kafka input settings.
 #[derive(Debug, Clone)]
@@ -126,6 +133,66 @@ impl KafkaInput {
         self.test_receiver = Some(rx);
         self
     }
+
+    /// Builds the configured codec, mapping codec errors into an input error.
+    fn build_codec(&self) -> Result<Box<dyn Codec>> {
+        create_codec(&self.config.codec, &serde_json::json!({})).map_err(|e| {
+            FerroStashError::Input {
+                plugin: "kafka".to_string(),
+                message: format!("unknown/invalid codec '{}': {e}", self.config.codec),
+            }
+        })
+    }
+
+    /// Builds an `rdkafka` client configuration from the plugin settings.
+    fn build_client_config(&self) -> ClientConfig {
+        let mut cc = ClientConfig::new();
+        cc.set("bootstrap.servers", self.config.bootstrap_servers.join(","))
+            .set("group.id", &self.config.group_id)
+            .set("client.id", &self.config.client_id)
+            .set("auto.offset.reset", self.config.auto_offset_reset.to_string())
+            .set("enable.auto.commit", "true")
+            .set("enable.partition.eof", "false");
+        cc
+    }
+
+    /// Decodes a Kafka payload via the codec and emits the resulting events,
+    /// stamping each with Kafka metadata. Returns `false` if the downstream
+    /// channel has closed (caller should stop).
+    async fn emit_payload(
+        codec: &dyn Codec,
+        sender: &mpsc::Sender<Event>,
+        payload: &[u8],
+        topic: &str,
+        partition: i32,
+        offset: i64,
+    ) -> bool {
+        let events = match codec.decode(payload) {
+            Ok(events) => events,
+            Err(e) => {
+                warn!(topic = %topic, error = %e, "Kafka payload decode error; skipping message");
+                return true;
+            }
+        };
+        for mut event in events {
+            event.set(
+                "[@metadata][kafka][topic]",
+                EventValue::String(topic.to_string()),
+            );
+            event.set(
+                "[@metadata][kafka][partition]",
+                EventValue::Integer(i64::from(partition)),
+            );
+            event.set(
+                "[@metadata][kafka][offset]",
+                EventValue::Integer(offset),
+            );
+            if sender.send(event).await.is_err() {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 #[async_trait]
@@ -174,12 +241,82 @@ impl InputPlugin for KafkaInput {
             return Ok(());
         }
 
-        // --- Stub: real Kafka consumer would go here ---
-        warn!("Kafka input plugin: using stub implementation — configure real Kafka connection for production");
+        // --- Real Kafka consumer (rdkafka StreamConsumer) ---
+        let codec = self.build_codec()?;
 
-        // Wait for shutdown (stub does not produce events).
-        shutdown.wait().await;
-        info!("Kafka input shutting down");
+        let consumer: StreamConsumer = self.build_client_config().create().map_err(|e| {
+            FerroStashError::Input {
+                plugin: "kafka".to_string(),
+                message: format!("failed to create Kafka consumer: {e}"),
+            }
+        })?;
+
+        let topic_refs: Vec<&str> = self.config.topics.iter().map(String::as_str).collect();
+        consumer
+            .subscribe(&topic_refs)
+            .map_err(|e| FerroStashError::Input {
+                plugin: "kafka".to_string(),
+                message: format!("failed to subscribe to topics {:?}: {e}", self.config.topics),
+            })?;
+
+        info!(topics = ?self.config.topics, "Kafka consumer subscribed");
+
+        loop {
+            tokio::select! {
+                // `recv()` is documented as cancellation-safe, so it is safe to
+                // drop the future when shutdown wins the select.
+                result = consumer.recv() => {
+                    match result {
+                        Ok(msg) => {
+                            let topic = msg.topic().to_string();
+                            let partition = msg.partition();
+                            let offset = msg.offset();
+                            match msg.payload() {
+                                Some(payload) => {
+                                    if !Self::emit_payload(
+                                        codec.as_ref(),
+                                        &sender,
+                                        payload,
+                                        &topic,
+                                        partition,
+                                        offset,
+                                    )
+                                    .await
+                                    {
+                                        info!("Kafka input: downstream channel closed, stopping");
+                                        break;
+                                    }
+                                }
+                                None => {
+                                    debug!(
+                                        topic = %topic,
+                                        partition,
+                                        offset,
+                                        "Kafka message had empty payload; skipping"
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            // Transient broker / rebalance errors: log and back off
+                            // briefly rather than tearing down the pipeline.
+                            warn!(error = %e, "Kafka recv error; backing off");
+                            tokio::select! {
+                                () = tokio::time::sleep(tokio::time::Duration::from_secs(1)) => {}
+                                () = shutdown.wait() => {
+                                    info!("Kafka input shutting down");
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    }
+                }
+                () = shutdown.wait() => {
+                    info!("Kafka input shutting down");
+                    break;
+                }
+            }
+        }
 
         Ok(())
     }
@@ -272,9 +409,48 @@ mod tests {
 
         let handle = tokio::spawn(async move { input.run(tx, sig).await });
 
-        // Immediately shut down — the stub should exit cleanly
+        // Immediately shut down — should exit cleanly even with no broker.
         ctrl.shutdown();
         let result = handle.await.expect("join");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_kafka_build_codec_invalid() {
+        let settings = serde_json::json!({ "topics": ["t"], "codec": "definitely-not-a-codec" });
+        let input = KafkaInput::from_config(&settings).expect("config");
+        assert!(input.build_codec().is_err());
+    }
+
+    /// Live smoke test against a real Kafka broker.
+    ///
+    /// Run with: `KAFKA_BROKERS=localhost:9092 KAFKA_TOPIC=my-topic \
+    ///   cargo test -p ferro-stash-input --  --ignored kafka_live_smoke`
+    /// Produce a message to `KAFKA_TOPIC` (offset reset is `earliest`) and the
+    /// test asserts that at least one event is emitted within the timeout.
+    #[tokio::test]
+    #[ignore = "requires a live Kafka broker; set KAFKA_BROKERS and KAFKA_TOPIC"]
+    async fn kafka_live_smoke() {
+        let brokers = std::env::var("KAFKA_BROKERS").expect("KAFKA_BROKERS");
+        let topic = std::env::var("KAFKA_TOPIC").expect("KAFKA_TOPIC");
+        let settings = serde_json::json!({
+            "bootstrap_servers": brokers,
+            "topics": [topic],
+            "group_id": format!("ferro-stash-smoke-{}", uuid::Uuid::new_v4()),
+            "auto_offset_reset": "earliest",
+            "codec": "plain",
+        });
+        let mut input = KafkaInput::from_config(&settings).expect("config");
+        let (tx, mut rx) = mpsc::channel(100);
+        let (ctrl, sig) = ferro_stash_core::shutdown::ShutdownController::new();
+        let handle = tokio::spawn(async move { input.run(tx, sig).await });
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(15), rx.recv())
+            .await
+            .expect("timed out waiting for a Kafka message");
+        assert!(event.is_some(), "expected at least one event");
+
+        ctrl.shutdown();
+        let _ = handle.await.expect("join");
     }
 }
