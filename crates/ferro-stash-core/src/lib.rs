@@ -67,6 +67,33 @@ where
     bounded_snippet(&String::from_utf8_lossy(&buf), limit)
 }
 
+/// Read a *complete* response body from a byte-chunk stream, but reject it if it
+/// exceeds `max` bytes. Unlike `Response::json()`/`text()` (which buffer the
+/// whole body unconditionally), this caps the read so a misconfigured/hostile
+/// endpoint returning a huge 2xx body cannot OOM the process. A body within the
+/// limit is returned in full (so the caller can parse it); an over-limit body is
+/// `Err` (a truncated body can't be meaningfully parsed, so it is rejected).
+/// The stream must be `Unpin` — wrap with `Box::pin(...)`.
+pub async fn read_capped_body<S, E>(mut stream: S, max: usize) -> Result<Vec<u8>, String>
+where
+    S: tokio_stream::Stream<Item = Result<bytes::Bytes, E>> + Unpin,
+{
+    use tokio_stream::StreamExt;
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(c) => {
+                if buf.len() + c.len() > max {
+                    return Err(format!("response body exceeds {max} bytes"));
+                }
+                buf.extend_from_slice(&c);
+            }
+            Err(_) => return Err("error reading response body stream".to_string()),
+        }
+    }
+    Ok(buf)
+}
+
 #[cfg(test)]
 mod bounded_snippet_tests {
     use super::bounded_snippet;
@@ -110,5 +137,23 @@ mod bounded_snippet_tests {
             bytes::Bytes::from_static(b"oops"),
         )]);
         assert_eq!(super::read_bounded_body_stream(stream, 512).await, "oops");
+    }
+
+    #[tokio::test]
+    async fn capped_body_within_limit_returns_full() {
+        let stream = tokio_stream::iter(vec![
+            Ok::<_, std::convert::Infallible>(bytes::Bytes::from_static(b"{\"hits\":")),
+            Ok(bytes::Bytes::from_static(b"[]}")),
+        ]);
+        let body = super::read_capped_body(stream, 1024).await.expect("within limit");
+        assert_eq!(body, b"{\"hits\":[]}");
+    }
+
+    #[tokio::test]
+    async fn capped_body_over_limit_errors() {
+        let chunks: Vec<Result<bytes::Bytes, std::convert::Infallible>> =
+            (0..1000).map(|_| Ok(bytes::Bytes::from(vec![b'x'; 1024]))).collect();
+        let stream = tokio_stream::iter(chunks);
+        assert!(super::read_capped_body(stream, 4096).await.is_err());
     }
 }

@@ -16,6 +16,14 @@ use ferro_stash_core::plugin::OutputPlugin;
 use reqwest::Client;
 use tracing::{debug, error, warn};
 
+/// Generous cap on the bulk *success* (2xx) response body that we buffer before
+/// scanning it for item-level errors. `Response::text()` buffers the entire body
+/// unconditionally, so a misconfigured/compromised host could return a `200`
+/// with a multi-GB body and OOM the process. Bulk responses are normally bounded
+/// by the batch size, so this never trips legitimately — it only stops a
+/// pathological response. Matches the ES filter/input 256 MB cap for consistency.
+const MAX_RESPONSE_BYTES: usize = 256 * 1024 * 1024;
+
 /// Elasticsearch output plugin.
 ///
 /// `Debug` is implemented manually so the `password` and `api_key` secrets are
@@ -79,18 +87,32 @@ impl ElasticsearchOutput {
         let hosts: Vec<String> = match settings.get("hosts") {
             Some(serde_json::Value::Array(a)) => a
                 .iter()
-                .filter_map(|v| v.as_str().map(String::from))
+                // Trim each entry and drop empty/whitespace-only hosts so a blank
+                // host (e.g. `hosts => ["", "  "]`) can never reach `next_host()`.
+                .filter_map(|v| v.as_str().map(str::trim).filter(|s| !s.is_empty()))
+                .map(String::from)
                 .collect(),
-            Some(serde_json::Value::String(s)) => vec![s.clone()],
+            Some(serde_json::Value::String(s)) => {
+                // A single host string is also trimmed; a blank/whitespace-only
+                // string collects to an empty vec and is rejected below.
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![trimmed.to_string()]
+                }
+            }
             // Not configured at all => default host (preserves prior behavior).
             _ => vec!["http://localhost:9200".to_string()],
         };
-        // A configured-but-empty `hosts` (e.g. `hosts => []` or an array of
-        // non-strings like `hosts => [9200]`) collects to an empty vec. Reject
-        // it at config time — otherwise the first `output()` call would panic in
-        // `next_host()` via `idx % self.hosts.len()` (divide-by-zero) and the
-        // out-of-bounds index. Mirrors the kafka output's `bootstrap_servers`
-        // contract: fail loudly at config time rather than at runtime.
+        // A configured-but-empty `hosts` (e.g. `hosts => []`, an array of
+        // non-strings like `hosts => [9200]`, or one with only blank/whitespace
+        // entries like `hosts => [""]` / `hosts => ""`) collects to an empty vec.
+        // Reject it at config time — otherwise the first `output()` call would
+        // panic in `next_host()` via `idx % self.hosts.len()` (divide-by-zero)
+        // and the out-of-bounds index. Mirrors the kafka output's
+        // `bootstrap_servers` contract: fail loudly at config time rather than at
+        // runtime.
         if hosts.is_empty() {
             return Err(FerroStashError::Output {
                 plugin: "elasticsearch".to_string(),
@@ -266,6 +288,20 @@ impl OutputPlugin for ElasticsearchOutput {
     }
 
     async fn output(&self, events: Vec<Event>) -> Result<()> {
+        self.output_capped(events, MAX_RESPONSE_BYTES).await
+    }
+
+    fn condition(&self) -> Option<&Condition> {
+        self.condition.as_ref()
+    }
+}
+
+impl ElasticsearchOutput {
+    /// Like [`OutputPlugin::output`], but with an explicit cap on the number of
+    /// bytes buffered from a successful (2xx) bulk response. `output()` always
+    /// passes the production [`MAX_RESPONSE_BYTES`]; tests pass a small cap to
+    /// drive the over-limit path without producing a 256 MB body.
+    async fn output_capped(&self, events: Vec<Event>, max_response_bytes: usize) -> Result<()> {
         if events.is_empty() {
             return Ok(());
         }
@@ -306,9 +342,34 @@ impl OutputPlugin for ElasticsearchOutput {
                 Ok(response) => {
                     let status = response.status();
                     if status.is_success() {
-                        let body_text = response.text().await.unwrap_or_default();
+                        // Bound the success-path body read. `Response::text()`
+                        // buffers the whole body, so a misconfigured/compromised
+                        // host returning a huge 200 could OOM the process. Stream
+                        // it with a generous cap; an over-limit/unreadable body is
+                        // treated as a bulk *failure* (retry, like a non-2xx),
+                        // never an unbounded buffer.
+                        //
+                        // `bytes_stream()` consumes `response`, so the status
+                        // borrow above must (and does) happen first.
+                        let body_bytes = match ferro_stash_core::read_capped_body(
+                            Box::pin(response.bytes_stream()),
+                            max_response_bytes,
+                        )
+                        .await
+                        {
+                            Ok(bytes) => bytes,
+                            Err(e) => {
+                                warn!(
+                                    status = %status,
+                                    error = %e,
+                                    "bulk 2xx response body too large or unreadable, will retry"
+                                );
+                                last_err = Some(format!("response body unreadable: {e}"));
+                                continue;
+                            }
+                        };
                         // Check for item-level errors
-                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body_text) {
+                        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
                             if json["errors"].as_bool() == Some(true) {
                                 let failed = json["items"].as_array().map_or(0, |items| {
                                     items
@@ -370,10 +431,6 @@ impl OutputPlugin for ElasticsearchOutput {
                 last_err.unwrap_or_default()
             ),
         })
-    }
-
-    fn condition(&self) -> Option<&Condition> {
-        self.condition.as_ref()
     }
 }
 
@@ -779,6 +836,127 @@ mod tests {
         assert!(
             ElasticsearchOutput::from_config(&non_strings, None).is_err(),
             "array of non-strings collects to empty and must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_config_blank_hosts_rejected() {
+        // `hosts => [""]` / `hosts => ""` / whitespace-only entries collect to an
+        // empty vec after trimming and must be rejected at config time, exactly
+        // like the empty-array case — otherwise a blank host could reach
+        // `next_host()`.
+        let empty_string = serde_json::json!({ "hosts": "", "index": "test" });
+        assert!(
+            ElasticsearchOutput::from_config(&empty_string, None).is_err(),
+            "blank single host string must be rejected at config time"
+        );
+
+        let whitespace_string = serde_json::json!({ "hosts": "   ", "index": "test" });
+        assert!(
+            ElasticsearchOutput::from_config(&whitespace_string, None).is_err(),
+            "whitespace-only single host string must be rejected at config time"
+        );
+
+        let blank_in_array = serde_json::json!({ "hosts": [""], "index": "test" });
+        assert!(
+            ElasticsearchOutput::from_config(&blank_in_array, None).is_err(),
+            "array of only blank hosts must be rejected at config time"
+        );
+
+        let whitespace_in_array = serde_json::json!({ "hosts": ["  ", "\t"], "index": "test" });
+        assert!(
+            ElasticsearchOutput::from_config(&whitespace_in_array, None).is_err(),
+            "array of only whitespace hosts must be rejected at config time"
+        );
+    }
+
+    #[test]
+    fn test_config_blank_hosts_dropped_keeping_valid() {
+        // A mix of blank and valid hosts keeps only the valid (trimmed) ones.
+        let settings = serde_json::json!({
+            "hosts": ["", "  http://valid:9200  ", "\t"],
+            "index": "test"
+        });
+        let output = ElasticsearchOutput::from_config(&settings, None).expect("config");
+        assert_eq!(output.hosts, vec!["http://valid:9200"]);
+    }
+
+    #[tokio::test]
+    async fn test_oversized_success_body_is_treated_as_failure() {
+        // Regression: a *successful* (200) bulk response with a body larger than
+        // the cap must be treated as a failure (retry/error), never buffered
+        // unbounded (OOM). The production cap is 256 MB; we drive the over-limit
+        // path with a small cap via `output_capped` so the test stays cheap.
+        //
+        // Use a 64 KiB *valid-JSON* 200 body (`{"errors":false,...}`) — well over
+        // the 4 KiB test cap. The body is valid JSON, so the failure must come
+        // from the size cap, not from a parse error.
+        let filler = "F".repeat(64 * 1024);
+        let huge_json = format!(r#"{{"errors":false,"filler":"{filler}"}}"#);
+        let app = Router::new().route(
+            "/_bulk",
+            post(move || {
+                let body = huge_json.clone();
+                async move { (axum::http::StatusCode::OK, body) }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+
+        let settings = serde_json::json!({
+            "hosts": [format!("http://{addr}")],
+            "index": "test",
+            // No retries so the test resolves quickly: the single attempt's
+            // over-limit 200 body must yield an error, not a parsed success.
+            "retry_max_interval": 0,
+        });
+        let output = ElasticsearchOutput::from_config(&settings, None).expect("config");
+
+        // 4 KiB cap: the 64 KiB 200 body exceeds it, so `read_capped_body` errs
+        // and the bulk is treated as failed rather than buffered/parsed.
+        let result = output
+            .output_capped(vec![Event::new("hello")], 4 * 1024)
+            .await;
+
+        assert!(
+            result.is_err(),
+            "an over-limit 200 bulk body must be treated as a failure, not parsed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_within_cap_success_body_still_parsed() {
+        // Sanity companion to the over-limit test: a *within-cap* 200 body with
+        // no item-level errors still succeeds through the same capped path, so
+        // the cap only rejects oversize bodies and never breaks the happy path.
+        let app = Router::new().route(
+            "/_bulk",
+            post(|| async {
+                Json(serde_json::json!({ "errors": false, "items": [] }))
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+
+        let settings = serde_json::json!({
+            "hosts": [format!("http://{addr}")],
+            "index": "test"
+        });
+        let output = ElasticsearchOutput::from_config(&settings, None).expect("config");
+
+        let result = output
+            .output_capped(vec![Event::new("hello")], 4 * 1024)
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "a within-cap, error-free 200 body must still succeed: {result:?}"
         );
     }
 }

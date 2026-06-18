@@ -39,6 +39,16 @@ use indexmap::IndexMap;
 use reqwest::Client;
 use tracing::{debug, warn};
 
+/// Upper bound on a successful (`2xx`) `_search` response body we will buffer
+/// before parsing. A misconfigured/compromised/proxy-fronted ES host can return
+/// a `200` with an arbitrarily large JSON body; `Response::json()` buffers the
+/// *entire* body before parsing, so a hostile host could OOM the process on a
+/// single lookup. 256 MB is generous — legitimate responses are `result_size`-
+/// bounded and far smaller — while still capping the worst case. An over-limit
+/// (or unreadable) body is treated as a lookup *failure* for that host (warn +
+/// failover), never a panic or an unbounded read.
+const MAX_RESPONSE_BYTES: usize = 256 * 1024 * 1024;
+
 pub struct ElasticsearchFilter {
     /// Elasticsearch hosts; tried in order for basic failover.
     hosts: Vec<String>,
@@ -105,19 +115,35 @@ impl ElasticsearchFilter {
         let hosts: Vec<String> = match settings.get("hosts") {
             Some(serde_json::Value::Array(a)) => a
                 .iter()
-                .filter_map(|v| v.as_str().map(String::from))
+                // TRIM each entry and DROP empty/whitespace-only ones: a blank
+                // host (`""` / `"   "`) would otherwise survive into the vec and
+                // build a malformed URL (`/index/_search` with no scheme/authority)
+                // so every lookup fails — a silently-disabled enrichment.
+                .filter_map(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
                 .collect(),
-            Some(serde_json::Value::String(s)) => vec![s.clone()],
+            Some(serde_json::Value::String(s)) => {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![trimmed.to_string()]
+                }
+            }
             // Absent `hosts` key defaults to localhost (preserved behavior).
             _ => vec!["http://localhost:9200".to_string()],
         };
 
-        // An explicitly-empty `hosts` (`hosts => []`) or an array of only
-        // non-strings collapses to zero hosts, which would permanently disable
-        // the filter: `execute_query` would try no hosts, return `None`, and
-        // EVERY event would be tagged `_elasticsearch_lookup_failure` — a
-        // silently-disabled enrichment. The ES input and output plugins already
-        // reject empty hosts at config time; reject it here too for consistency.
+        // An explicitly-empty `hosts` (`hosts => []`), a blank host
+        // (`hosts => ""` / `hosts => [""]`), or an array of only non-strings
+        // collapses to zero usable hosts, which would permanently disable the
+        // filter: `execute_query` would try no hosts (or only malformed URLs),
+        // return `None`, and EVERY event would be tagged
+        // `_elasticsearch_lookup_failure` — a silently-disabled enrichment. The
+        // ES input and output plugins already reject empty hosts at config time;
+        // reject it here too for consistency.
         if hosts.is_empty() {
             return Err(FerroStashError::Filter {
                 plugin: "elasticsearch".to_string(),
@@ -274,10 +300,22 @@ impl ElasticsearchFilter {
 
     /// Execute a real `_search` against Elasticsearch, returning the
     /// `hits.hits[]._source` documents. Tries each host in order; returns
-    /// `None` on total failure (all hosts errored / non-2xx).
+    /// `None` on total failure (all hosts errored / non-2xx / over-limit body).
     async fn execute_query(
         &self,
         event: &Event,
+    ) -> Option<Vec<IndexMap<String, EventValue>>> {
+        self.execute_query_capped(event, MAX_RESPONSE_BYTES).await
+    }
+
+    /// Like [`Self::execute_query`], but with an explicit cap on the number of
+    /// bytes buffered from a successful response body. Factored out so tests can
+    /// drive the over-limit path with a small cap without producing a 256 MB
+    /// body. Production callers use [`Self::execute_query`] (256 MB).
+    async fn execute_query_capped(
+        &self,
+        event: &Event,
+        max_response_bytes: usize,
     ) -> Option<Vec<IndexMap<String, EventValue>>> {
         let body = self.build_search_body(event);
 
@@ -326,7 +364,27 @@ impl ElasticsearchFilter {
                 continue;
             }
 
-            let json: serde_json::Value = match response.json().await {
+            // Bound the *successful* (2xx) body read too: `Response::json()`
+            // buffers the entire body before parsing, so a misconfigured/hostile
+            // host could return a `200` with a multi-GB JSON body and OOM the
+            // process on a single lookup. Stream the body and reject it if it
+            // exceeds `max_response_bytes` — an over-limit (or unreadable) body
+            // is a lookup *failure* for this host (warn + try next host), never
+            // a panic and never an unbounded read.
+            let bytes = match ferro_stash_core::read_capped_body(
+                Box::pin(response.bytes_stream()),
+                max_response_bytes,
+            )
+            .await
+            {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    warn!(url = %url, error = %e, "elasticsearch filter: response body too large or unreadable, trying next host");
+                    continue;
+                }
+            };
+
+            let json: serde_json::Value = match serde_json::from_slice(&bytes) {
                 Ok(j) => j,
                 Err(e) => {
                     warn!(url = %url, error = %e, "elasticsearch filter: invalid JSON response");
@@ -550,6 +608,55 @@ mod tests {
             err.to_string().contains("hosts"),
             "error should mention hosts"
         );
+    }
+
+    /// A blank `hosts` value (`hosts => ""` or `hosts => [""]`, including
+    /// whitespace-only entries) is rejected at config time, exactly like the
+    /// empty-list case. Without trimming, a blank host survives the round-9
+    /// empty-check but builds a malformed URL (`/index/_search`) so every lookup
+    /// silently fails. The absent-key localhost default is preserved (see
+    /// `test_elasticsearch_default_config`).
+    #[test]
+    fn test_blank_hosts_rejected_at_config_time() {
+        // `hosts => [""]`
+        let settings = serde_json::json!({ "hosts": [""] });
+        let err = ElasticsearchFilter::from_config(&settings, None)
+            .expect_err("blank host in array must be a config error");
+        assert!(
+            err.to_string().contains("hosts"),
+            "error should mention hosts: {}",
+            err
+        );
+
+        // `hosts => "   "` (scalar, whitespace-only)
+        let settings = serde_json::json!({ "hosts": "   " });
+        let err = ElasticsearchFilter::from_config(&settings, None)
+            .expect_err("whitespace-only scalar host must be a config error");
+        assert!(err.to_string().contains("hosts"), "error should mention hosts");
+
+        // `hosts => ""` (scalar, empty)
+        let settings = serde_json::json!({ "hosts": "" });
+        let err = ElasticsearchFilter::from_config(&settings, None)
+            .expect_err("empty scalar host must be a config error");
+        assert!(err.to_string().contains("hosts"), "error should mention hosts");
+
+        // A mix of blank and whitespace-only array entries also collapses to zero.
+        let settings = serde_json::json!({ "hosts": ["", "  ", "\t"] });
+        let err = ElasticsearchFilter::from_config(&settings, None)
+            .expect_err("array of only blank hosts must be a config error");
+        assert!(err.to_string().contains("hosts"), "error should mention hosts");
+    }
+
+    /// A usable host alongside blank entries survives: blanks are dropped, the
+    /// usable host is trimmed and kept. (Asserts the trim/drop logic does not
+    /// over-reject when at least one good host is present.)
+    #[test]
+    fn test_blank_hosts_dropped_usable_host_kept() {
+        let settings = serde_json::json!({
+            "hosts": ["", "  http://es:9200  ", "\t"]
+        });
+        let filter = ElasticsearchFilter::from_config(&settings, None).expect("config");
+        assert_eq!(filter.hosts, vec!["http://es:9200".to_string()]);
     }
 
     #[test]
@@ -887,6 +994,29 @@ mod tests {
         (format!("http://{addr}"), rx)
     }
 
+    /// Like [`spawn_mock_es`], but returns a `200 OK` with a caller-supplied
+    /// (potentially very large) **owned** body, so we can exercise the
+    /// success-path body bounding (`read_capped_body`) path. Returns the host URL.
+    fn spawn_mock_es_sized_ok(body: String) -> String {
+        let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                // Drain the request (best-effort).
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        format!("http://{addr}")
+    }
+
     /// Like [`spawn_mock_es`], but returns a non-2xx status with a caller-
     /// supplied (potentially very large) body, so we can exercise the
     /// error-body bounding path. Returns the host URL.
@@ -971,6 +1101,64 @@ mod tests {
             !snippet.contains(&"E".repeat(514)),
             "snippet must not contain more than the bounded read of body content"
         );
+    }
+
+    /// Regression for the HIGH DD finding: a misconfigured/compromised ES host
+    /// that returns a *2xx* (`200`) with an oversized JSON body must NOT be
+    /// buffered in full (`Response::json()` would, OOMing the process on a single
+    /// lookup). The fix streams the body via `read_capped_body` and rejects it
+    /// over the cap, treating it as a lookup *failure* for that host (failover +
+    /// `tag_on_failure`) — never a panic, never an unbounded read. We drive the
+    /// over-limit path with a small per-call cap (no need to allocate 256 MB).
+    #[tokio::test]
+    async fn test_oversized_success_body_is_capped_and_fails_over() {
+        // A 64 KiB *valid-JSON* 200 body — well over the 4 KiB test cap below.
+        // It is real JSON (so a buffering reader *would* have parsed it
+        // successfully); the cap must reject it on the size, not the shape.
+        let big = format!(
+            r#"{{"hits":{{"hits":[{{"_source":{{"pad":"{}"}}}}]}}}}"#,
+            "P".repeat(64 * 1024)
+        );
+        let host = spawn_mock_es_sized_ok(big);
+        let settings = serde_json::json!({
+            "hosts": [host],
+            "index": "users",
+            "timeout": 5
+        });
+        let filter = ElasticsearchFilter::from_config(&settings, None).expect("config");
+
+        // Drive the capped path directly with a small cap (4 KiB): the only host
+        // returns an over-limit 200 body, so `read_capped_body` errs, the host is
+        // treated as failed, failover exhausts, and `execute_query_capped`
+        // returns `None` (the filter would then apply `tag_on_failure`).
+        let out = filter
+            .execute_query_capped(&Event::new("test"), 4 * 1024)
+            .await;
+        assert!(
+            out.is_none(),
+            "an over-limit 200 body must be treated as a lookup failure, not parsed"
+        );
+    }
+
+    /// Sanity companion to the over-limit test: a *within-cap* valid 200 body on
+    /// the same capped code path still parses to hits, proving the cap rejects
+    /// only oversize bodies and does not break the normal success path.
+    #[tokio::test]
+    async fn test_within_cap_success_body_still_parses() {
+        let host = spawn_mock_es(r#"{"hits":{"hits":[{"_source":{"ok":true}}]}}"#);
+        let settings = serde_json::json!({
+            "hosts": [host],
+            "index": "users",
+            "target": "es_result"
+        });
+        let filter = ElasticsearchFilter::from_config(&settings, None).expect("config");
+        // A modest cap that comfortably fits the tiny response.
+        let out = filter
+            .execute_query_capped(&Event::new("test"), 4 * 1024)
+            .await;
+        let hits = out.expect("within-cap body must parse to hits");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].get("ok"), Some(&EventValue::Boolean(true)));
     }
 
     /// End-to-end (d): a field value carrying an injection payload is sent to ES

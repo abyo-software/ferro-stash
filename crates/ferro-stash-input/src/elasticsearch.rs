@@ -64,18 +64,27 @@ impl ElasticsearchInput {
             .map_or_else(
                 || vec!["http://localhost:9200".to_string()],
                 |a| {
+                    // Trim each entry and drop empty / whitespace-only ones. A
+                    // blank host (`hosts => ""` / `[""]`) would pass the
+                    // is_empty() guard below (the vec is non-empty) yet build a
+                    // malformed URL like `/_search` (no scheme/authority), so we
+                    // strip the noise here rather than fail at request time.
                     a.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
+                        .filter_map(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(String::from)
                         .collect()
                 },
             );
-        // A configured-but-empty `hosts` array (or an array of non-strings) must
-        // be rejected here. `next_host()` indexes `self.hosts[0]`, so an empty
-        // vector would panic on the first poll. The localhost default only
-        // applies when the key is ABSENT (handled by `map_or_else` above); once
-        // the key is present we honor it strictly and fail loudly rather than
-        // silently substituting a default. Mirrors the kafka input's
-        // `bootstrap_servers must contain at least one broker` check.
+        // A configured-but-empty `hosts` array (or an array of non-strings, or
+        // one whose entries are all blank/whitespace) must be rejected here.
+        // `next_host()` indexes `self.hosts[0]`, so an empty vector would panic
+        // on the first poll. The localhost default only applies when the key is
+        // ABSENT (handled by `map_or_else` above); once the key is present we
+        // honor it strictly and fail loudly rather than silently substituting a
+        // default. Mirrors the kafka input's `bootstrap_servers must contain at
+        // least one broker` check.
         if hosts.is_empty() {
             return Err(FerroStashError::Input {
                 plugin: "elasticsearch".to_string(),
@@ -239,11 +248,28 @@ impl ElasticsearchInput {
         );
         let pit_req = self.build_request(self.client.post(&pit_url)).await;
         let mut pit_id = match pit_req.send().await {
-            Ok(resp) => resp
-                .json::<serde_json::Value>()
+            Ok(resp) => {
+                // Cap the success-path read so a misconfigured/hostile ES
+                // returning a huge 200 body to `_pit` cannot OOM the process
+                // (same hazard as the search/ES|QL reads). This read is
+                // best-effort: PIT is an optimization, so an over-limit body or
+                // any read/parse failure simply falls back to plain (non-PIT)
+                // search rather than aborting. `bytes_stream()` consumes `resp`.
+                match ferro_stash_core::read_capped_body(
+                    Box::pin(resp.bytes_stream()),
+                    MAX_RESPONSE_BYTES,
+                )
                 .await
-                .ok()
-                .and_then(|v| v["id"].as_str().map(String::from)),
+                {
+                    Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
+                        .ok()
+                        .and_then(|v| v["id"].as_str().map(String::from)),
+                    Err(e) => {
+                        warn!(error = %e, "PIT open response too large or unreadable, falling back to plain search");
+                        None
+                    }
+                }
+            }
             Err(e) => {
                 warn!(error = %e, "failed to open PIT, falling back to plain search");
                 None
@@ -305,8 +331,24 @@ impl ElasticsearchInput {
                 return Err(es_status_error("search", status, response).await);
             }
 
+            // Cap the success-path body read. `response.json()` would buffer the
+            // whole 200 body unconditionally, so a huge/hostile response could
+            // OOM the process. Read at most `MAX_RESPONSE_BYTES`; an over-limit
+            // (Err) body surfaces as a loud `Input` error (like the non-2xx
+            // path) rather than being silently truncated/buffered. The status
+            // check above already ran (it borrows `response`); `bytes_stream()`
+            // consumes `response`, exactly as `.json()` did.
+            let bytes = ferro_stash_core::read_capped_body(
+                Box::pin(response.bytes_stream()),
+                MAX_RESPONSE_BYTES,
+            )
+            .await
+            .map_err(|e| FerroStashError::Input {
+                plugin: "elasticsearch".to_string(),
+                message: format!("search response read error: {e}"),
+            })?;
             let result: serde_json::Value =
-                response.json().await.map_err(|e| FerroStashError::Input {
+                serde_json::from_slice(&bytes).map_err(|e| FerroStashError::Input {
                     plugin: "elasticsearch".to_string(),
                     message: format!("response parse error: {e}"),
                 })?;
@@ -418,8 +460,21 @@ impl ElasticsearchInput {
             return Err(es_status_error("ES|QL", status, response).await);
         }
 
+        // Cap the success-path body read (same OOM hazard as `run_search`):
+        // `response.json()` would buffer the whole 200 body unconditionally. An
+        // over-limit body surfaces as a loud `Input` error. The status check
+        // above borrowed `response`; `bytes_stream()` consumes it like `.json()`.
+        let bytes = ferro_stash_core::read_capped_body(
+            Box::pin(response.bytes_stream()),
+            MAX_RESPONSE_BYTES,
+        )
+        .await
+        .map_err(|e| FerroStashError::Input {
+            plugin: "elasticsearch".to_string(),
+            message: format!("ES|QL response read error: {e}"),
+        })?;
         let result: serde_json::Value =
-            response.json().await.map_err(|e| FerroStashError::Input {
+            serde_json::from_slice(&bytes).map_err(|e| FerroStashError::Input {
                 plugin: "elasticsearch".to_string(),
                 message: format!("ES|QL response parse error: {e}"),
             })?;
@@ -463,6 +518,15 @@ impl ElasticsearchInput {
 /// error message. Bounds the snippet so a large/hostile error body cannot
 /// produce an unbounded log line, while still aiding debugging.
 const ERROR_BODY_SNIPPET_LIMIT: usize = 512;
+
+/// Upper bound on the size of a *success* (2xx) ES response body we will buffer
+/// before parsing. `Response::json()` / `text()` buffer the whole body
+/// unconditionally, so a misconfigured/compromised ES returning a huge 200 body
+/// could OOM the process. 256 MB is generous — per-page `search` / `_query`
+/// responses are far smaller — while still bounding the read. Mirrors the cap
+/// applied to non-2xx error bodies (`ERROR_BODY_SNIPPET_LIMIT`) and the ES
+/// filter's success-path cap. (DD: unbounded success-read hardening.)
+const MAX_RESPONSE_BYTES: usize = 256 * 1024 * 1024;
 
 /// Build a loud `Input` error from a non-success Elasticsearch HTTP response.
 ///
@@ -889,5 +953,140 @@ mod tests {
             panic!("expected Input error variant");
         }
         assert!(rx.try_recv().is_err(), "no events should be sent on error");
+    }
+
+    // ---- Success-read cap: an over-limit 200 body must Err, not OOM ----
+
+    /// Spawn a mock HTTP server that replies `200 OK` and then streams more than
+    /// `MAX_RESPONSE_BYTES` of body to every connection. Uses a declared
+    /// (oversized) `Content-Length` and writes the body in chunks so the test
+    /// never allocates a 256 MB literal; the client's `read_capped_body` aborts
+    /// the read once the cap is exceeded, so the server stops as soon as a write
+    /// fails (broken pipe). This drives both the PIT-open read (best-effort
+    /// fallback) and the search read (must surface Err).
+    async fn spawn_mock_es_oversized_body() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock listener");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            // PIT open + search both connect; serve each the oversized body.
+            for _ in 0..4u8 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf).await;
+                    // Declare a body larger than the cap. We don't need to send
+                    // it all — the client aborts after MAX_RESPONSE_BYTES + 1.
+                    let declared_len = (MAX_RESPONSE_BYTES as u64) + (16 * 1024 * 1024);
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {declared_len}\r\nConnection: close\r\n\r\n"
+                    );
+                    if stream.write_all(header.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    // Stream 8 MiB chunks until the client hangs up (it will,
+                    // once it has read past the cap). Bounded loop as a safety
+                    // net so a misbehaving client can't wedge the test forever.
+                    let chunk = vec![b'x'; 8 * 1024 * 1024];
+                    let max_chunks = (declared_len / chunk.len() as u64) + 1;
+                    for _ in 0..max_chunks {
+                        if stream.write_all(&chunk).await.is_err() {
+                            break; // client dropped the connection after the cap
+                        }
+                    }
+                    let _ = stream.flush().await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn test_run_search_errors_on_oversized_200_body() {
+        // A 200 response whose body exceeds MAX_RESPONSE_BYTES must produce Err
+        // (the read is capped) rather than buffering unbounded and OOM-ing. The
+        // PIT-open read of the same oversized body must NOT crash — it falls
+        // back to plain search, which then hits the cap on the search read.
+        let host = spawn_mock_es_oversized_body().await;
+        let settings = serde_json::json!({
+            "hosts": [host],
+            "index": "logs",
+        });
+        let input = ElasticsearchInput::from_config(&settings).expect("config");
+        let (tx, mut rx) = mpsc::channel(16);
+        let result = input.run_search(&tx).await;
+        assert!(
+            result.is_err(),
+            "oversized 200 body must return Err (capped read), got Ok: {result:?}"
+        );
+        if let Err(FerroStashError::Input { plugin, message }) = result {
+            assert_eq!(plugin, "elasticsearch");
+            assert!(
+                message.contains("read error") && message.contains("exceeds"),
+                "expected capped-read error, got: {message}"
+            );
+        } else {
+            panic!("expected Input error variant, got: {result:?}");
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "no events should be sent on an oversized-body error"
+        );
+    }
+
+    // ---- LOW: blank hosts must be trimmed/dropped, and rejected if all blank ----
+
+    #[test]
+    fn test_es_input_blank_host_string_rejected() {
+        // `hosts => [""]` collects to no usable entries after trimming and must
+        // be rejected at config time (it would build a malformed URL like
+        // `/_search`). Same class as the empty-array rejection.
+        let settings = serde_json::json!({ "hosts": [""] });
+        let err = ElasticsearchInput::from_config(&settings)
+            .expect_err("blank host string must be rejected");
+        assert!(
+            matches!(err, FerroStashError::Input { ref plugin, .. } if plugin == "elasticsearch"),
+            "expected elasticsearch Input error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_es_input_whitespace_only_hosts_rejected() {
+        // Whitespace-only entries are dropped; an array of only blanks must be
+        // rejected rather than building a malformed request.
+        let settings = serde_json::json!({ "hosts": ["", "   ", "\t\n"] });
+        let err = ElasticsearchInput::from_config(&settings)
+            .expect_err("all-blank hosts must be rejected");
+        assert!(
+            matches!(err, FerroStashError::Input { ref plugin, .. } if plugin == "elasticsearch"),
+            "expected elasticsearch Input error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_es_input_hosts_trimmed_and_blanks_dropped() {
+        // Surrounding whitespace is trimmed; blank entries are dropped while the
+        // real ones are preserved (in order).
+        let settings = serde_json::json!({
+            "hosts": ["  http://es1:9200  ", "", "http://es2:9200", "   "]
+        });
+        let input = ElasticsearchInput::from_config(&settings).expect("config");
+        assert_eq!(
+            input.hosts,
+            vec!["http://es1:9200".to_string(), "http://es2:9200".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_es_input_absent_hosts_still_defaults_localhost() {
+        // The localhost default must still apply when the key is ABSENT (the
+        // trim/drop logic only runs on a present array).
+        let settings = serde_json::json!({});
+        let input = ElasticsearchInput::from_config(&settings).expect("config");
+        assert_eq!(input.hosts, vec!["http://localhost:9200".to_string()]);
     }
 }
