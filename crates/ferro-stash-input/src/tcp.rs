@@ -12,6 +12,100 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+/// Maximum number of bytes a single line may accumulate before a newline is
+/// seen on an accepted TCP connection.
+///
+/// `BufReader::lines()` grows an unbounded `String` per connection; a remote
+/// client (this listener is unauthenticated) can stream bytes without ever
+/// sending `\n`, inflating the per-connection buffer until the process OOMs,
+/// and many connections amplify it. We cap the accumulated line length and
+/// drop the connection once it is exceeded. 16 MB is far above any legitimate
+/// single log line while keeping per-connection memory bounded.
+const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Outcome of a single bounded line read from a TCP connection.
+#[derive(Debug, PartialEq, Eq)]
+enum LineRead {
+    /// A complete line (terminated by `\n`) was read into the buffer.
+    Line,
+    /// The peer closed the connection. The buffer holds any trailing bytes
+    /// received before EOF (a final line without a newline, within the cap).
+    Eof,
+    /// The accumulated bytes exceeded the cap before a newline was seen.
+    Overflow,
+}
+
+/// Read one line from `reader` into `buf`, enforcing a hard cap on the number
+/// of bytes accumulated before a newline.
+///
+/// This replaces `BufReader::lines()` (which grows an unbounded `String`) so an
+/// unauthenticated client cannot stream bytes without a `\n` to OOM the
+/// process. Crucially we do *not* use `read_until`, which would itself buffer
+/// the whole unterminated stream in a single call; instead we drive the
+/// `BufReader`'s internal buffer directly via `fill_buf`/`consume` and refuse
+/// to grow `buf` past `cap`. The trailing `\n` (and a preceding `\r`) is
+/// stripped by [`decode_line`], not here, so callers see the raw line bytes
+/// up to and including the newline.
+async fn read_line_capped<R>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    cap: usize,
+) -> std::io::Result<LineRead>
+where
+    R: AsyncBufReadExt + Unpin,
+{
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            // EOF: report whether any unterminated bytes remain (the caller
+            // emits them if within cap).
+            return Ok(LineRead::Eof);
+        }
+        // Find a newline within the currently-buffered chunk.
+        match available.iter().position(|&b| b == b'\n') {
+            Some(idx) => {
+                let take = idx + 1; // include the '\n'
+                // Adding this chunk-up-to-newline must not exceed the cap.
+                if buf.len() + take > cap {
+                    reader.consume(take);
+                    return Ok(LineRead::Overflow);
+                }
+                buf.extend_from_slice(&available[..take]);
+                reader.consume(take);
+                return Ok(LineRead::Line);
+            }
+            None => {
+                let len = available.len();
+                // No newline in this chunk; accumulating it would exceed the
+                // cap → the peer is streaming an over-long line. Refuse.
+                if buf.len() + len > cap {
+                    reader.consume(len);
+                    return Ok(LineRead::Overflow);
+                }
+                buf.extend_from_slice(available);
+                reader.consume(len);
+            }
+        }
+    }
+}
+
+/// Decode a raw line buffer into a `String`, stripping a trailing `\n` and an
+/// optional preceding `\r` (matching the previous `lines()` behavior). Returns
+/// `None` for an empty buffer.
+fn decode_line(buf: &[u8]) -> Option<String> {
+    if buf.is_empty() {
+        return None;
+    }
+    let mut end = buf.len();
+    if end > 0 && buf[end - 1] == b'\n' {
+        end -= 1;
+        if end > 0 && buf[end - 1] == b'\r' {
+            end -= 1;
+        }
+    }
+    Some(String::from_utf8_lossy(&buf[..end]).into_owned())
+}
+
 #[derive(Debug)]
 pub struct TcpInput {
     host: String,
@@ -86,19 +180,62 @@ impl InputPlugin for TcpInput {
                             let tags = self.tags.clone();
                             let peer = peer_addr.to_string();
                             tokio::spawn(async move {
-                                let reader = tokio::io::BufReader::new(stream);
-                                let mut lines = reader.lines();
-                                while let Ok(Some(line)) = lines.next_line().await {
-                                    if line.is_empty() {
-                                        continue;
-                                    }
-                                    let mut event = Event::new(&line);
-                                    event.set("host", EventValue::String(peer.clone()));
-                                    for tag in &tags {
-                                        event.add_tag(tag);
-                                    }
-                                    if tx.send(event).await.is_err() {
-                                        break;
+                                let mut reader = tokio::io::BufReader::new(stream);
+                                let mut buf: Vec<u8> = Vec::new();
+                                loop {
+                                    buf.clear();
+                                    // Bounded line read: cap the accumulated bytes so an
+                                    // unauthenticated client streaming without a newline
+                                    // cannot grow this buffer until OOM.
+                                    match read_line_capped(&mut reader, &mut buf, MAX_LINE_BYTES)
+                                        .await
+                                    {
+                                        Ok(LineRead::Line) => {
+                                            if let Some(line) = decode_line(&buf) {
+                                                if !line.is_empty() {
+                                                    let mut event = Event::new(&line);
+                                                    event.set(
+                                                        "host",
+                                                        EventValue::String(peer.clone()),
+                                                    );
+                                                    for tag in &tags {
+                                                        event.add_tag(tag);
+                                                    }
+                                                    if tx.send(event).await.is_err() {
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Ok(LineRead::Eof) => {
+                                            // Final line without a trailing newline (within cap).
+                                            if let Some(line) = decode_line(&buf) {
+                                                if !line.is_empty() {
+                                                    let mut event = Event::new(&line);
+                                                    event.set(
+                                                        "host",
+                                                        EventValue::String(peer.clone()),
+                                                    );
+                                                    for tag in &tags {
+                                                        event.add_tag(tag);
+                                                    }
+                                                    let _ = tx.send(event).await;
+                                                }
+                                            }
+                                            break;
+                                        }
+                                        Ok(LineRead::Overflow) => {
+                                            warn!(
+                                                peer = %peer,
+                                                cap = MAX_LINE_BYTES,
+                                                "TCP line exceeds max length; dropping connection"
+                                            );
+                                            break;
+                                        }
+                                        Err(e) => {
+                                            warn!(peer = %peer, error = %e, "TCP read error");
+                                            break;
+                                        }
                                     }
                                 }
                                 debug!(peer = %peer, "TCP connection closed");
@@ -170,6 +307,92 @@ mod tests {
         let settings = serde_json::json!({ "port": 5000 });
         let input = TcpInput::from_config(&settings).expect("config");
         assert_eq!(input.name(), "tcp");
+    }
+
+    #[test]
+    fn test_decode_line_strips_terminators() {
+        assert_eq!(decode_line(b"hello\n").as_deref(), Some("hello"));
+        assert_eq!(decode_line(b"hello\r\n").as_deref(), Some("hello"));
+        assert_eq!(decode_line(b"hello").as_deref(), Some("hello"));
+        assert_eq!(decode_line(b"").as_deref(), None);
+        // A lone trailing '\r' without '\n' is preserved (only '\r\n' is stripped).
+        assert_eq!(decode_line(b"hello\r").as_deref(), Some("hello\r"));
+    }
+
+    #[tokio::test]
+    async fn test_read_line_capped_reads_lines() {
+        let data = b"line one\nline two\n".to_vec();
+        let mut reader = tokio::io::BufReader::new(std::io::Cursor::new(data));
+        let mut buf = Vec::new();
+
+        let r = read_line_capped(&mut reader, &mut buf, MAX_LINE_BYTES)
+            .await
+            .expect("read");
+        assert_eq!(r, LineRead::Line);
+        assert_eq!(decode_line(&buf).as_deref(), Some("line one"));
+
+        buf.clear();
+        let r = read_line_capped(&mut reader, &mut buf, MAX_LINE_BYTES)
+            .await
+            .expect("read");
+        assert_eq!(r, LineRead::Line);
+        assert_eq!(decode_line(&buf).as_deref(), Some("line two"));
+
+        buf.clear();
+        let r = read_line_capped(&mut reader, &mut buf, MAX_LINE_BYTES)
+            .await
+            .expect("read");
+        assert_eq!(r, LineRead::Eof);
+        assert!(buf.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_read_line_capped_emits_final_unterminated_line() {
+        // A last line without a trailing newline is delivered on EOF.
+        let data = b"no newline at end".to_vec();
+        let mut reader = tokio::io::BufReader::new(std::io::Cursor::new(data));
+        let mut buf = Vec::new();
+        let r = read_line_capped(&mut reader, &mut buf, MAX_LINE_BYTES)
+            .await
+            .expect("read");
+        assert_eq!(r, LineRead::Eof);
+        assert_eq!(decode_line(&buf).as_deref(), Some("no newline at end"));
+    }
+
+    #[tokio::test]
+    async fn test_read_line_capped_rejects_overlong_line_without_unbounded_growth() {
+        // Regression (HIGH): a remote peer streaming bytes with NO newline must
+        // not grow the per-connection buffer past the cap. We feed `cap + 1`
+        // bytes (no '\n') with a small cap and assert Overflow is returned and
+        // the accumulated buffer never exceeds the cap.
+        let cap: usize = 1024;
+        let data = vec![b'x'; cap + 1]; // larger than cap, no newline
+        let mut reader = tokio::io::BufReader::new(std::io::Cursor::new(data));
+        let mut buf = Vec::new();
+        let r = read_line_capped(&mut reader, &mut buf, cap)
+            .await
+            .expect("read");
+        assert_eq!(r, LineRead::Overflow);
+        assert!(
+            buf.len() <= cap,
+            "accumulated buffer must stay within cap, got {}",
+            buf.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_line_capped_accepts_line_exactly_at_cap() {
+        // A line whose bytes (incl. the newline) total exactly `cap` is allowed.
+        let cap: usize = 16;
+        let mut data = vec![b'a'; cap - 1];
+        data.push(b'\n'); // total == cap
+        let mut reader = tokio::io::BufReader::new(std::io::Cursor::new(data));
+        let mut buf = Vec::new();
+        let r = read_line_capped(&mut reader, &mut buf, cap)
+            .await
+            .expect("read");
+        assert_eq!(r, LineRead::Line);
+        assert_eq!(buf.len(), cap);
     }
 
     #[tokio::test]

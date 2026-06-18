@@ -47,6 +47,20 @@ const MAX_BEATS_FRAME_BYTES: usize = 100_000_000;
 /// because legitimate inner frames compress well; anything beyond is hostile.
 const MAX_DECOMPRESSED_BYTES: usize = 4 * MAX_BEATS_FRAME_BYTES;
 
+/// Upper bound on the number of inner frames/events materialized from a single
+/// `C` (compressed) frame.
+///
+/// The byte caps above bound the *compressed* wire length and the *decompressed*
+/// size, but [`parse_inner_frames`] then turns every decoded inner frame into
+/// an in-memory [`Event`]. A small zlib payload can decompress to hundreds of
+/// MB of minimal `J`/`D` inner frames (each only a handful of bytes), yielding
+/// tens of millions of `Event` objects — each far larger than its wire footprint
+/// — before a single one is sent downstream. That heap blow-up defeats the byte
+/// caps, so we additionally bound the *count* of decoded events from one frame.
+/// 1,000,000 events is far above any legitimate Beats batch (typical windows are
+/// in the thousands) while keeping the peak per-frame `Event` count bounded.
+const MAX_INNER_FRAMES: usize = 1_000_000;
+
 /// Returns `true` if an attacker-announced on-the-wire length is within the
 /// allocation cap and therefore safe to allocate a buffer for.
 ///
@@ -345,6 +359,20 @@ fn parse_inner_frames(data: &[u8]) -> Result<Vec<(u32, Event)>> {
     }
 
     while pos + 2 <= data.len() {
+        // Bound the number of materialized events from a single compressed
+        // frame: a small zlib payload can decompress to hundreds of MB of
+        // minimal J/D frames, expanding into tens of millions of `Event`s and
+        // exhausting the heap despite the decompressed-byte cap. Once the cap
+        // is reached we stop decoding the rest of this frame.
+        if events.len() >= MAX_INNER_FRAMES {
+            warn!(
+                decoded = events.len(),
+                cap = MAX_INNER_FRAMES,
+                "Beats compressed frame yields too many inner events; truncating decode"
+            );
+            break;
+        }
+
         let _version = data[pos];
         let frame_type = data[pos + 1];
         pos += 2;
@@ -621,6 +649,33 @@ mod tests {
     // wire-length cap (so legitimate well-compressing inner frames are allowed).
     // Checked at compile time to avoid a runtime constant assertion.
     const _: () = assert!(MAX_DECOMPRESSED_BYTES > MAX_BEATS_FRAME_BYTES);
+
+    #[test]
+    fn test_parse_inner_frames_caps_event_count() {
+        // Regression (HIGH, event-count expansion): a decompressed buffer of
+        // many minimal inner frames must not materialize an unbounded number of
+        // `Event`s. We craft a buffer holding MAX_INNER_FRAMES + extra minimal
+        // J frames (each a 0-byte payload = 10 bytes on the wire) and assert the
+        // decoded event count is capped at MAX_INNER_FRAMES rather than growing
+        // to the full frame count.
+        let extra = 50usize;
+        let total = MAX_INNER_FRAMES + extra;
+        // Each minimal J frame: '2','J', seq(4), payload_len=0(4) → 10 bytes.
+        let mut data = Vec::with_capacity(total * 10);
+        for _ in 0..total {
+            data.push(b'2');
+            data.push(b'J');
+            data.extend_from_slice(&0u32.to_be_bytes()); // seq
+            data.extend_from_slice(&0u32.to_be_bytes()); // payload_len = 0
+        }
+
+        let parsed = parse_inner_frames(&data).expect("parse");
+        assert_eq!(
+            parsed.len(),
+            MAX_INNER_FRAMES,
+            "decoded event count must be capped at MAX_INNER_FRAMES, not the full {total}"
+        );
+    }
 
     #[test]
     fn test_beats_zip_bomb_decompression_is_bounded() {

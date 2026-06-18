@@ -14,6 +14,86 @@ use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+/// Maximum number of bytes a single syslog line may accumulate before a
+/// newline is seen on a TCP connection.
+///
+/// As with the TCP input, `BufReader::lines()` grows an unbounded `String` per
+/// connection, so an unauthenticated client streaming bytes without `\n` could
+/// OOM the process. We cap the accumulated line length and drop the connection
+/// on overflow. (UDP is already bounded by a fixed 65536-byte datagram
+/// buffer and is left unchanged.) 16 MB matches the TCP input cap.
+const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Outcome of a single bounded line read from a syslog TCP connection.
+#[derive(Debug, PartialEq, Eq)]
+enum LineRead {
+    /// A complete line (terminated by `\n`) was read into the buffer.
+    Line,
+    /// The peer closed the connection; the buffer holds any trailing bytes.
+    Eof,
+    /// The accumulated bytes exceeded the cap before a newline was seen.
+    Overflow,
+}
+
+/// Read one line from `reader` into `buf`, enforcing a hard cap on the number
+/// of bytes accumulated before a newline (mirrors `tcp::read_line_capped`).
+///
+/// We drive the `BufReader`'s internal buffer via `fill_buf`/`consume` rather
+/// than `read_until` (which would buffer the whole unterminated stream in a
+/// single call) so the per-connection buffer can never exceed `cap`.
+async fn read_line_capped<R>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    cap: usize,
+) -> std::io::Result<LineRead>
+where
+    R: AsyncBufReadExt + Unpin,
+{
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(LineRead::Eof);
+        }
+        match available.iter().position(|&b| b == b'\n') {
+            Some(idx) => {
+                let take = idx + 1;
+                if buf.len() + take > cap {
+                    reader.consume(take);
+                    return Ok(LineRead::Overflow);
+                }
+                buf.extend_from_slice(&available[..take]);
+                reader.consume(take);
+                return Ok(LineRead::Line);
+            }
+            None => {
+                let len = available.len();
+                if buf.len() + len > cap {
+                    reader.consume(len);
+                    return Ok(LineRead::Overflow);
+                }
+                buf.extend_from_slice(available);
+                reader.consume(len);
+            }
+        }
+    }
+}
+
+/// Decode a raw syslog line buffer into a `String`, stripping a trailing `\n`
+/// and an optional preceding `\r`. Returns `None` for an empty buffer.
+fn decode_line(buf: &[u8]) -> Option<String> {
+    if buf.is_empty() {
+        return None;
+    }
+    let mut end = buf.len();
+    if end > 0 && buf[end - 1] == b'\n' {
+        end -= 1;
+        if end > 0 && buf[end - 1] == b'\r' {
+            end -= 1;
+        }
+    }
+    Some(String::from_utf8_lossy(&buf[..end]).into_owned())
+}
+
 #[derive(Debug)]
 pub struct SyslogInput {
     host: String,
@@ -209,17 +289,53 @@ impl InputPlugin for SyslogInput {
                                     let tags = self.tags.clone();
                                     let peer_str = peer.ip().to_string();
                                     tokio::spawn(async move {
-                                        let reader = tokio::io::BufReader::new(stream);
-                                        let mut lines = reader.lines();
-                                        while let Ok(Some(line)) = lines.next_line().await {
-                                            if line.is_empty() { continue; }
-                                            let mut event = parse_syslog_message(&line);
-                                            event.set("host", EventValue::String(peer_str.clone()));
-                                            for tag in &tags {
-                                                event.add_tag(tag);
-                                            }
-                                            if tx.send(event).await.is_err() {
-                                                break;
+                                        let mut reader = tokio::io::BufReader::new(stream);
+                                        let mut buf: Vec<u8> = Vec::new();
+                                        loop {
+                                            buf.clear();
+                                            // Bounded line read: cap accumulated bytes so an
+                                            // unauthenticated client streaming without a
+                                            // newline cannot grow the buffer until OOM.
+                                            match read_line_capped(&mut reader, &mut buf, MAX_LINE_BYTES).await {
+                                                Ok(LineRead::Line) => {
+                                                    if let Some(line) = decode_line(&buf) {
+                                                        if !line.is_empty() {
+                                                            let mut event = parse_syslog_message(&line);
+                                                            event.set("host", EventValue::String(peer_str.clone()));
+                                                            for tag in &tags {
+                                                                event.add_tag(tag);
+                                                            }
+                                                            if tx.send(event).await.is_err() {
+                                                                break;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                Ok(LineRead::Eof) => {
+                                                    if let Some(line) = decode_line(&buf) {
+                                                        if !line.is_empty() {
+                                                            let mut event = parse_syslog_message(&line);
+                                                            event.set("host", EventValue::String(peer_str.clone()));
+                                                            for tag in &tags {
+                                                                event.add_tag(tag);
+                                                            }
+                                                            let _ = tx.send(event).await;
+                                                        }
+                                                    }
+                                                    break;
+                                                }
+                                                Ok(LineRead::Overflow) => {
+                                                    warn!(
+                                                        peer = %peer_str,
+                                                        cap = MAX_LINE_BYTES,
+                                                        "syslog TCP line exceeds max length; dropping connection"
+                                                    );
+                                                    break;
+                                                }
+                                                Err(e) => {
+                                                    warn!(peer = %peer_str, error = %e, "syslog TCP read error");
+                                                    break;
+                                                }
                                             }
                                         }
                                     });
@@ -343,6 +459,53 @@ mod tests {
         assert_eq!(input.host, "0.0.0.0");
         assert_eq!(input.port, 514);
         assert_eq!(input.name(), "syslog");
+    }
+
+    #[tokio::test]
+    async fn test_syslog_read_line_capped_reads_lines() {
+        let data = b"<13>line one\n<13>line two\n".to_vec();
+        let mut reader = tokio::io::BufReader::new(std::io::Cursor::new(data));
+        let mut buf = Vec::new();
+
+        let r = read_line_capped(&mut reader, &mut buf, MAX_LINE_BYTES)
+            .await
+            .expect("read");
+        assert_eq!(r, LineRead::Line);
+        assert_eq!(decode_line(&buf).as_deref(), Some("<13>line one"));
+
+        buf.clear();
+        let r = read_line_capped(&mut reader, &mut buf, MAX_LINE_BYTES)
+            .await
+            .expect("read");
+        assert_eq!(r, LineRead::Line);
+        assert_eq!(decode_line(&buf).as_deref(), Some("<13>line two"));
+    }
+
+    #[tokio::test]
+    async fn test_syslog_read_line_capped_rejects_overlong_line() {
+        // Regression (HIGH): a syslog TCP peer streaming bytes with NO newline
+        // must not grow the per-connection buffer past the cap.
+        let cap: usize = 1024;
+        let data = vec![b'x'; cap + 1]; // larger than cap, no newline
+        let mut reader = tokio::io::BufReader::new(std::io::Cursor::new(data));
+        let mut buf = Vec::new();
+        let r = read_line_capped(&mut reader, &mut buf, cap)
+            .await
+            .expect("read");
+        assert_eq!(r, LineRead::Overflow);
+        assert!(
+            buf.len() <= cap,
+            "accumulated buffer must stay within cap, got {}",
+            buf.len()
+        );
+    }
+
+    #[test]
+    fn test_syslog_decode_line_strips_terminators() {
+        assert_eq!(decode_line(b"<13>msg\n").as_deref(), Some("<13>msg"));
+        assert_eq!(decode_line(b"<13>msg\r\n").as_deref(), Some("<13>msg"));
+        assert_eq!(decode_line(b"<13>msg").as_deref(), Some("<13>msg"));
+        assert_eq!(decode_line(b"").as_deref(), None);
     }
 
     #[test]
