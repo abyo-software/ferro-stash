@@ -7,18 +7,90 @@ is cut. Pre-1.0 releases may introduce breaking changes between minor tags.
 
 ## [Unreleased]
 
+### Added
+
+- **Real external integrations for the ten formerly-stub connector
+  plugins.** The plugins that previously parsed config and ran a
+  lifecycle skeleton without any external call now perform real I/O. New
+  dependencies: `rdkafka` (input + output kafka), `redis` (input +
+  output redis), `aws-config` + `aws-sdk-s3` (input + output s3),
+  `maxminddb` (geoip filter), `hickory-resolver` (dns filter). Validation
+  status is **not** uniform and is documented honestly per plugin in
+  [`README.md`](README.md) "Honest limitations":
+  - **kafka input** — `rdkafka` async `StreamConsumer` (subscribe, recv
+    loop, codec decode, auto offset commit). *Compile-validated only*;
+    live round-trip covered by an `#[ignore]` smoke test (`KAFKA_BROKERS`).
+  - **kafka output** — `rdkafka` `FutureProducer` (codec serialize, key
+    sprintf, compression/acks/retries, flush). *Compile-validated only*;
+    `#[ignore]` smoke test (`KAFKA_BROKERS`).
+  - **redis input** — async client: `BLPOP` (list),
+    `SUBSCRIBE`/`PSUBSCRIBE` (channel/pattern), `AUTH` + `SELECT`.
+    *Compile-validated only.*
+  - **redis output** — async `ConnectionManager`: `RPUSH` (list) /
+    `PUBLISH` (channel). *Compile-validated only.*
+  - **s3 input** — `aws-sdk-s3` paginated `ListObjectsV2` + `GetObject`
+    poll, in-memory seen-key dedup, optional `delete_after_read`.
+    *Compile-validated only.*
+  - **s3 output** — `aws-sdk-s3` `PutObject` on rotation/flush, gzip when
+    `encoding => "gzip"`. *Validated against a local mock S3 server.* New
+    config fields **`endpoint`** and **`force_path_style`** for MinIO /
+    LocalStack / other S3-compatible stores.
+  - **datadog output** — `reqwest` POST to `/api/v2/logs` (`DD-API-KEY`,
+    batched, retry/backoff). *Validated against a local mock HTTP server.*
+  - **geoip filter** — `maxminddb` lookups against a configured `.mmdb`,
+    full Logstash-style subfields, falling back to
+    private/loopback/public classification when no database is set.
+    *Live-validated against a real GeoLite2-City database.* New config
+    field **`database`** (path to the GeoLite2/GeoIP2 database).
+  - **dns filter** — `hickory-resolver` forward (A/AAAA) and reverse
+    (PTR) lookups, custom `nameserver`, `Replace`/`Append` action.
+    *Live-validated against `8.8.8.8`.*
+  - **elasticsearch filter** — `reqwest` `_search` with host failover,
+    query-template sprintf, hits→field mapping. *Validated against a local
+    mock HTTP server, not against a live Elasticsearch cluster.*
+
+### Changed
+
+- **New build requirement: `cmake`.** The kafka plugins pull `rdkafka`,
+  which builds a vendored `librdkafka` via CMake, so `cmake` is now
+  required at build time (in addition to the existing clang/gcc for the
+  Artichoke/mruby FFI). Connector TLS uses rustls, so no system OpenSSL
+  is needed. The `geoip` filter additionally needs a user-supplied
+  `.mmdb` database file at runtime (not vendored).
+
+### Honest residual limitations
+
+- **kafka input**: `consumer_threads` / `max_poll_records` are parsed but
+  not yet wired to behaviour; no SASL/SSL `security.protocol` passthrough;
+  auto-commit only.
+- **redis (input + output)**: password-only `AUTH` (no `username`/ACL);
+  no TLS (`rediss://`); a pub/sub `key` is treated as a single
+  channel/pattern (no comma-split list).
+- **s3 input**: the seen-key dedup set is in-memory only — non-deleted
+  objects are reprocessed after a restart (no sincedb); no
+  SQS-notification mode; `delete_after_read` deletes immediately after
+  emit.
+- **s3 output**: single `PutObject` (no multipart upload) in v1.
+- **kafka & redis** produce/consume round-trips are not live-validated
+  (compile + `#[ignore]` smoke tests only).
+- **elasticsearch filter** is not validated against a real ES cluster
+  (mock only).
+
 ### Documentation
 
 - **Docs audit (2026-06-18).** README and the docs/ pack were rewritten
   to match source. The previously-documented "8 input / 10 filter / 6
   output / 6 codec" surface was an understatement: the factory functions
   actually register **15 inputs / 29 filters / 11 outputs / 21 codecs**.
-  Of those, **10 are production-shaped stubs** (input/output
-  kafka/redis/s3, output datadog, filters geoip/dns/elasticsearch) — now
-  labelled as such everywhere. Corrected: test count (measured **1,165
-  passing / 16 ignored**, not 670/1,151), workspace member count (10),
-  `unsafe_code` posture (`deny` + 2 overrides, not `forbid`), the
-  non-existent `rdkafka`/`maxminddb`/`aws-sdk` dependency claims, the
+  Of those, **10 were production-shaped stubs** (input/output
+  kafka/redis/s3, output datadog, filters geoip/dns/elasticsearch) at the
+  time of that audit — labelled as such. (Those 10 plugins have since
+  gained real external integrations; see the **Added** section above.)
+  Corrected: test count (measured **1,165 passing / 16 ignored**, not
+  670/1,151), workspace member count (10), `unsafe_code` posture (`deny` +
+  2 overrides, not `forbid`), the then-non-existent
+  `rdkafka`/`maxminddb`/`aws-sdk` dependency claims (these crates are now
+  real dependencies, added with the connector implementations above), the
   `120+` grok-pattern claim (actually ~50), and the Artichoke fork
   description (a filesystem **path** dependency to `artichoke-extended`,
   not a git pin on `integration/logstash-compat`, and not `ferro-artichoke`).
@@ -89,8 +161,11 @@ is promoted to GA.
 
 > Plugin-count figures in this historical 0.1.0 entry were corrected by
 > the 2026-06-18 docs audit (see Unreleased). The real registered surface
-> is 15 input / 29 filter / 11 output / 21 codec, with 10 stubs. The
-> bullets below are retained for historical record.
+> is 15 input / 29 filter / 11 output / 21 codec; at 0.1.0 ten of those
+> were production-shaped stubs. (Those ten have since gained real external
+> integrations — see the **Added** section under [Unreleased].) The
+> bullets below are retained for historical record and describe the 0.1.0
+> state.
 
 - **Plugin counts are scoped, not catalog-complete.** The registered
   surface covers the production-common Logstash configuration; Logstash's

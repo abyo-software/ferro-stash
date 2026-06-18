@@ -23,23 +23,28 @@ cargo deny check
 
 - Rust 1.75+ (stable)
 - C compiler (clang or gcc) — required for Artichoke/mruby FFI in ferro-stash-ruby
+- `cmake` — required by the kafka plugins (rdkafka builds a vendored librdkafka via CMake). Connector TLS uses rustls, so no system OpenSSL is needed.
 - macOS or Linux
+- Runtime (not build-time): the geoip filter needs a user-supplied `.mmdb` (GeoLite2/GeoIP2) database at the configured `database` path — not vendored.
 
 ## Project Structure
 
 Plugin counts below are what is registered in the factory functions
 (`create_input`/`create_filter`/`create_output`/`create_codec`), verified
-against source. Some registered plugins are production-shaped stubs — see
-README "Honest limitations" (stubs: input/output kafka/redis/s3, output
-datadog, filters geoip/dns/elasticsearch).
+against source. The ten connector plugins that were formerly stubs now
+perform real external integrations (input/output kafka/redis/s3, output
+datadog, filters geoip/dns/elasticsearch); their validation levels differ
+(compile-only / mock / live) — see README "Honest limitations". Config
+fields of note: geoip `database` (path to the `.mmdb`), s3 output
+`endpoint` / `force_path_style` (MinIO/LocalStack/S3-compatible).
 
 | Crate | Purpose |
 |-------|---------|
 | `ferro-stash-core` | Event model, pipeline engine, conditions, buffering, DLQ, metrics |
 | `ferro-stash-config` | Logstash DSL + YAML config parsing |
-| `ferro-stash-input` | Input plugins (15 registered: stdin, file, tcp, udp, http, syslog, generator, heartbeat, beats, elasticsearch, dead_letter_queue, pipeline + stubs kafka/redis/s3) |
-| `ferro-stash-filter` | Filter plugins (29 registered: grok, mutate, json, date, dissect, kv, drop, clone, ruby, script, aggregate, throttle, … + stubs geoip/dns/elasticsearch) |
-| `ferro-stash-output` | Output plugins (11 registered: stdout, elasticsearch, file, http, tcp, null, pipeline + stubs kafka/redis/s3/datadog) |
+| `ferro-stash-input` | Input plugins (15 registered: stdin, file, tcp, udp, http, syslog, generator, heartbeat, beats, elasticsearch, dead_letter_queue, pipeline + real kafka/redis/s3, compile-validated) |
+| `ferro-stash-filter` | Filter plugins (29 registered: grok, mutate, json, date, dissect, kv, drop, clone, ruby, script, aggregate, throttle, … + real geoip/dns (live-validated), elasticsearch (mock-validated)) |
+| `ferro-stash-output` | Output plugins (11 registered: stdout, elasticsearch, file, http, tcp, null, pipeline + real kafka/redis (compile-validated), s3/datadog (mock-validated)) |
 | `ferro-stash-codec` | Codecs (21 registered: json, plain, multiline, csv, msgpack, cef, netflow, avro, protobuf, edn, …) |
 | `ferro-stash-ruby` | Artichoke (mruby) Ruby interpreter bridge for the `ruby` filter |
 | `ferro-script` | Native Painless-style scripting engine (Cranelift JIT) for the `script` filter/codec |

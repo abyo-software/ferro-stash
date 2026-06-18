@@ -19,11 +19,14 @@ The current `cargo test --workspace` run measures **1,165 tests passing /
 16 ignored / 0 failing** across 15 binary test targets, with `cargo
 clippy -D warnings`, `cargo fmt --check`, and `cargo deny check` clean.
 
-Several plugins are **production-shaped stubs** (the trait, config
-parsing, and lifecycle are wired, but the external integration is not
-implemented). These are called out explicitly in the tables below — do
-not assume a plugin is functional just because it is registered. See
-[Honest limitations](#honest-limitations).
+The ten previously-stubbed connector plugins (input/output `kafka`,
+`redis`, `s3`; output `datadog`; filters `geoip`, `dns`,
+`elasticsearch`) now have **real external integrations**. Their
+validation status differs and is stated honestly per plugin in the
+tables below and in [Honest limitations](#honest-limitations) — some are
+compile-validated only, some are tested against a local mock server, and
+a few are live-validated against a real endpoint. Read those caveats
+before deploying any connector.
 
 ## Why FerroStash
 
@@ -79,8 +82,11 @@ runnable record of what this evidence does and does not substantiate.
 
 Counts below reflect what is **registered in the plugin factories**
 (`create_input` / `create_filter` / `create_output` / `create_codec`),
-verified against source. "Stub" means the plugin loads and runs but does
-not perform the real external integration.
+verified against source. The ten connector plugins that were formerly
+stubs now perform real external integrations; the **Status** column
+states the validation level for each (`compile-validated`,
+`mock-validated`, or `live-validated` — see the Notes column and
+[Honest limitations](#honest-limitations) for what each means).
 
 ### Input plugins (15 registered)
 
@@ -98,9 +104,9 @@ not perform the real external integration.
 | `elasticsearch` | functional | `search_after` + Point-in-Time pagination (reqwest) |
 | `dead_letter_queue` | functional | reads from the on-disk DLQ |
 | `pipeline` | functional | pipeline-to-pipeline (multi-pipeline mode) |
-| `kafka` | **stub** | config + consumer-loop skeleton only; no broker connection |
-| `redis` | **stub** | config + loop skeleton only; no Redis connection |
-| `s3` | **stub** | config + polling skeleton only; no AWS SDK / S3 calls |
+| `kafka` | real (compile-validated) | `rdkafka` async `StreamConsumer`: subscribe, recv loop, codec decode, auto offset commit. No live broker round-trip in CI — covered by an `#[ignore]` smoke test (`KAFKA_BROKERS`). `consumer_threads`/`max_poll_records` parsed but not yet wired; no SASL/SSL passthrough; auto-commit only |
+| `redis` | real (compile-validated) | async client: `BLPOP` (list), `SUBSCRIBE`/`PSUBSCRIBE` (channel/pattern), `AUTH` + `SELECT`. Password-only AUTH (no username/ACL), no TLS (`rediss://`), pub/sub `key` is a single channel/pattern |
+| `s3` | real (compile-validated) | `aws-sdk-s3`: paginated `ListObjectsV2` + `GetObject` poll, in-memory seen-key dedup, optional `delete_after_read`. Seen-key set is not persisted (reprocesses non-deleted objects after restart — no sincedb); no SQS-notification mode |
 
 ### Filter plugins (29 registered)
 
@@ -132,9 +138,9 @@ not perform the real external integration.
 | `de_dot` | functional | replace `.` in field names |
 | `json_encode` | functional | serialize a field to a JSON string |
 | `bytes` | functional | parse human byte sizes (e.g. `1.5kB`) |
-| `geoip` | **stub** | private/public/loopback IP classification only; no MaxMind GeoLite2 database |
-| `dns` | **stub** | no actual resolution; tags events to indicate stub behaviour |
-| `elasticsearch` | **stub** | echoes the event's own data; no ES query is issued |
+| `geoip` | real (live-validated) | `maxminddb` lookups against a configured `.mmdb` (`database` field), full Logstash-style subfields. Falls back to private/loopback/public classification when no `database` is set. Validated against a real GeoLite2-City database |
+| `dns` | real (live-validated) | `hickory-resolver` forward (A/AAAA) and reverse (PTR) lookups, custom `nameserver`, `Replace`/`Append` action. Validated against `8.8.8.8` |
+| `elasticsearch` | real (mock-validated) | `reqwest` `_search` with host failover, query-template `%{field}` sprintf, hits→field mapping. Validated against a local mock HTTP server — **not** against a live Elasticsearch cluster |
 
 ### Output plugins (11 registered)
 
@@ -147,10 +153,10 @@ not perform the real external integration.
 | `tcp` | functional | TLS via rustls |
 | `null` | functional | discard (benchmarking) |
 | `pipeline` | functional | pipeline-to-pipeline (multi-pipeline mode) |
-| `kafka` | **stub** | config only; no broker connection |
-| `redis` | **stub** | config only; no Redis connection |
-| `s3` | **stub** | config only; no AWS SDK / S3 calls |
-| `datadog` | **stub** | config only; no Datadog API calls |
+| `kafka` | real (compile-validated) | `rdkafka` `FutureProducer`: codec serialize, key sprintf, compression/acks/retries, flush. No live broker round-trip in CI — covered by an `#[ignore]` smoke test (`KAFKA_BROKERS`) |
+| `redis` | real (compile-validated) | async `ConnectionManager`: `RPUSH` (list) / `PUBLISH` (channel). Password-only AUTH (no username/ACL), no TLS (`rediss://`), `key` is a single channel |
+| `s3` | real (mock-validated) | `aws-sdk-s3` `PutObject` on rotation/flush (+gzip when `encoding => "gzip"`). New `endpoint` / `force_path_style` fields for MinIO/LocalStack/S3-compatible stores. Single `PutObject` (no multipart upload) in v1. Validated against a local mock S3 server |
+| `datadog` | real (mock-validated) | `reqwest` POST to `/api/v2/logs` (`DD-API-KEY`, batched, retry/backoff). Validated against a local mock HTTP server |
 
 ### Codecs (21 registered)
 
@@ -174,7 +180,8 @@ not perform the real external integration.
 ## Quick start
 
 ```bash
-# Build (requires a C compiler for the Artichoke/mruby FFI — see Prerequisites)
+# Build (requires a C compiler for the Artichoke/mruby FFI and cmake for
+# the rdkafka-backed kafka plugins — see Prerequisites)
 cargo build --release
 
 # Run with a Logstash DSL config
@@ -321,7 +328,13 @@ cargo deny check
   raises its own MSRV to 1.88 and uses edition 2024).
 - A C compiler (clang or gcc) — required to compile the Artichoke/mruby
   FFI in `ferro-stash-ruby`.
+- **`cmake`** — required by the `kafka` plugins, which pull `rdkafka` and
+  build a vendored `librdkafka` via CMake. (TLS in the connectors uses
+  rustls, so no system OpenSSL is needed.)
 - The `artichoke-extended` fork checked out at the path described above.
+- **Runtime, not build-time:** the `geoip` filter needs a user-supplied
+  `.mmdb` (GeoLite2/GeoIP2) database file at the configured `database`
+  path; it is not vendored.
 
 ## Fuzzing
 
@@ -342,12 +355,48 @@ Data sources → FerroStash → FerroSearch → Applications
 
 ## Honest limitations
 
-- **Stub plugins.** `kafka`, `redis`, `s3` (input and output), `datadog`
-  (output), and the `geoip`, `dns`, `elasticsearch` filters are
-  production-shaped stubs — they parse config and run but do not perform
-  the real external integration. Do not deploy them expecting a live
-  connection. (Real implementations require the respective client SDKs,
-  which are not currently dependencies.)
+- **Connector plugins are implemented, but validation levels differ.**
+  The ten formerly-stub plugins (`kafka`, `redis`, `s3` input and
+  output; `datadog` output; `geoip`, `dns`, `elasticsearch` filters) now
+  perform real external integrations via their client SDKs. They are
+  **not** all validated to the same degree — read these caveats before
+  deploying:
+  - **Compile-validated only** (built and unit-tested, but no live
+    round-trip exercised in CI):
+    - **kafka** input (`rdkafka` `StreamConsumer`) and output
+      (`FutureProducer`). The produce/consume round-trips are covered by
+      `#[ignore]` smoke tests gated on `KAFKA_BROKERS`, not by CI.
+      Residuals: `consumer_threads`/`max_poll_records` are parsed but not
+      yet wired to behaviour; no SASL/SSL `security.protocol` passthrough
+      yet; auto-commit only.
+    - **redis** input (`BLPOP`, `SUBSCRIBE`/`PSUBSCRIBE`) and output
+      (`RPUSH`/`PUBLISH`). Residuals: password-only `AUTH` (no
+      `username`/ACL); no TLS (`rediss://`); a pub/sub `key` is treated as
+      a single channel/pattern (no comma-split list).
+    - **s3** input (paginated `ListObjectsV2` + `GetObject`). Residuals:
+      the seen-key dedup set is in-memory only, so non-deleted objects are
+      reprocessed after a restart (no sincedb); no SQS-notification mode;
+      `delete_after_read` deletes immediately after emit.
+  - **Mock-validated** (tested against a local mock server, not a real
+    service):
+    - **datadog** output — `reqwest` POST to `/api/v2/logs`
+      (`DD-API-KEY`, batched, retry/backoff), tested against a local mock
+      HTTP server.
+    - **s3** output — `aws-sdk-s3` `PutObject` on rotation/flush (gzip
+      when `encoding => "gzip"`), tested against a local mock S3 server.
+      Single `PutObject` only (no multipart upload) in v1. New config
+      fields `endpoint` and `force_path_style` support MinIO / LocalStack
+      / other S3-compatible stores.
+    - **elasticsearch** filter — `reqwest` `_search` with host failover
+      and query-template sprintf, tested against a local mock HTTP server.
+      It is **not** validated against a live Elasticsearch cluster.
+  - **Live-validated** (exercised against a real endpoint):
+    - **geoip** filter — `maxminddb` lookups, validated against a real
+      GeoLite2-City database. Requires a user-supplied `.mmdb` file at the
+      `database` path (not vendored); falls back to private/loopback/public
+      classification when no database is configured.
+    - **dns** filter — `hickory-resolver` forward (A/AAAA) and reverse
+      (PTR) lookups, validated against `8.8.8.8`.
 - **Plugin catalogue is scoped.** The registered surface covers
   production-common Logstash usage, not Logstash's full 200+ plugin
   ecosystem. There is no dynamic plugin loading; everything is compiled
