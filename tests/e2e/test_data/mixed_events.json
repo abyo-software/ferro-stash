@@ -1,0 +1,20 @@
+{"message": "2024-01-15 10:30:00|INFO|auth|login successful for user alice from 192.168.1.100"}
+{"message": "2024-01-15 10:30:01|ERROR|payment|charge failed for order 12345 amount 99.99"}
+{"message": "2024-01-15 10:30:02|WARN|inventory|low stock for SKU-A001 quantity 5"}
+{"message": "2024-01-15 10:30:03|INFO|auth|logout for user bob session abc123"}
+{"message": "2024-01-15 10:30:04|DEBUG|search|query completed in 350ms results 42"}
+{"message": "John,30,engineer,New York,75000"}
+{"message": "Alice,28,designer,San Francisco,82000"}
+{"message": "Bob,35,manager,Chicago,95000"}
+{"message": "Charlie,42,director,Boston,120000"}
+{"message": "Dave,25,intern,Austin,45000"}
+{"message": "2024-01-15 10:30:05|ERROR|notification|email delivery failed to user@example.com retry 3"}
+{"message": "2024-01-15 10:30:06|INFO|api-gateway|request processed path /api/v2/users duration 12ms"}
+{"message": "2024-01-15 10:30:07|WARN|storage|disk usage at 85 percent on volume vol-abc123"}
+{"message": "2024-01-15 10:30:08|INFO|cdn|cache hit ratio 94.5 percent for domain example.com"}
+{"message": "2024-01-15 10:30:09|FATAL|database|connection pool exhausted max 100 active 100"}
+{"message": "Eve,31,analyst,Seattle,88000"}
+{"message": "Frank,38,architect,Denver,110000"}
+{"message": "Grace,27,developer,Portland,78000"}
+{"message": "Heidi,45,vp,Miami,150000"}
+{"message": "Ivan,33,devops,Atlanta,92000"}

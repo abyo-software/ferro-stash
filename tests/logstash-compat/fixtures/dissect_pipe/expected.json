@@ -1,0 +1,23 @@
+[
+  {
+    "message": "2024-01-15 10:30:00|INFO|auth|login successful for user alice from 192.168.1.100",
+    "event_time": "2024-01-15 10:30:00",
+    "level": "INFO",
+    "component": "auth",
+    "detail": "login successful for user alice from 192.168.1.100"
+  },
+  {
+    "message": "2024-01-15 10:30:01|ERROR|payment|charge failed for order 12345 amount 99.99",
+    "event_time": "2024-01-15 10:30:01",
+    "level": "ERROR",
+    "component": "payment",
+    "detail": "charge failed for order 12345 amount 99.99"
+  },
+  {
+    "message": "2024-01-15 10:30:02|WARN|inventory|low stock for SKU-A001 quantity 5",
+    "event_time": "2024-01-15 10:30:02",
+    "level": "WARN",
+    "component": "inventory",
+    "detail": "low stock for SKU-A001 quantity 5"
+  }
+]

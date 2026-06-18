@@ -1,0 +1,197 @@
+[
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "host": "server01",
+    "message": "host=server01 port=8080 status=200 method=GET path=/api/health response_time=0.003",
+    "method": "GET",
+    "path": "/api/health",
+    "port": "8080",
+    "response_time": "0.003",
+    "status": "200"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "host": "server02",
+    "message": "host=server02 port=3306 status=error method=CONNECT path=/db/main response_time=5.210",
+    "method": "CONNECT",
+    "path": "/db/main",
+    "port": "3306",
+    "response_time": "5.210",
+    "status": "error"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "host": "server03",
+    "message": "host=server03 port=443 status=301 method=GET path=/old-page response_time=0.001",
+    "method": "GET",
+    "path": "/old-page",
+    "port": "443",
+    "response_time": "0.001",
+    "status": "301"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "host": "server01",
+    "message": "host=server01 port=8080 status=500 method=POST path=/api/users response_time=1.234",
+    "method": "POST",
+    "path": "/api/users",
+    "port": "8080",
+    "response_time": "1.234",
+    "status": "500"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "host": "server04",
+    "message": "host=server04 port=6379 status=ok method=SET path=/cache/session response_time=0.0005",
+    "method": "SET",
+    "path": "/cache/session",
+    "port": "6379",
+    "response_time": "0.0005",
+    "status": "ok"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "action": "login",
+    "duration": "45ms",
+    "ip": "192.168.1.100",
+    "message": "user=admin action=login ip=192.168.1.100 result=success duration=45ms",
+    "result": "success",
+    "user": "admin"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "action": "upload",
+    "duration": "1200ms",
+    "ip": "10.0.0.5",
+    "message": "user=bob action=upload ip=10.0.0.5 result=failure duration=1200ms",
+    "result": "failure",
+    "user": "bob"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "action": "delete",
+    "duration": "3ms",
+    "ip": "172.16.0.50",
+    "message": "user=charlie action=delete ip=172.16.0.50 result=denied duration=3ms",
+    "result": "denied",
+    "user": "charlie"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "action": "download",
+    "duration": "567ms",
+    "ip": "192.168.1.100",
+    "message": "user=alice action=download ip=192.168.1.100 result=success duration=567ms",
+    "result": "success",
+    "user": "alice"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "action": "search",
+    "duration": "89ms",
+    "ip": "10.10.10.1",
+    "message": "user=dave action=search ip=10.10.10.1 result=success duration=89ms",
+    "result": "success",
+    "user": "dave"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "component": "scheduler",
+    "elapsed": "120s",
+    "job": "backup",
+    "level": "INFO",
+    "message": "level=INFO component=scheduler job=backup status=completed elapsed=120s records=50000",
+    "records": "50000",
+    "status": "completed"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "component": "mailer",
+    "elapsed": "30s",
+    "job": "newsletter",
+    "level": "ERROR",
+    "message": "level=ERROR component=mailer job=newsletter status=failed elapsed=30s records=0",
+    "records": "0",
+    "status": "failed"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "component": "cache",
+    "elapsed": "5s",
+    "job": "eviction",
+    "level": "WARN",
+    "message": "level=WARN component=cache job=eviction status=running elapsed=5s records=1234",
+    "records": "1234",
+    "status": "running"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "component": "indexer",
+    "elapsed": "3600s",
+    "job": "reindex",
+    "level": "INFO",
+    "message": "level=INFO component=indexer job=reindex status=completed elapsed=3600s records=1000000",
+    "records": "1000000",
+    "status": "completed"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "component": "router",
+    "elapsed": "0s",
+    "job": "health_check",
+    "level": "DEBUG",
+    "message": "level=DEBUG component=router job=health_check status=ok elapsed=0s records=1",
+    "records": "1",
+    "status": "ok"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "cpu": "78.5",
+    "disk": "45.1",
+    "env": "production",
+    "instance": "i-abc123",
+    "memory": "62.3",
+    "message": "env=production region=us-east-1 instance=i-abc123 cpu=78.5 memory=62.3 disk=45.1",
+    "region": "us-east-1"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "cpu": "23.1",
+    "disk": "12.7",
+    "env": "staging",
+    "instance": "i-def456",
+    "memory": "41.8",
+    "message": "env=staging region=eu-west-1 instance=i-def456 cpu=23.1 memory=41.8 disk=12.7",
+    "region": "eu-west-1"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "cpu": "95.2",
+    "disk": "73.4",
+    "env": "production",
+    "instance": "i-ghi789",
+    "memory": "88.9",
+    "message": "env=production region=ap-southeast-1 instance=i-ghi789 cpu=95.2 memory=88.9 disk=73.4",
+    "region": "ap-southeast-1"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "cpu": "5.3",
+    "disk": "8.2",
+    "env": "development",
+    "instance": "i-jkl012",
+    "memory": "15.6",
+    "message": "env=development region=us-west-2 instance=i-jkl012 cpu=5.3 memory=15.6 disk=8.2",
+    "region": "us-west-2"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "cpu": "45.0",
+    "disk": "30.0",
+    "env": "production",
+    "instance": "i-mno345",
+    "memory": "55.5",
+    "message": "env=production region=us-east-1 instance=i-mno345 cpu=45.0 memory=55.5 disk=30.0",
+    "region": "us-east-1"
+  }
+]

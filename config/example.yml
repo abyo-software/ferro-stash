@@ -1,0 +1,33 @@
+# FerroStash Example Configuration (YAML format)
+
+pipeline:
+  workers: 4
+  batch_size: 500
+  batch_delay_ms: 5000
+
+input:
+  - type: file
+    path: /var/log/*.log
+    start_position: beginning
+    tags:
+      - syslog
+
+filter:
+  - type: grok
+    match:
+      message: "%{IP:client_ip} %{NOTSPACE:method} %{URIPATH:path} %{INT:status}"
+  - type: mutate
+    convert:
+      status: integer
+  - type: date
+    match:
+      - timestamp
+      - ISO8601
+
+output:
+  - type: elasticsearch
+    hosts:
+      - http://localhost:9200
+    index: logs
+  - type: stdout
+    codec: json

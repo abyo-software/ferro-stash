@@ -1,0 +1,23 @@
+[
+  {
+    "level": "INFO",
+    "msg": "ok",
+    "severity": "low"
+  },
+  {
+    "level": "ERROR",
+    "msg": "boom",
+    "severity": "high",
+    "tags": ["alert"]
+  },
+  {
+    "level": "WARN",
+    "msg": "uh oh",
+    "severity": "medium"
+  },
+  {
+    "level": "DEBUG",
+    "msg": "trace",
+    "severity": "low"
+  }
+]

@@ -1,0 +1,18 @@
+[
+  {
+    "level": "info",
+    "service": "AUTH",
+    "username": "alice",
+    "status": 200,
+    "pipeline": "ferro-stash",
+    "tags": ["processed", "mutated"]
+  },
+  {
+    "level": "error",
+    "service": "PAYMENT",
+    "username": "bob",
+    "status": 500,
+    "pipeline": "ferro-stash",
+    "tags": ["processed", "mutated"]
+  }
+]

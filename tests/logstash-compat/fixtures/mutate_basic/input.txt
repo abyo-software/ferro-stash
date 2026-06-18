@@ -1,0 +1,2 @@
+{"level": "INFO", "service": "auth", "user": "alice", "status": 200}
+{"level": "ERROR", "service": "payment", "user": "bob", "status": 500}

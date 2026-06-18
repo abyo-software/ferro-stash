@@ -1,0 +1,5 @@
+{"valid": "yes", "n": 1}
+this is not json at all
+{"unterminated": "string
+{"trailing_comma": 1,}
+{"valid": "again", "n": 2}

@@ -1,0 +1,222 @@
+[
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "action": "login",
+    "duration_ms": 45,
+    "ip": "192.168.1.100",
+    "level": "INFO",
+    "service": "auth",
+    "status": 200,
+    "timestamp": "2024-01-15T10:30:00Z",
+    "user": "alice"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "action": "charge",
+    "duration_ms": 1200,
+    "ip": "10.0.0.5",
+    "level": "ERROR",
+    "service": "payment",
+    "status": 500,
+    "timestamp": "2024-01-15T10:30:01Z",
+    "user": "bob"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "action": "update",
+    "duration_ms": 89,
+    "ip": "172.16.0.50",
+    "level": "WARN",
+    "service": "inventory",
+    "status": 429,
+    "timestamp": "2024-01-15T10:30:02Z",
+    "user": "charlie"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "action": "logout",
+    "duration_ms": 12,
+    "ip": "192.168.1.100",
+    "level": "INFO",
+    "service": "auth",
+    "status": 200,
+    "timestamp": "2024-01-15T10:30:03Z",
+    "user": "alice"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "action": "query",
+    "duration_ms": 350,
+    "ip": "10.10.10.1",
+    "level": "DEBUG",
+    "service": "search",
+    "status": 200,
+    "timestamp": "2024-01-15T10:30:04Z",
+    "user": "dave"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "action": "send_email",
+    "duration_ms": 5000,
+    "ip": "192.168.2.1",
+    "level": "ERROR",
+    "service": "notification",
+    "status": 502,
+    "timestamp": "2024-01-15T10:30:05Z",
+    "user": "eve"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "action": "register",
+    "duration_ms": 234,
+    "ip": "10.0.0.10",
+    "level": "INFO",
+    "service": "auth",
+    "status": 201,
+    "timestamp": "2024-01-15T10:30:06Z",
+    "user": "frank"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "action": "rate_limit",
+    "duration_ms": 5,
+    "ip": "172.16.0.100",
+    "level": "WARN",
+    "service": "api-gateway",
+    "status": 429,
+    "timestamp": "2024-01-15T10:30:07Z",
+    "user": "grace"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "action": "refund",
+    "duration_ms": 567,
+    "ip": "192.168.1.50",
+    "level": "INFO",
+    "service": "payment",
+    "status": 200,
+    "timestamp": "2024-01-15T10:30:08Z",
+    "user": "heidi"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "action": "connection_lost",
+    "duration_ms": 0,
+    "ip": "10.0.0.1",
+    "level": "FATAL",
+    "service": "database",
+    "status": 503,
+    "timestamp": "2024-01-15T10:30:09Z",
+    "user": "system"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "action": "cache_hit",
+    "duration_ms": 2,
+    "ip": "203.0.113.50",
+    "level": "INFO",
+    "service": "cdn",
+    "status": 200,
+    "timestamp": "2024-01-15T10:30:10Z",
+    "user": "ivan"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "action": "login",
+    "duration_ms": 78,
+    "ip": "198.51.100.1",
+    "level": "ERROR",
+    "service": "auth",
+    "status": 403,
+    "timestamp": "2024-01-15T10:30:11Z",
+    "user": "judy"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "action": "index",
+    "duration_ms": 1500,
+    "ip": "10.0.0.1",
+    "level": "INFO",
+    "service": "search",
+    "status": 200,
+    "timestamp": "2024-01-15T10:30:12Z",
+    "user": "system"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "action": "disk_usage",
+    "duration_ms": 15,
+    "ip": "10.0.0.2",
+    "level": "WARN",
+    "service": "storage",
+    "status": 200,
+    "timestamp": "2024-01-15T10:30:13Z",
+    "user": "system"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "action": "password_reset",
+    "duration_ms": 89,
+    "ip": "192.168.3.1",
+    "level": "INFO",
+    "service": "auth",
+    "status": 200,
+    "timestamp": "2024-01-15T10:30:14Z",
+    "user": "kate"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "action": "charge",
+    "duration_ms": 3000,
+    "ip": "10.10.10.50",
+    "level": "ERROR",
+    "service": "payment",
+    "status": 500,
+    "timestamp": "2024-01-15T10:30:15Z",
+    "user": "leo"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "action": "send_sms",
+    "duration_ms": 123,
+    "ip": "172.16.0.200",
+    "level": "INFO",
+    "service": "notification",
+    "status": 200,
+    "timestamp": "2024-01-15T10:30:16Z",
+    "user": "mallory"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "action": "request_log",
+    "duration_ms": 8,
+    "ip": "192.168.4.1",
+    "level": "DEBUG",
+    "service": "api-gateway",
+    "status": 200,
+    "timestamp": "2024-01-15T10:30:17Z",
+    "user": "nancy"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "action": "restock",
+    "duration_ms": 456,
+    "ip": "10.0.0.30",
+    "level": "INFO",
+    "service": "inventory",
+    "status": 200,
+    "timestamp": "2024-01-15T10:30:18Z",
+    "user": "oscar"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "action": "replication_lag",
+    "duration_ms": 0,
+    "ip": "10.0.0.3",
+    "level": "CRITICAL",
+    "service": "database",
+    "status": 500,
+    "timestamp": "2024-01-15T10:30:19Z",
+    "user": "system"
+  }
+]

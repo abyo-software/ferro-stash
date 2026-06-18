@@ -1,0 +1,5 @@
+[
+  { "message": "hello world" },
+  { "message": "second event" },
+  { "message": "third event" }
+]

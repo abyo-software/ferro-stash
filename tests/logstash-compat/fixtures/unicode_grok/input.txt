@@ -1,0 +1,6 @@
+alice|hello
+bob|safe
+charlie|🚀🎉 emoji line
+diana|café résumé naïve façade
+eve|こんにちは世界 hello world
+frank|مرحبا بالعالم arabic rtl

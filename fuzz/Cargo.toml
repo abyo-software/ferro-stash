@@ -1,0 +1,66 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# FerroStash fuzzing harness (cargo-fuzz / libfuzzer).
+#
+# This crate is intentionally NOT a member of the top-level workspace —
+# cargo-fuzz requires nightly-only compiler flags that would taint the
+# stable workspace build. Drive it via `cd fuzz && cargo +nightly fuzz
+# <cmd>` (see `~/fuzz-runner/run-fuzz.sh` for the nightly 24h runner
+# invocation pattern).
+
+[package]
+name = "ferro-stash-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+serde_json = "1"
+
+# Path-deps into the workspace crates whose decode/parse boundaries we
+# fuzz. Versions are pinned to `path =` so cargo rebuilds the exact
+# in-tree source on every fuzz run.
+ferro-stash-core = { path = "../crates/ferro-stash-core" }
+ferro-stash-codec = { path = "../crates/ferro-stash-codec" }
+ferro-stash-config = { path = "../crates/ferro-stash-config" }
+
+[[bin]]
+name = "codec_decode"
+path = "fuzz_targets/codec_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "netflow_decode"
+path = "fuzz_targets/netflow_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "logstash_dsl_parse"
+path = "fuzz_targets/logstash_dsl_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cef_decode"
+path = "fuzz_targets/cef_decode.rs"
+test = false
+doc = false
+bench = false
+
+# Prevent surprise inclusion in the parent workspace. Cargo treats a
+# `[workspace]` key as "I am my own workspace root".
+[workspace]
+
+[profile.release]
+debug = 1

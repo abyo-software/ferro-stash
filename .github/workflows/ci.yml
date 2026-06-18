@@ -1,0 +1,149 @@
+# SPDX-License-Identifier: Apache-2.0
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  # Note: `RUSTFLAGS: -Dwarnings` intentionally NOT set here. It would
+  # propagate to path-dep builds (artichoke-extended) which we don't
+  # control. Workspace-level strictness is enforced via
+  # `[workspace.lints]` in Cargo.toml (workspace-only), and clippy CI
+  # passes `-D warnings` explicitly.
+  # implemented`). Prepend the pre-installed toolchain bin directory instead
+  # of invoking dtolnay/rust-toolchain (which calls rustup internally).
+
+# Wave 14 capacity reduction (replicates ferro-protocols c0f945d):
+#   * `cargo check` job dropped — `cargo clippy` is a strict superset.
+#   * Coverage moved to push-to-main only (see coverage.yml).
+#   * cargo-audit / cargo-deny / cargo-llvm-cov already use
+#     taiki-e/install-action@v2; nothing else to convert.
+#   * No cross-OS matrix in this repo (Linux KVM is canonical).
+
+jobs:
+  test:
+    name: Test
+    runs-on: [self-hosted, Linux, X64, kvm]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout artichoke-extended (sibling path dep)
+        run: |
+          set -euo pipefail
+          SIBLING="$GITHUB_WORKSPACE/../../artichoke-extended"
+          if [ -d "$SIBLING/.git" ]; then
+            git -C "$SIBLING" fetch --depth=1 origin extended
+            git -C "$SIBLING" reset --hard FETCH_HEAD
+          else
+            rm -rf "$SIBLING"
+            git clone --depth=1 --branch extended \
+              https://github.com/masumi-ryugo/artichoke-extended.git "$SIBLING"
+          fi
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+
+  clippy:
+    name: Clippy
+    runs-on: [self-hosted, Linux, X64, kvm]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout artichoke-extended (sibling path dep)
+        run: |
+          set -euo pipefail
+          SIBLING="$GITHUB_WORKSPACE/../../artichoke-extended"
+          if [ -d "$SIBLING/.git" ]; then
+            git -C "$SIBLING" fetch --depth=1 origin extended
+            git -C "$SIBLING" reset --hard FETCH_HEAD
+          else
+            rm -rf "$SIBLING"
+            git clone --depth=1 --branch extended \
+              https://github.com/masumi-ryugo/artichoke-extended.git "$SIBLING"
+          fi
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets
+
+  fmt:
+    name: Format
+    runs-on: [self-hosted, Linux, X64, kvm]
+    steps:
+      - uses: actions/checkout@v4
+      # `cargo fmt --all` descends into path dependencies
+      # (artichoke-extended is vendored via `../../../../artichoke-extended/...`
+      # from ferro-stash-ruby). We only want to enforce formatting on our own
+      # workspace members, so invoke fmt per-package using -p.
+      - name: Format check (workspace members only)
+        run: |
+          set -euo pipefail
+          for pkg in \
+            ferro-stash-core \
+            ferro-stash-config \
+            ferro-stash-input \
+            ferro-stash-filter \
+            ferro-stash-output \
+            ferro-stash-codec \
+            ferro-stash \
+            ferro-stash-ruby \
+            ferro-script \
+            ferro-stash-e2e; do
+            cargo fmt -p "$pkg" -- --check
+          done
+
+  audit:
+    name: Security Audit
+    runs-on: [self-hosted, Linux, X64, kvm]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout artichoke-extended (sibling path dep)
+        run: |
+          set -euo pipefail
+          SIBLING="$GITHUB_WORKSPACE/../../artichoke-extended"
+          if [ -d "$SIBLING/.git" ]; then
+            git -C "$SIBLING" fetch --depth=1 origin extended
+            git -C "$SIBLING" reset --hard FETCH_HEAD
+          else
+            rm -rf "$SIBLING"
+            git clone --depth=1 --branch extended \
+              https://github.com/masumi-ryugo/artichoke-extended.git "$SIBLING"
+          fi
+      - run: cargo generate-lockfile
+      # cargo install cargo-audit pulls aws-lc-sys, which fails to build on
+      # macOS aarch64 self-hosted runner (ios-aarch64 generated asm path lookup).
+      # Install pre-built binary instead.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: Run cargo audit
+        # No active ignores: RUSTSEC-2026-0097 (rand 0.8.5 reseed unsoundness)
+        # was previously ignored but the advisory no longer matches any crate
+        # in the resolved graph (cargo-deny emitted advisory-not-detected).
+        run: cargo audit --deny warnings
+
+  deny:
+    name: Cargo Deny
+    runs-on: [self-hosted, Linux, X64, kvm]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout artichoke-extended (sibling path dep)
+        run: |
+          set -euo pipefail
+          SIBLING="$GITHUB_WORKSPACE/../../artichoke-extended"
+          if [ -d "$SIBLING/.git" ]; then
+            git -C "$SIBLING" fetch --depth=1 origin extended
+            git -C "$SIBLING" reset --hard FETCH_HEAD
+          else
+            rm -rf "$SIBLING"
+            git clone --depth=1 --branch extended \
+              https://github.com/masumi-ryugo/artichoke-extended.git "$SIBLING"
+          fi
+      # cargo install cargo-deny pulls aws-lc-sys, which fails to build on
+      # macOS aarch64 self-hosted runner (ios-aarch64 generated asm path lookup).
+      # Install pre-built binary instead.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: Run cargo deny
+        run: cargo deny check
+

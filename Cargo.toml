@@ -1,0 +1,168 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 abyo software 合同会社 (abyo software LLC)
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/ferro-stash-core",
+    "crates/ferro-stash-config",
+    "crates/ferro-stash-input",
+    "crates/ferro-stash-filter",
+    "crates/ferro-stash-output",
+    "crates/ferro-stash-codec",
+    "crates/ferro-stash-cli",
+    "crates/ferro-stash-ruby",
+    "crates/ferro-script",
+    "crates/ferro-stash-e2e",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["abyo software 合同会社 (abyo software LLC) <dev@abyo.net>"]
+repository = "https://github.com/ferrosearch/ferro-stash"
+rust-version = "1.75"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec", "io"] }
+tokio-stream = "0.1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = { package = "serde_yaml_ng", version = "0.10" }
+
+# HTTP / Network
+reqwest = { version = "0.12", features = ["json", "gzip", "rustls-tls"], default-features = false }
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
+http-body-util = "0.1"
+axum = { version = "0.7", features = ["ws"] }
+tower = "0.4"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Regex / Pattern matching
+regex = "1"
+# onig = "6" # Requires libclang, use regex crate instead
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Crypto / TLS
+rustls = "0.23"
+tokio-rustls = "0.26"
+
+# Compression
+flate2 = "1"
+
+# Misc
+bytes = "1"
+uuid = { version = "1", features = ["v4"] }
+dashmap = "6"
+crossbeam-channel = "0.5"
+notify = "6"
+glob = "0.3"
+indexmap = { version = "2", features = ["serde"] }
+base64 = "0.22"
+hostname = "0.4"
+num_cpus = "1"
+percent-encoding = "2"
+sha2 = "0.10"
+sha1 = "0.10"
+md5 = { package = "md-5", version = "0.10" }
+hmac = "0.12"
+hex = "0.4"
+url = "2"
+csv = "1"
+zstd = "0.13"
+memchr = "2"
+rmp-serde = "1"
+
+# Internal crates
+ferro-stash-core = { path = "crates/ferro-stash-core" }
+ferro-stash-config = { path = "crates/ferro-stash-config" }
+ferro-stash-input = { path = "crates/ferro-stash-input" }
+ferro-stash-filter = { path = "crates/ferro-stash-filter" }
+ferro-stash-output = { path = "crates/ferro-stash-output" }
+ferro-stash-codec = { path = "crates/ferro-stash-codec" }
+ferro-stash-ruby = { path = "crates/ferro-stash-ruby" }
+
+criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny" # ferro-script overrides to "allow" for cranelift JIT FFI
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+# Pedantic is too noisy on Rust 1.95+; many lints fire on existing code that
+# the older toolchain the Mac runner cached treated as silent. Disable the
+# group rather than chase the dozens of cosmetic pedantic lints.
+pedantic = { level = "allow", priority = -1 }
+unwrap_used = "deny"
+expect_used = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+cast_lossless = "allow"
+return_self_not_must_use = "allow"
+if_not_else = "allow"
+single_match_else = "allow"
+too_many_lines = "allow"
+wildcard_imports = "allow"
+doc_markdown = "allow"
+needless_pass_by_value = "allow"
+unused_self = "allow"
+unreadable_literal = "allow"
+similar_names = "allow"
+struct_excessive_bools = "allow"
+struct_field_names = "allow"
+manual_let_else = "allow"
+case_sensitive_file_extension_comparisons = "allow"
+cast_possible_wrap = "allow"
+incompatible_msrv = "allow"
+redundant_else = "allow"
+unnecessary_wraps = "allow"
+no_effect_underscore_binding = "allow"
+map_unwrap_or = "allow"
+match_same_arms = "allow"
+needless_continue = "allow"
+needless_for_each = "allow"
+unnecessary_semicolon = "allow"
+unnecessary_debug_formatting = "allow"
+inefficient_to_string = "allow"
+items_after_statements = "allow"
+must_use_unit = "allow"
+manual_string_new = "allow"
+if_same_then_else = "allow"
+redundant_closure_for_method_calls = "allow"
+unnested_or_patterns = "allow"
+format_push_string = "allow"
+unused_async = "allow"
+stable_sort_primitive = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+opt-level = 3
+
+[profile.bench]
+inherits = "release"
+debug = true

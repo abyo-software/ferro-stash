@@ -1,0 +1,53 @@
+# SPDX-License-Identifier: Apache-2.0
+name: Coverage
+
+# Coverage instrumentation makes the build 2-5x slower than a plain test
+# run and uploads to Codecov on success. There's no value in producing a
+# fresh coverage report for every PR commit — Codecov reports historical
+# coverage on the merged main branch, not on uncommitted PRs. Running on
+# push-to-main + manual dispatch frees the KVM runner pool for
+# PR-blocking jobs.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: coverage-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  coverage:
+    name: Coverage
+    runs-on: [self-hosted, Linux, X64, kvm]
+    steps:
+      - uses: actions/checkout@v4
+      # ferro-stash-ruby depends on artichoke-backend/artichoke-core via a
+      # sibling path (`../../../../artichoke-extended/...` relative to the
+      # crate manifest). From $GITHUB_WORKSPACE (= _work/ferro-stash/ferro-stash)
+      # that resolves to _work/artichoke-extended, so clone there.
+      - name: Checkout artichoke-extended (sibling path dep)
+        run: |
+          set -euo pipefail
+          SIBLING="$GITHUB_WORKSPACE/../../artichoke-extended"
+          if [ -d "$SIBLING/.git" ]; then
+            git -C "$SIBLING" fetch --depth=1 origin extended
+            git -C "$SIBLING" reset --hard FETCH_HEAD
+          else
+            rm -rf "$SIBLING"
+            git clone --depth=1 --branch extended \
+              https://github.com/masumi-ryugo/artichoke-extended.git "$SIBLING"
+          fi
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - run: cargo llvm-cov --workspace --cobertura --output-path cobertura.xml
+      - name: Upload coverage artefact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: cobertura.xml

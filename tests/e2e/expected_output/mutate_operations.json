@@ -1,0 +1,322 @@
+[
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "action": "login",
+    "duration_ms": 45,
+    "ip": "192.168.1.100",
+    "level": "info",
+    "pipeline": "ferro-stash",
+    "service": "AUTH",
+    "status": 200,
+    "tags": [
+      "processed",
+      "mutated"
+    ],
+    "timestamp": "2024-01-15T10:30:00Z",
+    "username": "alice"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "action": "charge",
+    "duration_ms": 1200,
+    "ip": "10.0.0.5",
+    "level": "error",
+    "pipeline": "ferro-stash",
+    "service": "PAYMENT",
+    "status": 500,
+    "tags": [
+      "processed",
+      "mutated"
+    ],
+    "timestamp": "2024-01-15T10:30:01Z",
+    "username": "bob"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "action": "update",
+    "duration_ms": 89,
+    "ip": "172.16.0.50",
+    "level": "warn",
+    "pipeline": "ferro-stash",
+    "service": "INVENTORY",
+    "status": 429,
+    "tags": [
+      "processed",
+      "mutated"
+    ],
+    "timestamp": "2024-01-15T10:30:02Z",
+    "username": "charlie"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "action": "logout",
+    "duration_ms": 12,
+    "ip": "192.168.1.100",
+    "level": "info",
+    "pipeline": "ferro-stash",
+    "service": "AUTH",
+    "status": 200,
+    "tags": [
+      "processed",
+      "mutated"
+    ],
+    "timestamp": "2024-01-15T10:30:03Z",
+    "username": "alice"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "action": "query",
+    "duration_ms": 350,
+    "ip": "10.10.10.1",
+    "level": "debug",
+    "pipeline": "ferro-stash",
+    "service": "SEARCH",
+    "status": 200,
+    "tags": [
+      "processed",
+      "mutated"
+    ],
+    "timestamp": "2024-01-15T10:30:04Z",
+    "username": "dave"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "action": "send_email",
+    "duration_ms": 5000,
+    "ip": "192.168.2.1",
+    "level": "error",
+    "pipeline": "ferro-stash",
+    "service": "NOTIFICATION",
+    "status": 502,
+    "tags": [
+      "processed",
+      "mutated"
+    ],
+    "timestamp": "2024-01-15T10:30:05Z",
+    "username": "eve"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "action": "register",
+    "duration_ms": 234,
+    "ip": "10.0.0.10",
+    "level": "info",
+    "pipeline": "ferro-stash",
+    "service": "AUTH",
+    "status": 201,
+    "tags": [
+      "processed",
+      "mutated"
+    ],
+    "timestamp": "2024-01-15T10:30:06Z",
+    "username": "frank"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "action": "rate_limit",
+    "duration_ms": 5,
+    "ip": "172.16.0.100",
+    "level": "warn",
+    "pipeline": "ferro-stash",
+    "service": "API-GATEWAY",
+    "status": 429,
+    "tags": [
+      "processed",
+      "mutated"
+    ],
+    "timestamp": "2024-01-15T10:30:07Z",
+    "username": "grace"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "action": "refund",
+    "duration_ms": 567,
+    "ip": "192.168.1.50",
+    "level": "info",
+    "pipeline": "ferro-stash",
+    "service": "PAYMENT",
+    "status": 200,
+    "tags": [
+      "processed",
+      "mutated"
+    ],
+    "timestamp": "2024-01-15T10:30:08Z",
+    "username": "heidi"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "action": "connection_lost",
+    "duration_ms": 0,
+    "ip": "10.0.0.1",
+    "level": "fatal",
+    "pipeline": "ferro-stash",
+    "service": "DATABASE",
+    "status": 503,
+    "tags": [
+      "processed",
+      "mutated"
+    ],
+    "timestamp": "2024-01-15T10:30:09Z",
+    "username": "system"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "action": "cache_hit",
+    "duration_ms": 2,
+    "ip": "203.0.113.50",
+    "level": "info",
+    "pipeline": "ferro-stash",
+    "service": "CDN",
+    "status": 200,
+    "tags": [
+      "processed",
+      "mutated"
+    ],
+    "timestamp": "2024-01-15T10:30:10Z",
+    "username": "ivan"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "action": "login",
+    "duration_ms": 78,
+    "ip": "198.51.100.1",
+    "level": "error",
+    "pipeline": "ferro-stash",
+    "service": "AUTH",
+    "status": 403,
+    "tags": [
+      "processed",
+      "mutated"
+    ],
+    "timestamp": "2024-01-15T10:30:11Z",
+    "username": "judy"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "action": "index",
+    "duration_ms": 1500,
+    "ip": "10.0.0.1",
+    "level": "info",
+    "pipeline": "ferro-stash",
+    "service": "SEARCH",
+    "status": 200,
+    "tags": [
+      "processed",
+      "mutated"
+    ],
+    "timestamp": "2024-01-15T10:30:12Z",
+    "username": "system"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "action": "disk_usage",
+    "duration_ms": 15,
+    "ip": "10.0.0.2",
+    "level": "warn",
+    "pipeline": "ferro-stash",
+    "service": "STORAGE",
+    "status": 200,
+    "tags": [
+      "processed",
+      "mutated"
+    ],
+    "timestamp": "2024-01-15T10:30:13Z",
+    "username": "system"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "action": "password_reset",
+    "duration_ms": 89,
+    "ip": "192.168.3.1",
+    "level": "info",
+    "pipeline": "ferro-stash",
+    "service": "AUTH",
+    "status": 200,
+    "tags": [
+      "processed",
+      "mutated"
+    ],
+    "timestamp": "2024-01-15T10:30:14Z",
+    "username": "kate"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "action": "charge",
+    "duration_ms": 3000,
+    "ip": "10.10.10.50",
+    "level": "error",
+    "pipeline": "ferro-stash",
+    "service": "PAYMENT",
+    "status": 500,
+    "tags": [
+      "processed",
+      "mutated"
+    ],
+    "timestamp": "2024-01-15T10:30:15Z",
+    "username": "leo"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "action": "send_sms",
+    "duration_ms": 123,
+    "ip": "172.16.0.200",
+    "level": "info",
+    "pipeline": "ferro-stash",
+    "service": "NOTIFICATION",
+    "status": 200,
+    "tags": [
+      "processed",
+      "mutated"
+    ],
+    "timestamp": "2024-01-15T10:30:16Z",
+    "username": "mallory"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "action": "request_log",
+    "duration_ms": 8,
+    "ip": "192.168.4.1",
+    "level": "debug",
+    "pipeline": "ferro-stash",
+    "service": "API-GATEWAY",
+    "status": 200,
+    "tags": [
+      "processed",
+      "mutated"
+    ],
+    "timestamp": "2024-01-15T10:30:17Z",
+    "username": "nancy"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "action": "restock",
+    "duration_ms": 456,
+    "ip": "10.0.0.30",
+    "level": "info",
+    "pipeline": "ferro-stash",
+    "service": "INVENTORY",
+    "status": 200,
+    "tags": [
+      "processed",
+      "mutated"
+    ],
+    "timestamp": "2024-01-15T10:30:18Z",
+    "username": "oscar"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "action": "replication_lag",
+    "duration_ms": 0,
+    "ip": "10.0.0.3",
+    "level": "critical",
+    "pipeline": "ferro-stash",
+    "service": "DATABASE",
+    "status": 500,
+    "tags": [
+      "processed",
+      "mutated"
+    ],
+    "timestamp": "2024-01-15T10:30:19Z",
+    "username": "system"
+  }
+]

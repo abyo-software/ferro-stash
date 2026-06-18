@@ -1,0 +1,20 @@
+{"message": "Jan 15 10:30:00 server01 sshd[12345]: Accepted publickey for admin from 192.168.1.100 port 52413"}
+{"message": "Jan 15 10:30:01 server02 kernel: [UFW BLOCK] IN=eth0 OUT= MAC=00:16:3e:5e:6c:00 SRC=10.0.0.5 DST=10.0.0.1"}
+{"message": "Jan 15 10:30:02 server03 cron[9876]: (root) CMD (/usr/local/bin/backup.sh)"}
+{"message": "Jan 15 10:30:03 server01 nginx[4321]: 192.168.1.50 GET /api/health 200 0.003"}
+{"message": "Jan 15 10:30:04 server04 postfix/smtp[11111]: to=<user@example.com>, relay=mail.example.com, status=sent"}
+{"message": "Feb 20 14:22:10 webserver01 apache2[2222]: 10.10.10.1 GET /index.html 200 1523"}
+{"message": "Feb 20 14:22:11 dbserver01 mysqld[3333]: Query OK, 42 rows affected (0.05 sec)"}
+{"message": "Feb 20 14:22:12 appserver01 java[4444]: ERROR OutOfMemoryError: Java heap space"}
+{"message": "Feb 20 14:22:13 loadbalancer haproxy[5555]: 172.16.0.1:443 backend_servers/web1 200 0.012"}
+{"message": "Feb 20 14:22:14 monitoring nagios[6666]: SERVICE ALERT: server01;disk;CRITICAL;host unreachable"}
+{"message": "Mar 01 08:00:00 gateway squid[7777]: 1709280000.000 200 TCP_HIT/200 1234 GET http://example.com/page"}
+{"message": "Mar 01 08:00:01 dns01 named[8888]: query: example.com IN A + (192.168.1.1)"}
+{"message": "Mar 01 08:00:02 firewall01 iptables: DROPPED IN=eth1 OUT= SRC=203.0.113.50 DST=10.0.0.1 PROTO=TCP DPT=22"}
+{"message": "Mar 01 08:00:03 vpn01 openvpn[9999]: client-01/192.168.100.5:1194 MULTI: primary virtual IP for client-01: 10.8.0.2"}
+{"message": "Mar 01 08:00:04 backup01 rsync[1010]: sent 1234567 bytes received 890 bytes total size 9876543"}
+{"message": "Apr 10 16:45:00 ci-runner01 docker[2020]: container start abc123def456 (image=node:18, name=build-job-42)"}
+{"message": "Apr 10 16:45:01 k8s-node01 kubelet[3030]: Pod sandbox changed, recreating pod default/nginx-deployment-abc123"}
+{"message": "Apr 10 16:45:02 redis01 redis-server[4040]: DB loaded from disk: 0.234 seconds"}
+{"message": "Apr 10 16:45:03 elastic01 elasticsearch[5050]: [node-1] indices [logs-2024.01], total [5], took [1.2s]"}
+{"message": "Apr 10 16:45:04 proxy01 envoy[6060]: [2024-04-10T16:45:04Z] upstream_rq_completed{200} cluster=backend_svc"}

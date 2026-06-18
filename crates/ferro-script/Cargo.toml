@@ -1,0 +1,76 @@
+[package]
+name = "ferro-script"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+regex = { workspace = true }
+thiserror = { workspace = true }
+dashmap = { workspace = true }
+
+# Cranelift JIT for Painless script compilation
+cranelift = "0.116"
+cranelift-jit = "0.116"
+cranelift-module = "0.116"
+cranelift-native = "0.116"
+target-lexicon = "0.13"
+
+# Cargo doesn't allow [lints.rust] alongside [lints] workspace = true;
+# duplicate the relevant subset of workspace lints here so we can override
+# unsafe_code (cranelift JIT FFI) without inheriting forbid from workspace.
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "allow", priority = -1 }
+# Cranelift JIT setup uses unwrap() on settings_builder.set() (infallible
+# for known keys); allow rather than wrap each call in expect() noise.
+unwrap_used = "allow"
+expect_used = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+cast_lossless = "allow"
+cast_possible_wrap = "allow"
+return_self_not_must_use = "allow"
+if_not_else = "allow"
+single_match_else = "allow"
+too_many_lines = "allow"
+wildcard_imports = "allow"
+doc_markdown = "allow"
+needless_pass_by_value = "allow"
+unused_self = "allow"
+unreadable_literal = "allow"
+similar_names = "allow"
+match_same_arms = "allow"
+manual_let_else = "allow"
+struct_excessive_bools = "allow"
+struct_field_names = "allow"
+case_sensitive_file_extension_comparisons = "allow"
+incompatible_msrv = "allow"
+redundant_else = "allow"
+unnecessary_wraps = "allow"
+no_effect_underscore_binding = "allow"
+map_unwrap_or = "allow"
+needless_continue = "allow"
+needless_for_each = "allow"
+unnecessary_semicolon = "allow"
+unnecessary_debug_formatting = "allow"
+inefficient_to_string = "allow"
+items_after_statements = "allow"
+must_use_unit = "allow"
+manual_string_new = "allow"
+if_same_then_else = "allow"
+redundant_closure_for_method_calls = "allow"
+unnested_or_patterns = "allow"
+format_push_string = "allow"
+unused_async = "allow"

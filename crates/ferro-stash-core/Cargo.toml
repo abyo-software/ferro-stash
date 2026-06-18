@@ -1,0 +1,55 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "ferro-stash-core"
+description = "Core pipeline engine and event model for FerroStash"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tokio-stream = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+uuid = { workspace = true }
+dashmap = { workspace = true }
+indexmap = { workspace = true }
+crossbeam-channel = { workspace = true }
+hostname = { workspace = true }
+async-trait = "0.1"
+regex = { workspace = true }
+num_cpus = { workspace = true }
+zstd = { workspace = true }
+serde_yaml = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tempfile = "3"
+criterion = { workspace = true }
+
+[[bench]]
+name = "event_bench"
+harness = false
+
+[[bench]]
+name = "pipeline_bench"
+harness = false
+
+[[bench]]
+name = "pq_bench"
+harness = false
+
+[lints]
+workspace = true

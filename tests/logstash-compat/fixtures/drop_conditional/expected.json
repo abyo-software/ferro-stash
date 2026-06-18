@@ -1,0 +1,14 @@
+[
+  {
+    "level": "INFO",
+    "msg": "user logged in"
+  },
+  {
+    "level": "ERROR",
+    "msg": "payment failed"
+  },
+  {
+    "level": "WARN",
+    "msg": "queue depth high"
+  }
+]

@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Convenience compose file — declares the Logstash 8.x reference image
+# the docker-driven regression harness pins. The actual harness
+# (`tests/e2e/logstash_docker_compat_test.rs`) shells out to `docker run`
+# directly so it can pipe stdin/stdout per-fixture; this compose file
+# exists only to:
+#
+#   1. Centralise the image tag (so a single line changes if we bump).
+#   2. Pre-pull on machines that prefer compose:
+#        docker compose -f tests/logstash-compat/docker-compose.yml pull
+#
+# The harness does NOT use `compose up` — each fixture spawns its own
+# short-lived `docker run --rm -i` so the JVM cold-start cost is paid
+# per-test (~12s). Six fixtures take ~70s wall-clock end-to-end.
+
+services:
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.15.3
+    profiles: ["pull-only"]
+    # No command, no ports, no volumes — this entry exists for image
+    # caching only. The Rust harness invokes the image directly via
+    # `docker run`.

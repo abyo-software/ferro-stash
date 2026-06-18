@@ -1,0 +1,10 @@
+## JVM configuration for benchmarking — tuned for throughput
+-Xms4g
+-Xmx4g
+-XX:+UseG1GC
+-XX:G1ReservePercent=25
+-XX:InitiatingHeapOccupancyPercent=75
+-Djava.awt.headless=true
+-Dfile.encoding=UTF-8
+-Djruby.compile.invokedynamic=true
+-XX:+HeapDumpOnOutOfMemoryError

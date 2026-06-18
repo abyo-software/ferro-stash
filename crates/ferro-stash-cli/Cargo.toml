@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "ferro-stash"
+description = "High-performance data pipeline — drop-in Logstash replacement written in Rust"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "ferro-stash"
+path = "src/main.rs"
+
+[dependencies]
+ferro-stash-core = { workspace = true }
+ferro-stash-config = { workspace = true }
+ferro-stash-input = { workspace = true }
+ferro-stash-filter = { workspace = true }
+ferro-stash-output = { workspace = true }
+ferro-stash-codec = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+axum = { workspace = true }
+chrono = { workspace = true }
+num_cpus = { workspace = true }
+glob = { workspace = true }
+hostname = { workspace = true }
+uuid = { workspace = true }
+notify = { workspace = true }
+fs2 = "0.4"
+socket2 = "0.5"
+serde_yaml = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

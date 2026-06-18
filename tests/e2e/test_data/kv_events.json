@@ -1,0 +1,20 @@
+{"message": "host=server01 port=8080 status=200 method=GET path=/api/health response_time=0.003"}
+{"message": "host=server02 port=3306 status=error method=CONNECT path=/db/main response_time=5.210"}
+{"message": "host=server03 port=443 status=301 method=GET path=/old-page response_time=0.001"}
+{"message": "host=server01 port=8080 status=500 method=POST path=/api/users response_time=1.234"}
+{"message": "host=server04 port=6379 status=ok method=SET path=/cache/session response_time=0.0005"}
+{"message": "user=admin action=login ip=192.168.1.100 result=success duration=45ms"}
+{"message": "user=bob action=upload ip=10.0.0.5 result=failure duration=1200ms"}
+{"message": "user=charlie action=delete ip=172.16.0.50 result=denied duration=3ms"}
+{"message": "user=alice action=download ip=192.168.1.100 result=success duration=567ms"}
+{"message": "user=dave action=search ip=10.10.10.1 result=success duration=89ms"}
+{"message": "level=INFO component=scheduler job=backup status=completed elapsed=120s records=50000"}
+{"message": "level=ERROR component=mailer job=newsletter status=failed elapsed=30s records=0"}
+{"message": "level=WARN component=cache job=eviction status=running elapsed=5s records=1234"}
+{"message": "level=INFO component=indexer job=reindex status=completed elapsed=3600s records=1000000"}
+{"message": "level=DEBUG component=router job=health_check status=ok elapsed=0s records=1"}
+{"message": "env=production region=us-east-1 instance=i-abc123 cpu=78.5 memory=62.3 disk=45.1"}
+{"message": "env=staging region=eu-west-1 instance=i-def456 cpu=23.1 memory=41.8 disk=12.7"}
+{"message": "env=production region=ap-southeast-1 instance=i-ghi789 cpu=95.2 memory=88.9 disk=73.4"}
+{"message": "env=development region=us-west-2 instance=i-jkl012 cpu=5.3 memory=15.6 disk=8.2"}
+{"message": "env=production region=us-east-1 instance=i-mno345 cpu=45.0 memory=55.5 disk=30.0"}

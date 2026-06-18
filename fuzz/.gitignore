@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: Apache-2.0
+# cargo-fuzz generated artefacts
+target/
+artifacts/
+coverage/
+Cargo.lock
+
+# Ignore all libfuzzer-generated corpus entries, EXCEPT permanent
+# regression seeds — crashes / OOMs that a past fuzz run surfaced and
+# a commit has since fixed. Tracking them in git ensures every future
+# fuzz run (local, CI, post-clone) re-checks the exact input that
+# triggered the original bug. Naming convention:
+# `regression-<topic>-<YYYY-MM-DD>`.
+#
+# NOTE: we exclude `corpus/*/` at the subpath level (NOT `corpus/` at
+# directory level) because git's gitignore can't re-include files
+# inside an already-excluded directory.
+corpus/*/*
+!corpus/*/regression-*
+
+# Known-crash quarantine: regression seeds whose source-side fix has NOT
+# yet landed. Kept out of corpus/ so libfuzzer doesn't replay them on
+# startup (which would exit 1 before any new exploration). Reproduce with
+# `cargo +nightly fuzz run <target> known-crash/<target>/<file>`.
+known-crash/

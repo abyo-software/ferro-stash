@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "ferro-stash-e2e"
+description = "E2E Logstash compatibility tests for FerroStash"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+# This crate exists solely for integration tests
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+ferro-stash-core = { workspace = true }
+ferro-stash-config = { workspace = true }
+ferro-stash-filter = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+
+[[test]]
+name = "compatibility_test"
+path = "../../tests/e2e/compatibility_test.rs"
+
+[[test]]
+name = "logstash_compat_test"
+path = "../../tests/e2e/logstash_compat_test.rs"
+
+# Side-by-side regression vs Logstash 8.x reference (docker-driven).
+# All tests are #[ignore]; run with:
+#   cargo test -p ferro-stash-e2e --test logstash_docker_compat_test -- --ignored --nocapture
+[[test]]
+name = "logstash_docker_compat_test"
+path = "../../tests/e2e/logstash_docker_compat_test.rs"
+
+[lints]
+workspace = true

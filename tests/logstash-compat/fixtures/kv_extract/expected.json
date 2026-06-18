@@ -1,0 +1,25 @@
+[
+  {
+    "message": "host=server01 port=8080 status=200 method=GET path=/api/health",
+    "host": "server01",
+    "port": "8080",
+    "status": "200",
+    "method": "GET",
+    "path": "/api/health"
+  },
+  {
+    "message": "host=server02 port=3306 status=error method=CONNECT path=/db/main",
+    "host": "server02",
+    "port": "3306",
+    "status": "error",
+    "method": "CONNECT",
+    "path": "/db/main"
+  },
+  {
+    "message": "user=admin action=login ip=192.168.1.100 result=success",
+    "user": "admin",
+    "action": "login",
+    "ip": "192.168.1.100",
+    "result": "success"
+  }
+]

@@ -1,0 +1,4 @@
+{"level": "INFO", "msg": "ok"}
+{"level": "ERROR", "msg": "boom"}
+{"level": "WARN", "msg": "uh oh"}
+{"level": "DEBUG", "msg": "trace"}

@@ -1,0 +1,5 @@
+{"level": "INFO", "msg": "user logged in"}
+{"level": "DEBUG", "msg": "noisy diagnostic"}
+{"level": "ERROR", "msg": "payment failed"}
+{"level": "DEBUG", "msg": "another noisy line"}
+{"level": "WARN", "msg": "queue depth high"}

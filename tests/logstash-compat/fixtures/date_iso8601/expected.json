@@ -1,0 +1,20 @@
+[
+  {
+    "ts": "2024-01-15T10:30:00Z",
+    "service": "auth",
+    "level": "INFO",
+    "event_time": "2024-01-15T10:30:00.000Z"
+  },
+  {
+    "ts": "2024-02-20T14:22:11Z",
+    "service": "payment",
+    "level": "ERROR",
+    "event_time": "2024-02-20T14:22:11.000Z"
+  },
+  {
+    "ts": "2024-03-01T08:00:00Z",
+    "service": "inventory",
+    "level": "WARN",
+    "event_time": "2024-03-01T08:00:00.000Z"
+  }
+]

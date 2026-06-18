@@ -1,0 +1,82 @@
+[
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "message": "{\"level\": \"INFO\", \"service\": \"auth\", \"action\": \"login\", \"user\": \"alice\", \"ip\": \"192.168.1.100\", \"status\": 200, \"duration_ms\": 45, \"timestamp\": \"2024-01-15T10:30:00Z\"}"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "message": "{\"level\": \"ERROR\", \"service\": \"payment\", \"action\": \"charge\", \"user\": \"bob\", \"ip\": \"10.0.0.5\", \"status\": 500, \"duration_ms\": 1200, \"timestamp\": \"2024-01-15T10:30:01Z\"}"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "message": "{\"level\": \"WARN\", \"service\": \"inventory\", \"action\": \"update\", \"user\": \"charlie\", \"ip\": \"172.16.0.50\", \"status\": 429, \"duration_ms\": 89, \"timestamp\": \"2024-01-15T10:30:02Z\"}"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "message": "{\"level\": \"INFO\", \"service\": \"auth\", \"action\": \"logout\", \"user\": \"alice\", \"ip\": \"192.168.1.100\", \"status\": 200, \"duration_ms\": 12, \"timestamp\": \"2024-01-15T10:30:03Z\"}"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "message": "{\"level\": \"DEBUG\", \"service\": \"search\", \"action\": \"query\", \"user\": \"dave\", \"ip\": \"10.10.10.1\", \"status\": 200, \"duration_ms\": 350, \"timestamp\": \"2024-01-15T10:30:04Z\"}"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "message": "{\"level\": \"ERROR\", \"service\": \"notification\", \"action\": \"send_email\", \"user\": \"eve\", \"ip\": \"192.168.2.1\", \"status\": 502, \"duration_ms\": 5000, \"timestamp\": \"2024-01-15T10:30:05Z\"}"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "message": "{\"level\": \"INFO\", \"service\": \"auth\", \"action\": \"register\", \"user\": \"frank\", \"ip\": \"10.0.0.10\", \"status\": 201, \"duration_ms\": 234, \"timestamp\": \"2024-01-15T10:30:06Z\"}"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "message": "{\"level\": \"WARN\", \"service\": \"api-gateway\", \"action\": \"rate_limit\", \"user\": \"grace\", \"ip\": \"172.16.0.100\", \"status\": 429, \"duration_ms\": 5, \"timestamp\": \"2024-01-15T10:30:07Z\"}"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "message": "{\"level\": \"INFO\", \"service\": \"payment\", \"action\": \"refund\", \"user\": \"heidi\", \"ip\": \"192.168.1.50\", \"status\": 200, \"duration_ms\": 567, \"timestamp\": \"2024-01-15T10:30:08Z\"}"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "message": "{\"level\": \"FATAL\", \"service\": \"database\", \"action\": \"connection_lost\", \"user\": \"system\", \"ip\": \"10.0.0.1\", \"status\": 503, \"duration_ms\": 0, \"timestamp\": \"2024-01-15T10:30:09Z\"}"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "message": "{\"level\": \"INFO\", \"service\": \"cdn\", \"action\": \"cache_hit\", \"user\": \"ivan\", \"ip\": \"203.0.113.50\", \"status\": 200, \"duration_ms\": 2, \"timestamp\": \"2024-01-15T10:30:10Z\"}"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "message": "{\"level\": \"ERROR\", \"service\": \"auth\", \"action\": \"login\", \"user\": \"judy\", \"ip\": \"198.51.100.1\", \"status\": 403, \"duration_ms\": 78, \"timestamp\": \"2024-01-15T10:30:11Z\"}"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "message": "{\"level\": \"INFO\", \"service\": \"search\", \"action\": \"index\", \"user\": \"system\", \"ip\": \"10.0.0.1\", \"status\": 200, \"duration_ms\": 1500, \"timestamp\": \"2024-01-15T10:30:12Z\"}"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "message": "{\"level\": \"WARN\", \"service\": \"storage\", \"action\": \"disk_usage\", \"user\": \"system\", \"ip\": \"10.0.0.2\", \"status\": 200, \"duration_ms\": 15, \"timestamp\": \"2024-01-15T10:30:13Z\"}"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "message": "{\"level\": \"INFO\", \"service\": \"auth\", \"action\": \"password_reset\", \"user\": \"kate\", \"ip\": \"192.168.3.1\", \"status\": 200, \"duration_ms\": 89, \"timestamp\": \"2024-01-15T10:30:14Z\"}"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "message": "{\"level\": \"ERROR\", \"service\": \"payment\", \"action\": \"charge\", \"user\": \"leo\", \"ip\": \"10.10.10.50\", \"status\": 500, \"duration_ms\": 3000, \"timestamp\": \"2024-01-15T10:30:15Z\"}"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "message": "{\"level\": \"INFO\", \"service\": \"notification\", \"action\": \"send_sms\", \"user\": \"mallory\", \"ip\": \"172.16.0.200\", \"status\": 200, \"duration_ms\": 123, \"timestamp\": \"2024-01-15T10:30:16Z\"}"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "message": "{\"level\": \"DEBUG\", \"service\": \"api-gateway\", \"action\": \"request_log\", \"user\": \"nancy\", \"ip\": \"192.168.4.1\", \"status\": 200, \"duration_ms\": 8, \"timestamp\": \"2024-01-15T10:30:17Z\"}"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "message": "{\"level\": \"INFO\", \"service\": \"inventory\", \"action\": \"restock\", \"user\": \"oscar\", \"ip\": \"10.0.0.30\", \"status\": 200, \"duration_ms\": 456, \"timestamp\": \"2024-01-15T10:30:18Z\"}"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "message": "{\"level\": \"CRITICAL\", \"service\": \"database\", \"action\": \"replication_lag\", \"user\": \"system\", \"ip\": \"10.0.0.3\", \"status\": 500, \"duration_ms\": 0, \"timestamp\": \"2024-01-15T10:30:19Z\"}"
+  }
+]

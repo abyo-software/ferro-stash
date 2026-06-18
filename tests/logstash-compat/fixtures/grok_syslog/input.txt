@@ -1,0 +1,3 @@
+Jan 15 10:30:00 server01 sshd[12345]: Accepted publickey for admin from 192.168.1.100 port 52413
+Feb 20 14:22:11 dbserver01 mysqld[3333]: Query OK, 42 rows affected (0.05 sec)
+Mar 01 08:00:00 gateway squid[7777]: 1709280000.000 200 TCP_HIT/200 1234 GET http://example.com/page

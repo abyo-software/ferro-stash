@@ -1,0 +1,322 @@
+[
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "bytes": "1234",
+    "clientip": "192.168.1.1",
+    "httpversion": "1.1",
+    "ident": "admin",
+    "message": "192.168.1.1 - admin [15/Jan/2024:10:30:00 +0000] \"GET /index.html HTTP/1.1\" 200 1234 \"https://example.com\" \"Mozilla/5.0 (Windows NT 10.0; Win64; x64)\"",
+    "protocol": "HTTP",
+    "raw_timestamp": "15/Jan/2024:10:30:00 +0000",
+    "request": "/index.html",
+    "response": 200,
+    "tags": [
+      "web_access"
+    ],
+    "verb": "GET"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "bytes": "89",
+    "clientip": "10.0.0.5",
+    "httpversion": "1.1",
+    "ident": "-",
+    "message": "10.0.0.5 - - [15/Jan/2024:10:30:01 +0000] \"POST /api/login HTTP/1.1\" 401 89 \"-\" \"curl/7.81.0\"",
+    "protocol": "HTTP",
+    "raw_timestamp": "15/Jan/2024:10:30:01 +0000",
+    "request": "/api/login",
+    "response": 401,
+    "tags": [
+      "web_access"
+    ],
+    "verb": "POST"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "bytes": "0",
+    "clientip": "172.16.0.100",
+    "httpversion": "1.1",
+    "ident": "user1",
+    "message": "172.16.0.100 - user1 [15/Jan/2024:10:30:02 +0000] \"GET /images/logo.png HTTP/1.1\" 304 0 \"https://example.com/index.html\" \"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)\"",
+    "protocol": "HTTP",
+    "raw_timestamp": "15/Jan/2024:10:30:02 +0000",
+    "request": "/images/logo.png",
+    "response": 304,
+    "tags": [
+      "web_access"
+    ],
+    "verb": "GET"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "bytes": "67",
+    "clientip": "192.168.1.50",
+    "httpversion": "1.1",
+    "ident": "-",
+    "message": "192.168.1.50 - - [15/Jan/2024:10:30:03 +0000] \"DELETE /api/users/42 HTTP/1.1\" 403 67 \"-\" \"PostmanRuntime/7.32.3\"",
+    "protocol": "HTTP",
+    "raw_timestamp": "15/Jan/2024:10:30:03 +0000",
+    "request": "/api/users/42",
+    "response": 403,
+    "tags": [
+      "web_access"
+    ],
+    "verb": "DELETE"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "bytes": "456",
+    "clientip": "10.10.10.1",
+    "httpversion": "1.1",
+    "ident": "bot",
+    "message": "10.10.10.1 - bot [15/Jan/2024:10:30:04 +0000] \"GET /robots.txt HTTP/1.1\" 200 456 \"-\" \"Googlebot/2.1\"",
+    "protocol": "HTTP",
+    "raw_timestamp": "15/Jan/2024:10:30:04 +0000",
+    "request": "/robots.txt",
+    "response": 200,
+    "tags": [
+      "web_access"
+    ],
+    "verb": "GET"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "bytes": "234",
+    "clientip": "192.168.2.1",
+    "httpversion": "1.1",
+    "ident": "admin",
+    "message": "192.168.2.1 - admin [15/Jan/2024:10:30:05 +0000] \"PUT /api/config HTTP/1.1\" 200 234 \"https://admin.example.com\" \"Mozilla/5.0 (X11; Linux x86_64)\"",
+    "protocol": "HTTP",
+    "raw_timestamp": "15/Jan/2024:10:30:05 +0000",
+    "request": "/api/config",
+    "response": 200,
+    "tags": [
+      "web_access"
+    ],
+    "verb": "PUT"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "bytes": "15",
+    "clientip": "10.0.0.10",
+    "httpversion": "1.1",
+    "ident": "-",
+    "message": "10.0.0.10 - - [15/Jan/2024:10:30:06 +0000] \"GET /health HTTP/1.1\" 200 15 \"-\" \"kube-probe/1.27\"",
+    "protocol": "HTTP",
+    "raw_timestamp": "15/Jan/2024:10:30:06 +0000",
+    "request": "/health",
+    "response": 200,
+    "tags": [
+      "web_access"
+    ],
+    "verb": "GET"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "bytes": "8901",
+    "clientip": "172.16.0.200",
+    "httpversion": "1.1",
+    "ident": "user2",
+    "message": "172.16.0.200 - user2 [15/Jan/2024:10:30:07 +0000] \"GET /api/data?page=1&limit=50 HTTP/1.1\" 200 8901 \"https://app.example.com\" \"Mozilla/5.0 (iPhone; CPU iPhone OS 16_0)\"",
+    "protocol": "HTTP",
+    "raw_timestamp": "15/Jan/2024:10:30:07 +0000",
+    "request": "/api/data?page=1&limit=50",
+    "response": 200,
+    "tags": [
+      "web_access"
+    ],
+    "verb": "GET"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "bytes": "169",
+    "clientip": "192.168.1.99",
+    "httpversion": "1.1",
+    "ident": "-",
+    "message": "192.168.1.99 - - [15/Jan/2024:10:30:08 +0000] \"GET /nonexistent HTTP/1.1\" 404 169 \"-\" \"Mozilla/5.0 (Windows NT 10.0; Win64; x64)\"",
+    "protocol": "HTTP",
+    "raw_timestamp": "15/Jan/2024:10:30:08 +0000",
+    "request": "/nonexistent",
+    "response": 404,
+    "tags": [
+      "web_access"
+    ],
+    "verb": "GET"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "bytes": "42",
+    "clientip": "10.0.0.20",
+    "httpversion": "1.1",
+    "ident": "deploy",
+    "message": "10.0.0.20 - deploy [15/Jan/2024:10:30:09 +0000] \"POST /webhook/deploy HTTP/1.1\" 202 42 \"-\" \"GitHub-Hookshot/abc123\"",
+    "protocol": "HTTP",
+    "raw_timestamp": "15/Jan/2024:10:30:09 +0000",
+    "request": "/webhook/deploy",
+    "response": 202,
+    "tags": [
+      "web_access"
+    ],
+    "verb": "POST"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "bytes": "156789",
+    "clientip": "192.168.3.1",
+    "httpversion": "1.1",
+    "ident": "-",
+    "message": "192.168.3.1 - - [15/Jan/2024:10:30:10 +0000] \"GET /static/app.js HTTP/1.1\" 200 156789 \"https://example.com\" \"Mozilla/5.0 (Windows NT 10.0; Win64; x64)\"",
+    "protocol": "HTTP",
+    "raw_timestamp": "15/Jan/2024:10:30:10 +0000",
+    "request": "/static/app.js",
+    "response": 200,
+    "tags": [
+      "web_access"
+    ],
+    "verb": "GET"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "bytes": "345",
+    "clientip": "10.10.10.50",
+    "httpversion": "1.1",
+    "ident": "admin",
+    "message": "10.10.10.50 - admin [15/Jan/2024:10:30:11 +0000] \"PATCH /api/users/1 HTTP/1.1\" 200 345 \"https://admin.example.com\" \"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)\"",
+    "protocol": "HTTP",
+    "raw_timestamp": "15/Jan/2024:10:30:11 +0000",
+    "request": "/api/users/1",
+    "response": 200,
+    "tags": [
+      "web_access"
+    ],
+    "verb": "PATCH"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "bytes": "0",
+    "clientip": "172.16.0.50",
+    "httpversion": "1.1",
+    "ident": "-",
+    "message": "172.16.0.50 - - [15/Jan/2024:10:30:12 +0000] \"OPTIONS /api/data HTTP/1.1\" 204 0 \"https://other.example.com\" \"Mozilla/5.0 (Windows NT 10.0; Win64; x64)\"",
+    "protocol": "HTTP",
+    "raw_timestamp": "15/Jan/2024:10:30:12 +0000",
+    "request": "/api/data",
+    "response": 204,
+    "tags": [
+      "web_access"
+    ],
+    "verb": "OPTIONS"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "bytes": "2345",
+    "clientip": "192.168.1.1",
+    "httpversion": "1.1",
+    "ident": "admin",
+    "message": "192.168.1.1 - admin [15/Jan/2024:10:30:13 +0000] \"GET /api/metrics HTTP/1.1\" 200 2345 \"https://grafana.example.com\" \"Mozilla/5.0 (X11; Linux x86_64)\"",
+    "protocol": "HTTP",
+    "raw_timestamp": "15/Jan/2024:10:30:13 +0000",
+    "request": "/api/metrics",
+    "response": 200,
+    "tags": [
+      "web_access"
+    ],
+    "verb": "GET"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "bytes": "1150",
+    "clientip": "10.0.0.30",
+    "httpversion": "1.1",
+    "ident": "-",
+    "message": "10.0.0.30 - - [15/Jan/2024:10:30:14 +0000] \"GET /favicon.ico HTTP/1.1\" 200 1150 \"https://example.com\" \"Mozilla/5.0 (iPhone; CPU iPhone OS 16_0)\"",
+    "protocol": "HTTP",
+    "raw_timestamp": "15/Jan/2024:10:30:14 +0000",
+    "request": "/favicon.ico",
+    "response": 200,
+    "tags": [
+      "web_access"
+    ],
+    "verb": "GET"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "bytes": "169",
+    "clientip": "172.16.0.75",
+    "httpversion": "1.1",
+    "ident": "scanner",
+    "message": "172.16.0.75 - scanner [15/Jan/2024:10:30:15 +0000] \"GET /wp-admin HTTP/1.1\" 404 169 \"-\" \"WPScan v3.8.25\"",
+    "protocol": "HTTP",
+    "raw_timestamp": "15/Jan/2024:10:30:15 +0000",
+    "request": "/wp-admin",
+    "response": 404,
+    "tags": [
+      "web_access"
+    ],
+    "verb": "GET"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "bytes": "100",
+    "clientip": "192.168.4.1",
+    "httpversion": "1.1",
+    "ident": "-",
+    "message": "192.168.4.1 - - [15/Jan/2024:10:30:16 +0000] \"POST /api/upload HTTP/1.1\" 413 100 \"https://app.example.com\" \"Mozilla/5.0 (Windows NT 10.0; Win64; x64)\"",
+    "protocol": "HTTP",
+    "raw_timestamp": "15/Jan/2024:10:30:16 +0000",
+    "request": "/api/upload",
+    "response": 413,
+    "tags": [
+      "web_access"
+    ],
+    "verb": "POST"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "bytes": "4567",
+    "clientip": "10.10.10.100",
+    "httpversion": "1.1",
+    "ident": "user3",
+    "message": "10.10.10.100 - user3 [15/Jan/2024:10:30:17 +0000] \"GET /api/search?q=rust+programming HTTP/1.1\" 200 4567 \"https://search.example.com\" \"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)\"",
+    "protocol": "HTTP",
+    "raw_timestamp": "15/Jan/2024:10:30:17 +0000",
+    "request": "/api/search?q=rust+programming",
+    "response": 200,
+    "tags": [
+      "web_access"
+    ],
+    "verb": "GET"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "bytes": "89",
+    "clientip": "192.168.1.200",
+    "httpversion": "1.1",
+    "ident": "-",
+    "message": "192.168.1.200 - - [15/Jan/2024:10:30:18 +0000] \"GET /api/status HTTP/1.1\" 503 89 \"-\" \"monitoring-agent/1.0\"",
+    "protocol": "HTTP",
+    "raw_timestamp": "15/Jan/2024:10:30:18 +0000",
+    "request": "/api/status",
+    "response": 503,
+    "tags": [
+      "web_access"
+    ],
+    "verb": "GET"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "bytes": "23",
+    "clientip": "10.0.0.40",
+    "httpversion": "1.1",
+    "ident": "admin",
+    "message": "10.0.0.40 - admin [15/Jan/2024:10:30:19 +0000] \"POST /api/restart HTTP/1.1\" 200 23 \"https://admin.example.com\" \"Mozilla/5.0 (X11; Linux x86_64)\"",
+    "protocol": "HTTP",
+    "raw_timestamp": "15/Jan/2024:10:30:19 +0000",
+    "request": "/api/restart",
+    "response": 200,
+    "tags": [
+      "web_access"
+    ],
+    "verb": "POST"
+  }
+]

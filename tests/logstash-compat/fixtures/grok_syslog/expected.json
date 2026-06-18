@@ -1,0 +1,29 @@
+[
+  {
+    "message": "Jan 15 10:30:00 server01 sshd[12345]: Accepted publickey for admin from 192.168.1.100 port 52413",
+    "syslog_month": "Jan",
+    "syslog_day": "15",
+    "syslog_time": "10:30:00",
+    "syslog_host": "server01",
+    "syslog_program": "sshd[12345]",
+    "syslog_message": "Accepted publickey for admin from 192.168.1.100 port 52413"
+  },
+  {
+    "message": "Feb 20 14:22:11 dbserver01 mysqld[3333]: Query OK, 42 rows affected (0.05 sec)",
+    "syslog_month": "Feb",
+    "syslog_day": "20",
+    "syslog_time": "14:22:11",
+    "syslog_host": "dbserver01",
+    "syslog_program": "mysqld[3333]",
+    "syslog_message": "Query OK, 42 rows affected (0.05 sec)"
+  },
+  {
+    "message": "Mar 01 08:00:00 gateway squid[7777]: 1709280000.000 200 TCP_HIT/200 1234 GET http://example.com/page",
+    "syslog_month": "Mar",
+    "syslog_day": "01",
+    "syslog_time": "08:00:00",
+    "syslog_host": "gateway",
+    "syslog_program": "squid[7777]",
+    "syslog_message": "1709280000.000 200 TCP_HIT/200 1234 GET http://example.com/page"
+  }
+]

@@ -1,0 +1,152 @@
+[
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "component": "auth",
+    "detail": "login successful for user alice from 192.168.1.100",
+    "event_time": "2024-01-15 10:30:00",
+    "level": "INFO",
+    "message": "2024-01-15 10:30:00|INFO|auth|login successful for user alice from 192.168.1.100"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "component": "payment",
+    "detail": "charge failed for order 12345 amount 99.99",
+    "event_time": "2024-01-15 10:30:01",
+    "level": "ERROR",
+    "message": "2024-01-15 10:30:01|ERROR|payment|charge failed for order 12345 amount 99.99"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "component": "inventory",
+    "detail": "low stock for SKU-A001 quantity 5",
+    "event_time": "2024-01-15 10:30:02",
+    "level": "WARN",
+    "message": "2024-01-15 10:30:02|WARN|inventory|low stock for SKU-A001 quantity 5"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "component": "auth",
+    "detail": "logout for user bob session abc123",
+    "event_time": "2024-01-15 10:30:03",
+    "level": "INFO",
+    "message": "2024-01-15 10:30:03|INFO|auth|logout for user bob session abc123"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "component": "search",
+    "detail": "query completed in 350ms results 42",
+    "event_time": "2024-01-15 10:30:04",
+    "level": "DEBUG",
+    "message": "2024-01-15 10:30:04|DEBUG|search|query completed in 350ms results 42"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "message": "John,30,engineer,New York,75000",
+    "tags": [
+      "_dissectfailure"
+    ]
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "message": "Alice,28,designer,San Francisco,82000",
+    "tags": [
+      "_dissectfailure"
+    ]
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "message": "Bob,35,manager,Chicago,95000",
+    "tags": [
+      "_dissectfailure"
+    ]
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "message": "Charlie,42,director,Boston,120000",
+    "tags": [
+      "_dissectfailure"
+    ]
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "message": "Dave,25,intern,Austin,45000",
+    "tags": [
+      "_dissectfailure"
+    ]
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "component": "notification",
+    "detail": "email delivery failed to user@example.com retry 3",
+    "event_time": "2024-01-15 10:30:05",
+    "level": "ERROR",
+    "message": "2024-01-15 10:30:05|ERROR|notification|email delivery failed to user@example.com retry 3"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "component": "api-gateway",
+    "detail": "request processed path /api/v2/users duration 12ms",
+    "event_time": "2024-01-15 10:30:06",
+    "level": "INFO",
+    "message": "2024-01-15 10:30:06|INFO|api-gateway|request processed path /api/v2/users duration 12ms"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "component": "storage",
+    "detail": "disk usage at 85 percent on volume vol-abc123",
+    "event_time": "2024-01-15 10:30:07",
+    "level": "WARN",
+    "message": "2024-01-15 10:30:07|WARN|storage|disk usage at 85 percent on volume vol-abc123"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "component": "cdn",
+    "detail": "cache hit ratio 94.5 percent for domain example.com",
+    "event_time": "2024-01-15 10:30:08",
+    "level": "INFO",
+    "message": "2024-01-15 10:30:08|INFO|cdn|cache hit ratio 94.5 percent for domain example.com"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "component": "database",
+    "detail": "connection pool exhausted max 100 active 100",
+    "event_time": "2024-01-15 10:30:09",
+    "level": "FATAL",
+    "message": "2024-01-15 10:30:09|FATAL|database|connection pool exhausted max 100 active 100"
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "message": "Eve,31,analyst,Seattle,88000",
+    "tags": [
+      "_dissectfailure"
+    ]
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "message": "Frank,38,architect,Denver,110000",
+    "tags": [
+      "_dissectfailure"
+    ]
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "message": "Grace,27,developer,Portland,78000",
+    "tags": [
+      "_dissectfailure"
+    ]
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "message": "Heidi,45,vp,Miami,150000",
+    "tags": [
+      "_dissectfailure"
+    ]
+  },
+  {
+    "@timestamp": "2024-01-15T10:30:00+00:00",
+    "message": "Ivan,33,devops,Atlanta,92000",
+    "tags": [
+      "_dissectfailure"
+    ]
+  }
+]
