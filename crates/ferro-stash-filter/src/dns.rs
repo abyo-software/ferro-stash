@@ -5,17 +5,27 @@
 //! lookups resolve an IP field to its PTR hostname(s). Resolution uses the
 //! `hickory-resolver` (0.25) async resolver over a Tokio connection provider.
 //!
-//! The resolver is built lazily once on first use (so config parsing never
-//! requires a runtime or network) and reused for the filter's lifetime. By
-//! default the system resolver configuration (`/etc/resolv.conf`) is used; if
-//! the `nameserver` config option is set the filter resolves against that
-//! server (UDP/53) instead.
+//! The resolver is built lazily on first use (so config parsing never requires
+//! a runtime or network) and, once built successfully, reused for the filter's
+//! lifetime. A *failed* build (e.g. `/etc/resolv.conf` momentarily unreadable
+//! during a DHCP/netplan reconfigure or before networking is up) is **not**
+//! cached: the next event retries the build, so a transient fault does not
+//! permanently disable resolution. By default the system resolver configuration
+//! (`/etc/resolv.conf`) is used; if the `nameserver` config option is set the
+//! filter resolves against that server (UDP/53) instead.
+//!
+//! Each lookup is also bounded in latency (see [`LOOKUP_TIMEOUT`]): the resolver
+//! is built with a tight per-attempt timeout / single attempt, and every lookup
+//! is additionally wrapped in a hard `tokio::time::timeout`. This prevents a
+//! single unreachable nameserver from stalling the (serial, per-worker) pipeline
+//! for ~10s while hickory exhausts its default 5s × 2-attempt budget.
 //!
 //! Runtime resolution errors (NXDOMAIN, timeouts, network down, empty answers)
 //! are never fatal: the configured `tag_on_failure` tag is added and the event
 //! flows on.
 
 use std::net::IpAddr;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use ferro_stash_core::condition::Condition;
@@ -27,6 +37,17 @@ use hickory_resolver::config::{NameServerConfigGroup, ResolverConfig};
 use hickory_resolver::name_server::TokioConnectionProvider;
 use tokio::sync::OnceCell;
 use tracing::warn;
+
+/// Hard upper bound on the wall-clock latency of a single DNS lookup.
+///
+/// hickory's default `ResolverOpts` allows `timeout` (5s) × `attempts` (2) ≈
+/// 10s per lookup before failing, which would serialize and stall the per-worker
+/// pipeline. We bound it two ways: the resolver is built with these tighter
+/// options (single attempt, ~2s timeout), and each lookup is wrapped in a
+/// `tokio::time::timeout(LOOKUP_TIMEOUT)` as a belt-and-braces ceiling so a slow
+/// nameserver tags failure quickly instead of stalling the batch. 2s is a sane
+/// default for a non-blocking enrichment filter.
+const LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Action to take when a lookup succeeds.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -50,10 +71,11 @@ pub struct DnsFilter {
     nameserver: Option<String>,
     /// Whether to add a tag on failure.
     tag_on_failure: String,
-    /// Lazily-built, reused resolver. `None` inside the cell means the resolver
-    /// could not be built (e.g. unreadable `/etc/resolv.conf`); lookups then
-    /// fail gracefully (tagged).
-    resolver: OnceCell<Option<TokioResolver>>,
+    /// Lazily-built, reused resolver. Only a *successful* build is memoized
+    /// here; a failed build (e.g. transiently unreadable `/etc/resolv.conf`) is
+    /// not cached, so the build is retried on the next lookup and recovers once
+    /// the system configuration becomes readable again.
+    resolver: OnceCell<TokioResolver>,
     condition: Option<Condition>,
 }
 
@@ -107,16 +129,23 @@ impl DnsFilter {
     }
 
     /// Build the resolver. Honors a custom `nameserver` (UDP/53) if configured,
-    /// otherwise reads the system configuration. Returns `None` on failure so
-    /// callers degrade gracefully.
-    fn build_resolver(&self) -> Option<TokioResolver> {
+    /// otherwise reads the system configuration. Returns `Err` only when the
+    /// build genuinely fails (e.g. unreadable `/etc/resolv.conf`); the error is
+    /// surfaced to the caller so a *transient* failure is not memoized.
+    ///
+    /// The resulting resolver always uses the bounded options from
+    /// [`Self::bounded_options`] so no single lookup can exhaust hickory's
+    /// default ~10s budget.
+    fn build_resolver(&self) -> std::result::Result<TokioResolver, String> {
         let provider = TokioConnectionProvider::default();
         if let Some(ns) = &self.nameserver {
             match ns.parse::<IpAddr>() {
                 Ok(ip) => {
                     let group = NameServerConfigGroup::from_ips_clear(&[ip], 53, true);
                     let config = ResolverConfig::from_parts(None, Vec::new(), group);
-                    Some(TokioResolver::builder_with_config(config, provider).build())
+                    let mut builder = TokioResolver::builder_with_config(config, provider);
+                    self.apply_bounded_options(builder.options_mut());
+                    Ok(builder.build())
                 }
                 Err(e) => {
                     warn!(
@@ -132,39 +161,63 @@ impl DnsFilter {
         }
     }
 
-    fn build_system_resolver(&self, provider: TokioConnectionProvider) -> Option<TokioResolver> {
+    fn build_system_resolver(
+        &self,
+        provider: TokioConnectionProvider,
+    ) -> std::result::Result<TokioResolver, String> {
         match TokioResolver::builder(provider) {
-            Ok(builder) => Some(builder.build()),
+            Ok(mut builder) => {
+                // Preserve the system-derived options (search domains, ndots,
+                // strategy, …) but clamp the latency-relevant ones.
+                self.apply_bounded_options(builder.options_mut());
+                Ok(builder.build())
+            }
             Err(e) => {
                 warn!(error = %e, "dns: failed to read system resolver configuration");
-                None
+                Err(e.to_string())
             }
         }
     }
 
-    /// Lazily obtain the shared resolver (built at most once).
+    /// Clamp the latency-relevant `ResolverOpts` in place: one attempt and a
+    /// tight per-attempt timeout so a single unreachable nameserver fails fast
+    /// (~[`LOOKUP_TIMEOUT`]) rather than burning hickory's default 5s × 2.
+    fn apply_bounded_options(&self, opts: &mut hickory_resolver::config::ResolverOpts) {
+        opts.timeout = LOOKUP_TIMEOUT;
+        opts.attempts = 1;
+    }
+
+    /// Lazily obtain the shared resolver. A successful build is memoized and
+    /// reused; a failed build is *not* cached, so subsequent calls retry and
+    /// recover from a transient configuration fault.
     async fn resolver(&self) -> Option<&TokioResolver> {
         self.resolver
-            .get_or_init(|| async { self.build_resolver() })
+            .get_or_try_init(|| async { self.build_resolver() })
             .await
-            .as_ref()
+            .ok()
     }
 
     /// Forward lookup: hostname -> first resolved address (as a string).
-    /// Returns `None` on any error or empty answer.
+    /// Returns `None` on any error or empty answer. The lookup is bounded by
+    /// [`LOOKUP_TIMEOUT`] so a slow nameserver cannot stall the worker.
     async fn resolve_forward(&self, hostname: &str) -> Option<String> {
         let resolver = self.resolver().await?;
-        match resolver.lookup_ip(hostname).await {
-            Ok(lookup) => lookup.iter().next().map(|ip| ip.to_string()),
-            Err(e) => {
+        match tokio::time::timeout(LOOKUP_TIMEOUT, resolver.lookup_ip(hostname)).await {
+            Ok(Ok(lookup)) => lookup.iter().next().map(|ip| ip.to_string()),
+            Ok(Err(e)) => {
                 warn!(hostname = %hostname, error = %e, "dns: forward lookup failed");
+                None
+            }
+            Err(_) => {
+                warn!(hostname = %hostname, "dns: forward lookup timed out");
                 None
             }
         }
     }
 
     /// Reverse lookup: IP -> first PTR hostname (trailing dot stripped).
-    /// Returns `None` on any error or empty answer.
+    /// Returns `None` on any error or empty answer. The lookup is bounded by
+    /// [`LOOKUP_TIMEOUT`] so a slow nameserver cannot stall the worker.
     async fn resolve_reverse(&self, ip: &str) -> Option<String> {
         let addr: IpAddr = match ip.parse() {
             Ok(a) => a,
@@ -174,14 +227,18 @@ impl DnsFilter {
             }
         };
         let resolver = self.resolver().await?;
-        match resolver.reverse_lookup(addr).await {
-            Ok(lookup) => lookup.iter().next().map(|ptr| {
+        match tokio::time::timeout(LOOKUP_TIMEOUT, resolver.reverse_lookup(addr)).await {
+            Ok(Ok(lookup)) => lookup.iter().next().map(|ptr| {
                 // PTR derefs to a Name whose Display includes a trailing dot;
                 // strip it for Logstash-style output.
                 ptr.to_string().trim_end_matches('.').to_string()
             }),
-            Err(e) => {
+            Ok(Err(e)) => {
                 warn!(ip = %ip, error = %e, "dns: reverse lookup failed");
+                None
+            }
+            Err(_) => {
+                warn!(ip = %ip, "dns: reverse lookup timed out");
                 None
             }
         }
@@ -348,6 +405,66 @@ mod tests {
         let settings = serde_json::json!({});
         let filter = DnsFilter::from_config(&settings, None).expect("config");
         assert_eq!(filter.name(), "dns");
+    }
+
+    #[test]
+    fn test_lookup_timeout_is_bounded() {
+        // Finding 2: a single lookup must not be able to consume hickory's
+        // default ~10s budget. The chosen bound is short and well under that.
+        assert!(
+            LOOKUP_TIMEOUT <= std::time::Duration::from_secs(3),
+            "per-lookup bound should be tight: {LOOKUP_TIMEOUT:?}"
+        );
+    }
+
+    #[test]
+    fn test_bounded_options_applied() {
+        // Finding 2: the resolver options are clamped to a single attempt and
+        // the tight per-attempt timeout, so attempts × timeout cannot blow up.
+        let settings = serde_json::json!({ "nameserver": "8.8.8.8" });
+        let filter = DnsFilter::from_config(&settings, None).expect("config");
+        let mut opts = hickory_resolver::config::ResolverOpts::default();
+        // Defaults are the dangerous ones we are guarding against.
+        assert_eq!(opts.attempts, 2);
+        filter.apply_bounded_options(&mut opts);
+        assert_eq!(opts.attempts, 1, "attempts must be clamped to 1");
+        assert_eq!(opts.timeout, LOOKUP_TIMEOUT, "timeout must be clamped");
+    }
+
+    #[tokio::test]
+    async fn test_custom_nameserver_build_succeeds() {
+        // Finding 1 (positive side): a custom-nameserver build never fails, so
+        // it is memoized — the custom path keeps working.
+        let settings = serde_json::json!({ "nameserver": "8.8.8.8" });
+        let filter = DnsFilter::from_config(&settings, None).expect("config");
+        assert!(
+            filter.build_resolver().is_ok(),
+            "custom nameserver build should succeed offline"
+        );
+        // First obtain memoizes; second returns the same cached instance.
+        let first = filter.resolver().await.map(std::ptr::from_ref);
+        let second = filter.resolver().await.map(std::ptr::from_ref);
+        assert!(first.is_some(), "resolver should build");
+        assert_eq!(first, second, "successful build must be memoized, not rebuilt");
+    }
+
+    #[tokio::test]
+    async fn test_build_failure_not_permanently_latched() {
+        // Finding 1: a *failed* build must not poison the OnceCell. We exercise
+        // the retry semantics directly: a fresh OnceCell that fails its init
+        // closure stays empty and can succeed on a later attempt. This is the
+        // exact `get_or_try_init` contract `resolver()` relies on, so a
+        // transient `/etc/resolv.conf` read failure recovers once readable.
+        let cell: OnceCell<u32> = OnceCell::new();
+        let first: std::result::Result<&u32, &'static str> = cell
+            .get_or_try_init(|| async { Err("transient failure") })
+            .await;
+        assert!(first.is_err(), "failing init should return the error");
+        assert!(cell.get().is_none(), "a failed init must NOT be cached");
+        // A subsequent attempt succeeds and is then memoized.
+        let second = cell.get_or_try_init(|| async { Ok::<u32, &'static str>(42) }).await;
+        assert_eq!(second, Ok(&42), "retry after failure should succeed");
+        assert_eq!(cell.get(), Some(&42), "successful init is memoized");
     }
 
     // ----- Live-smoke tests (require network) -----
