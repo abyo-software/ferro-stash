@@ -116,6 +116,125 @@ impl HttpOutput {
             condition,
         })
     }
+
+    /// Send a single body to the configured URL/method, honoring the
+    /// configured headers and retry/backoff policy. Returns `Ok(())` on the
+    /// first 2xx, and `Err` once retries are exhausted (or a non-retryable
+    /// status is seen). Shared by every format so the retry semantics are
+    /// identical for batched bodies and per-event form posts.
+    async fn send_body_with_retry(&self, body: &str, content_type: &str) -> Result<()> {
+        let mut last_error = None;
+        for attempt in 0..=self.retry_count {
+            let mut request = match self.method {
+                HttpMethod::Post => self.client.post(&self.url),
+                HttpMethod::Put => self.client.put(&self.url),
+                HttpMethod::Patch => self.client.patch(&self.url),
+            };
+
+            request = request.header("Content-Type", content_type);
+            for (key, value) in &self.headers {
+                request = request.header(key, value);
+            }
+
+            let response = match request.body(body.to_string()).send().await {
+                Ok(response) => response,
+                Err(e) => {
+                    last_error = Some(format!("request failed: {e}"));
+                    if attempt < self.retry_count {
+                        continue;
+                    }
+                    break;
+                }
+            };
+
+            if response.status().is_success() {
+                return Ok(());
+            }
+
+            let status = response.status();
+            let snippet = ferro_stash_core::read_bounded_body_stream(
+                Box::pin(response.bytes_stream()),
+                crate::ERROR_BODY_SNIPPET_LIMIT,
+            )
+            .await;
+            warn!(status = %status, body = %snippet, attempt, "HTTP output error");
+            last_error = Some(format!("HTTP {status}"));
+            if !(status.is_server_error() || status.as_u16() == 429) || attempt >= self.retry_count
+            {
+                break;
+            }
+        }
+
+        Err(FerroStashError::Output {
+            plugin: "http".to_string(),
+            message: last_error.unwrap_or_else(|| "request failed".to_string()),
+        })
+    }
+
+    /// Form-encode and POST one request PER EVENT, aggregating results like the
+    /// kafka output. Every event is attempted regardless of individual
+    /// failures (no short-circuit that would DROP later events). If ANY request
+    /// fails, an `Err` is returned so the pipeline can DLQ/retry the batch; on
+    /// full success `Ok(())` is returned. This NEVER returns `Ok` while having
+    /// dropped or failed to send any event.
+    ///
+    /// Delivery semantics: like the kafka output, this is AT-LEAST-ONCE. On a
+    /// partial-batch failure we return `Err` for the whole batch, so a
+    /// pipeline retry may RE-SEND the events that already succeeded
+    /// (duplicates). That is inherent to per-record at-least-once delivery and
+    /// is accepted; the contract here is that no event is ever silently
+    /// DROPPED, not that there are zero duplicates.
+    async fn output_form(&self, events: Vec<Event>) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        let total = events.len();
+        let mut succeeded = 0usize;
+        let mut first_error: Option<String> = None;
+
+        for event in &events {
+            // Preserve the original single-event form-encoding logic, applied
+            // per event.
+            let form_body = event
+                .fields()
+                .iter()
+                .map(|(k, v)| format!("{}={}", k, v.to_string_lossy()))
+                .collect::<Vec<_>>()
+                .join("&");
+
+            match self
+                .send_body_with_retry(&form_body, "application/x-www-form-urlencoded")
+                .await
+            {
+                Ok(()) => succeeded += 1,
+                Err(e) => {
+                    // Record the first failure for the surfaced error, but keep
+                    // going so the remaining events are still attempted.
+                    if first_error.is_none() {
+                        first_error = Some(e.to_string());
+                    }
+                }
+            }
+        }
+
+        let failed = total - succeeded;
+        if let Some(err) = first_error {
+            warn!(
+                succeeded,
+                failed, total, "HTTP form output: partial batch delivery; all events attempted"
+            );
+            return Err(FerroStashError::Output {
+                plugin: "http".to_string(),
+                message: format!(
+                    "HTTP form delivery failed for {failed}/{total} events (first error: {err}); \
+                     {succeeded} succeeded — whole-batch retry/DLQ may duplicate the sent events"
+                ),
+            });
+        }
+
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -125,6 +244,17 @@ impl OutputPlugin for HttpOutput {
     }
 
     async fn output(&self, events: Vec<Event>) -> Result<()> {
+        // Form-encoding is one record per request: a single
+        // `application/x-www-form-urlencoded` body cannot carry more than one
+        // event's worth of key/value pairs without ambiguous key collisions.
+        // The pipeline hands the WHOLE batch to one `output()` call, so the
+        // `form` format must send one POST PER EVENT and aggregate the results
+        // (like the kafka output) — otherwise every event after the first is
+        // silently dropped while the pipeline records the batch as delivered.
+        if matches!(self.format, HttpFormat::Form) {
+            return self.output_form(events).await;
+        }
+
         let (body, content_type_override) = match self.format {
             HttpFormat::Json => {
                 if events.len() == 1 {
@@ -156,67 +286,14 @@ impl OutputPlugin for HttpOutput {
                 Some("text/plain"),
             ),
             HttpFormat::Form => {
-                let form_body = if let Some(event) = events.first() {
-                    event
-                        .fields()
-                        .iter()
-                        .map(|(k, v)| format!("{}={}", k, v.to_string_lossy()))
-                        .collect::<Vec<_>>()
-                        .join("&")
-                } else {
-                    String::new()
-                };
-                (form_body, Some("application/x-www-form-urlencoded"))
+                // Handled above by `output_form`; unreachable here. Keep an
+                // explicit body so the match stays exhaustive without panics.
+                (String::new(), Some("application/x-www-form-urlencoded"))
             }
         };
 
         let ct = content_type_override.unwrap_or(&self.content_type);
-        let mut last_error = None;
-        for attempt in 0..=self.retry_count {
-            let mut request = match self.method {
-                HttpMethod::Post => self.client.post(&self.url),
-                HttpMethod::Put => self.client.put(&self.url),
-                HttpMethod::Patch => self.client.patch(&self.url),
-            };
-
-            request = request.header("Content-Type", ct);
-            for (key, value) in &self.headers {
-                request = request.header(key, value);
-            }
-
-            let response = match request.body(body.clone()).send().await {
-                Ok(response) => response,
-                Err(e) => {
-                    last_error = Some(format!("request failed: {e}"));
-                    if attempt < self.retry_count {
-                        continue;
-                    }
-                    break;
-                }
-            };
-
-            if response.status().is_success() {
-                return Ok(());
-            }
-
-            let status = response.status();
-            let body = ferro_stash_core::read_bounded_body_stream(
-                Box::pin(response.bytes_stream()),
-                crate::ERROR_BODY_SNIPPET_LIMIT,
-            )
-            .await;
-            warn!(status = %status, body = %body, attempt, "HTTP output error");
-            last_error = Some(format!("HTTP {status}"));
-            if !(status.is_server_error() || status.as_u16() == 429) || attempt >= self.retry_count
-            {
-                break;
-            }
-        }
-
-        Err(FerroStashError::Output {
-            plugin: "http".to_string(),
-            message: last_error.unwrap_or_else(|| "request failed".to_string()),
-        })
+        self.send_body_with_retry(&body, ct).await
     }
 
     fn condition(&self) -> Option<&Condition> {
@@ -228,10 +305,11 @@ impl OutputPlugin for HttpOutput {
 mod tests {
     use super::*;
     use axum::{routing::post, Router};
+    use ferro_stash_core::event::EventValue;
     use ferro_stash_core::Event;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     };
     use tokio::net::TcpListener;
 
@@ -366,5 +444,122 @@ mod tests {
             "HTTP output should retry once and publish successfully"
         );
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    fn form_event(message: &str, id: i64) -> Event {
+        let mut event = Event::new(message);
+        event.set("id", EventValue::Integer(id));
+        event
+    }
+
+    #[tokio::test]
+    async fn test_http_output_form_sends_one_request_per_event() {
+        // Regression for the round-14 HIGH data-loss finding: with
+        // `format => form` and a batch of N>1 events, the output MUST send one
+        // form-encoded request PER EVENT (not just `events.first()`), and all
+        // event data must arrive.
+        let count = Arc::new(AtomicUsize::new(0));
+        let bodies: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let handler_count = Arc::clone(&count);
+        let handler_bodies = Arc::clone(&bodies);
+        let app = Router::new().route(
+            "/events",
+            post(move |body: String| {
+                let handler_count = Arc::clone(&handler_count);
+                let handler_bodies = Arc::clone(&handler_bodies);
+                async move {
+                    handler_count.fetch_add(1, Ordering::SeqCst);
+                    if let Ok(mut guard) = handler_bodies.lock() {
+                        guard.push(body);
+                    }
+                    (axum::http::StatusCode::OK, "ok")
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+
+        let settings = serde_json::json!({
+            "url": format!("http://{addr}/events"),
+            "format": "form",
+            "retry_count": 0
+        });
+        let output = HttpOutput::from_config(&settings, None).expect("config");
+
+        let batch = vec![
+            form_event("alpha", 1),
+            form_event("bravo", 2),
+            form_event("charlie", 3),
+        ];
+        let result = output.output(batch).await;
+
+        assert!(result.is_ok(), "all form posts succeeded => Ok");
+        // One request per event, NOT a single request that drops events[1..].
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            3,
+            "form output must send one request per event"
+        );
+
+        let received = bodies.lock().expect("bodies").clone();
+        assert_eq!(received.len(), 3, "server received three form bodies");
+        // Each event's data must arrive (message + id) — no event is dropped.
+        let joined = received.join("\n");
+        for (msg, id) in [("alpha", "1"), ("bravo", "2"), ("charlie", "3")] {
+            assert!(
+                received.iter().any(|b| b.contains(&format!("message={msg}"))
+                    && b.contains(&format!("id={id}"))),
+                "expected a form body containing message={msg} and id={id}; got: {joined}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_http_output_form_failing_post_returns_err() {
+        // A failing POST must make output() return Err so the pipeline can
+        // DLQ/retry — events are NEVER silently dropped while returning Ok.
+        let count = Arc::new(AtomicUsize::new(0));
+        let handler_count = Arc::clone(&count);
+        let app = Router::new().route(
+            "/events",
+            post(move |_body: String| {
+                let handler_count = Arc::clone(&handler_count);
+                async move {
+                    handler_count.fetch_add(1, Ordering::SeqCst);
+                    // Non-retryable client error => fail fast per request.
+                    (axum::http::StatusCode::BAD_REQUEST, "nope")
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+
+        let settings = serde_json::json!({
+            "url": format!("http://{addr}/events"),
+            "format": "form",
+            "retry_count": 0
+        });
+        let output = HttpOutput::from_config(&settings, None).expect("config");
+
+        let batch = vec![form_event("alpha", 1), form_event("bravo", 2)];
+        let result = output.output(batch).await;
+
+        assert!(
+            result.is_err(),
+            "a failing form POST must surface Err (no silent drop)"
+        );
+        // Every event is still attempted (no short-circuit that would drop the
+        // later events after the first failure).
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            2,
+            "every event must be attempted even when one fails"
+        );
     }
 }
