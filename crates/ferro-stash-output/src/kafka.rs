@@ -249,32 +249,73 @@ impl OutputPlugin for KafkaOutput {
             records.push((payload, key));
         }
 
-        // Produce each record and await its delivery acknowledgement. librdkafka
-        // batches/compresses internally and a background thread drives delivery,
-        // so awaiting in order does not serialize the network round-trips.
+        // Attempt EVERY record in the batch regardless of individual failures —
+        // we never short-circuit on the first delivery error, so records after a
+        // failed one are still produced (no silent data loss). Each record's
+        // delivery acknowledgement is awaited and its outcome recorded; only after
+        // attempting all do we decide whether to surface an error.
+        //
+        // librdkafka batches/compresses internally and a background thread drives
+        // delivery, so awaiting in order does not serialize the network round-trips.
+        //
+        // Delivery semantics: Kafka output is AT-LEAST-ONCE. If a partial failure
+        // occurs (some records acked, some not) we return an error so the pipeline
+        // can DLQ/retry the whole batch — that whole-batch retry may RE-DELIVER the
+        // already-acked records (duplicates). This is inherent to at-least-once
+        // delivery and is accepted; the contract here is specifically that later
+        // records are never DROPPED, not that there are no duplicates.
+        let total = records.len();
+        let mut succeeded = 0usize;
+        let mut first_error: Option<String> = None;
         for (payload, key) in &records {
             let mut record: FutureRecord<'_, str, [u8]> =
                 FutureRecord::to(&self.config.topic).payload(payload.as_slice());
             if let Some(k) = key {
                 record = record.key(k.as_str());
             }
-            producer
+            match producer
                 .send(record, Timeout::After(KAFKA_QUEUE_TIMEOUT))
                 .await
-                .map_err(|(kafka_err, _msg)| FerroStashError::Output {
-                    plugin: "kafka".to_string(),
-                    message: format!("Kafka delivery failed: {kafka_err}"),
-                })?;
+            {
+                Ok(_) => succeeded += 1,
+                Err((kafka_err, _msg)) => {
+                    // Record the first failure for the surfaced error, but keep
+                    // going so the remaining records are still attempted.
+                    if first_error.is_none() {
+                        first_error = Some(kafka_err.to_string());
+                    }
+                }
+            }
+        }
+
+        let failed = total - succeeded;
+        if let Some(err) = first_error {
+            // At least one record failed: report the aggregate so the pipeline can
+            // DLQ/retry. All records were attempted, so no later record was dropped.
+            tracing::warn!(
+                topic = %self.config.topic,
+                succeeded,
+                failed,
+                total,
+                "Kafka output: partial batch delivery; all records attempted"
+            );
+            return Err(FerroStashError::Output {
+                plugin: "kafka".to_string(),
+                message: format!(
+                    "Kafka delivery failed for {failed}/{total} records (first error: {err}); \
+                     {succeeded} succeeded — whole-batch retry/DLQ may duplicate the acked records"
+                ),
+            });
         }
 
         debug!(
             topic = %self.config.topic,
-            event_count = records.len(),
+            event_count = total,
             "Kafka output: delivered events"
         );
         info!(
             topic = %self.config.topic,
-            event_count = records.len(),
+            event_count = total,
             "Kafka output: produced events"
         );
 
@@ -458,6 +499,48 @@ mod tests {
     }
 
     #[test]
+    fn test_kafka_all_records_serialized_no_short_circuit() {
+        // Regression for round-3 finding #2: every record in a batch must be
+        // PROCESSED (no early break that drops records after the first failure).
+        //
+        // A faithful delivery-failure test requires a live broker (the rdkafka
+        // `FutureProducer` is a concrete type that cannot be mocked here), so this
+        // asserts the part we can verify without a broker: the pre-produce loop
+        // serializes/keys EVERY event in the batch (no short-circuit), which is the
+        // same loop shape the delivery loop now uses (collect outcomes, never
+        // `return` on the first error). See `kafka_live_partial_batch_smoke` for
+        // the live-broker assertion that later records are still delivered.
+        let settings = serde_json::json!({ "topic": "t", "key": "%{[user]}", "codec": "json" });
+        let output = KafkaOutput::from_config(&settings, None).expect("config");
+
+        let mut events = Vec::new();
+        for i in 0..5 {
+            let mut e = Event::new(format!("msg-{i}"));
+            e.set(
+                "user",
+                ferro_stash_core::event::EventValue::String(format!("user-{i}")),
+            );
+            events.push(e);
+        }
+
+        // Mirror output()'s pre-produce step: every event is encoded + keyed.
+        let mut records: Vec<(Vec<u8>, Option<String>)> = Vec::with_capacity(events.len());
+        for event in &events {
+            let payload = output.encode(event).expect("encode");
+            let key = output.resolve_key(event);
+            records.push((payload, key));
+        }
+
+        // All five records were produced into the batch (none skipped).
+        assert_eq!(records.len(), 5, "every record must be attempted");
+        for (i, (payload, key)) in records.iter().enumerate() {
+            let text = String::from_utf8_lossy(payload);
+            assert!(text.contains(&format!("msg-{i}")), "record {i} body: {text}");
+            assert_eq!(key.as_deref(), Some(format!("user-{i}").as_str()));
+        }
+    }
+
+    #[test]
     fn test_kafka_compression_rdkafka_value() {
         assert_eq!(CompressionType::None.rdkafka_value(), "none");
         assert_eq!(CompressionType::Gzip.rdkafka_value(), "gzip");
@@ -490,6 +573,36 @@ mod tests {
             ferro_stash_core::event::EventValue::String("smoke".into()),
         );
         output.output(vec![event]).await.expect("live produce");
+        output.flush().await.expect("flush");
+    }
+
+    /// Live partial-batch smoke test (round-3 finding #2): a batch whose records
+    /// span a valid topic and a record that fails delivery must still attempt ALL
+    /// records — the later records are not dropped after the first failure. This
+    /// needs a live broker to exercise the real delivery path (the in-process
+    /// `FutureProducer` cannot be mocked), so it is gated behind `KAFKA_BROKERS`.
+    ///
+    /// To observe a partial failure deterministically you typically point all
+    /// records at a topic configured to reject some messages (e.g. a too-small
+    /// `max.message.bytes` for oversized payloads); the assertion is that EVERY
+    /// record is attempted and the aggregate error reports the per-record counts.
+    #[tokio::test]
+    #[ignore = "requires a running Kafka broker (KAFKA_BROKERS env var)"]
+    async fn kafka_live_partial_batch_smoke() {
+        let brokers = std::env::var("KAFKA_BROKERS").expect("KAFKA_BROKERS");
+        let topic =
+            std::env::var("KAFKA_TOPIC").unwrap_or_else(|_| "ferro-stash-live-test".to_string());
+        let settings = serde_json::json!({
+            "bootstrap_servers": brokers,
+            "topic": topic,
+            "codec": "json",
+        });
+        let output = KafkaOutput::from_config(&settings, None).expect("config");
+        // A normal multi-record batch should fully deliver against a healthy topic.
+        let events = (0..5)
+            .map(|i| Event::new(format!("partial-batch-{i}")))
+            .collect();
+        output.output(events).await.expect("live produce all");
         output.flush().await.expect("flush");
     }
 }

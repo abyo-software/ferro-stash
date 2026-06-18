@@ -44,7 +44,7 @@ impl RedisDataType {
 }
 
 /// Redis input configuration — mirrors the Logstash redis input settings.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RedisInputConfig {
     pub host: String,
     pub port: u16,
@@ -58,6 +58,24 @@ pub struct RedisInputConfig {
     /// empty object when the codec is named without a settings block.
     pub codec_settings: serde_json::Value,
     pub timeout: u64,
+}
+
+// Manual Debug to avoid leaking `password` into logs / error context.
+impl std::fmt::Debug for RedisInputConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RedisInputConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("key", &self.key)
+            .field("data_type", &self.data_type)
+            .field("db", &self.db)
+            .field("password", &self.password.as_ref().map(|_| "***"))
+            .field("batch_count", &self.batch_count)
+            .field("codec", &self.codec)
+            .field("codec_settings", &self.codec_settings)
+            .field("timeout", &self.timeout)
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -446,6 +464,16 @@ mod tests {
         assert!(input.config.password.is_none());
         assert_eq!(input.config.batch_count, 125);
         assert_eq!(input.name(), "redis");
+    }
+
+    #[test]
+    fn test_redis_input_config_debug_redacts_password() {
+        let settings = serde_json::json!({ "key": "logstash", "password": "hunter2" });
+        let input = RedisInput::from_config(&settings).expect("config");
+        let dbg = format!("{:?}", input.config);
+        assert!(!dbg.contains("hunter2"), "password leaked in Debug: {dbg}");
+        assert!(dbg.contains("***"), "expected redaction marker in: {dbg}");
+        assert!(dbg.contains("redis.example.com") || dbg.contains("127.0.0.1"));
     }
 
     #[test]

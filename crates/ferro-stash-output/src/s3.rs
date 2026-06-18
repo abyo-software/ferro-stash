@@ -61,7 +61,14 @@ pub struct S3Output {
     /// Codec used to serialize each event before buffering.
     codec: Box<dyn Codec>,
     /// In-memory buffer for events pending upload.
-    buffer: Mutex<Vec<String>>,
+    ///
+    /// Each entry is the raw codec-encoded bytes for one event. Lines are stored
+    /// as `Vec<u8>` (not `String`) so binary codecs (msgpack/avro/protobuf) round-
+    /// trip byte-for-byte into the uploaded object — round-tripping through
+    /// `String`/`from_utf8_lossy` would replace invalid bytes and corrupt the
+    /// object. The default `plain`/`json`/`line` codecs produce UTF-8, so those
+    /// are unaffected.
+    buffer: Mutex<Vec<Vec<u8>>>,
     /// When the current (post-rotation) buffer first received a line; drives
     /// time-based rotation. `None` while the buffer is empty.
     buffer_started: Mutex<Option<Instant>>,
@@ -184,13 +191,27 @@ impl S3Output {
             .await
     }
 
-    /// Serialize the buffered lines and apply gzip if `encoding == "gzip"`.
-    fn encode_payload(&self, lines: &[String]) -> Result<Vec<u8>> {
-        let joined = lines.join("\n");
+    /// Join the buffered (raw codec-encoded) lines with a single `\n` separator
+    /// and apply gzip if `encoding == "gzip"`.
+    ///
+    /// The buffer holds raw codec bytes, so the join and the upload operate on
+    /// bytes end-to-end — binary codecs are never lossily decoded.
+    fn encode_payload(&self, lines: &[Vec<u8>]) -> Result<Vec<u8>> {
+        // Join with a single `\n` separator without an intermediate `String`,
+        // preserving arbitrary (non-UTF-8) codec bytes verbatim.
+        let total: usize =
+            lines.iter().map(Vec::len).sum::<usize>() + lines.len().saturating_sub(1);
+        let mut joined = Vec::with_capacity(total);
+        for (i, line) in lines.iter().enumerate() {
+            if i > 0 {
+                joined.push(b'\n');
+            }
+            joined.extend_from_slice(line);
+        }
         if self.config.encoding == "gzip" {
             let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
             encoder
-                .write_all(joined.as_bytes())
+                .write_all(&joined)
                 .map_err(|e| FerroStashError::Output {
                     plugin: "s3".to_string(),
                     message: format!("gzip encode error: {e}"),
@@ -200,12 +221,12 @@ impl S3Output {
                 message: format!("gzip finish error: {e}"),
             })
         } else {
-            Ok(joined.into_bytes())
+            Ok(joined)
         }
     }
 
     /// Upload one rotated file's worth of buffered lines to S3.
-    async fn upload(&self, key: &str, lines: &[String]) -> Result<()> {
+    async fn upload(&self, key: &str, lines: &[Vec<u8>]) -> Result<()> {
         if lines.is_empty() {
             return Ok(());
         }
@@ -259,18 +280,16 @@ impl S3Output {
 
     /// Serialize an event to a buffer line via the configured codec.
     ///
-    /// The codec yields bytes; S3 lines are stored as `String`, so non-UTF-8
-    /// codec output is lossily decoded (the default `plain`/`json` codecs always
-    /// produce UTF-8).
-    fn encode_line(&self, event: &Event) -> Result<String> {
-        let bytes = self
-            .codec
+    /// Returns the raw codec bytes verbatim. S3 lines are buffered as `Vec<u8>`,
+    /// so binary codecs (msgpack/avro/protobuf) are preserved byte-for-byte —
+    /// there is no `String`/`from_utf8_lossy` round-trip that could corrupt them.
+    fn encode_line(&self, event: &Event) -> Result<Vec<u8>> {
+        self.codec
             .encode(event)
             .map_err(|e| FerroStashError::Output {
                 plugin: "s3".to_string(),
                 message: format!("codec encode error: {e}"),
-            })?;
-        Ok(String::from_utf8_lossy(&bytes).into_owned())
+            })
     }
 
     /// Generate an S3 key for the current file.
@@ -323,7 +342,7 @@ impl S3Output {
     }
 
     /// Lock the line buffer, mapping a poisoned lock to a plugin error.
-    fn lock_buffer(&self) -> Result<std::sync::MutexGuard<'_, Vec<String>>> {
+    fn lock_buffer(&self) -> Result<std::sync::MutexGuard<'_, Vec<Vec<u8>>>> {
         self.buffer.lock().map_err(|e| FerroStashError::Output {
             plugin: "s3".to_string(),
             message: format!("buffer lock poisoned: {e}"),
@@ -349,7 +368,7 @@ impl S3Output {
     async fn upload_or_restore(
         &self,
         key: &str,
-        payload: Vec<String>,
+        payload: Vec<Vec<u8>>,
         detached_bytes: u64,
     ) -> Result<()> {
         match self.upload(key, &payload).await {
@@ -388,7 +407,7 @@ impl OutputPlugin for S3Output {
     async fn output(&self, events: Vec<Event>) -> Result<()> {
         // Encode events via the configured codec *before* taking the lock so a
         // codec error fails without mutating buffer state.
-        let mut new_lines: Vec<(String, u64)> = Vec::with_capacity(events.len());
+        let mut new_lines: Vec<(Vec<u8>, u64)> = Vec::with_capacity(events.len());
         for event in &events {
             let line = self.encode_line(event)?;
             let line_bytes = line.len() as u64;
@@ -399,7 +418,7 @@ impl OutputPlugin for S3Output {
         // The lock is released before the (async) upload so we never hold a
         // std::sync::Mutex across an await point. We record the detached byte count
         // so it can be restored if the upload fails.
-        let rotated: Option<(String, Vec<String>, u64)> = {
+        let rotated: Option<(String, Vec<Vec<u8>>, u64)> = {
             let mut buf = self.lock_buffer()?;
             let mut started = self.lock_started()?;
 
@@ -432,7 +451,7 @@ impl OutputPlugin for S3Output {
     }
 
     async fn flush(&self) -> Result<()> {
-        let rotated: Option<(String, Vec<String>, u64)> = {
+        let rotated: Option<(String, Vec<Vec<u8>>, u64)> = {
             let mut buf = self.lock_buffer()?;
             let mut started = self.lock_started()?;
 
@@ -545,7 +564,7 @@ mod tests {
     fn test_s3_encode_payload_plain() {
         let settings = serde_json::json!({ "bucket": "b" });
         let output = S3Output::from_config(&settings, None).expect("config");
-        let lines = vec!["a".to_string(), "b".to_string()];
+        let lines = vec![b"a".to_vec(), b"b".to_vec()];
         let bytes = output.encode_payload(&lines).expect("encode");
         assert_eq!(bytes, b"a\nb");
     }
@@ -554,7 +573,7 @@ mod tests {
     fn test_s3_encode_payload_gzip() {
         let settings = serde_json::json!({ "bucket": "b", "encoding": "gzip" });
         let output = S3Output::from_config(&settings, None).expect("config");
-        let lines = vec!["hello".to_string(), "world".to_string()];
+        let lines = vec![b"hello".to_vec(), b"world".to_vec()];
         let compressed = output.encode_payload(&lines).expect("encode");
         // gzip magic header.
         assert_eq!(&compressed[..2], &[0x1f, 0x8b]);
@@ -717,7 +736,7 @@ mod tests {
         // The event is preserved in the buffer (not lost) and bytes are restored.
         let buf = output.buffer.lock().expect("lock");
         assert_eq!(buf.len(), 1, "buffered event must be retained on failure");
-        assert!(buf[0].contains("keep-me"));
+        assert!(String::from_utf8_lossy(&buf[0]).contains("keep-me"));
         assert!(
             output.current_bytes.load(Ordering::Relaxed) > 0,
             "byte counter must be restored on failure"
@@ -750,7 +769,7 @@ mod tests {
 
         let buf = output.buffer.lock().expect("lock");
         assert_eq!(buf.len(), 1, "flush failure must retain the event");
-        assert!(buf[0].contains("flush-keep"));
+        assert!(String::from_utf8_lossy(&buf[0]).contains("flush-keep"));
     }
 
     #[tokio::test]
@@ -901,6 +920,66 @@ mod tests {
             "codec": { "_plugin": "no-such-codec" },
         });
         assert!(S3Output::from_config(&settings, None).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_s3_output_binary_codec_roundtrips_byte_for_byte() {
+        // Regression for round-3 finding #1: a binary codec (msgpack) must round-
+        // trip byte-for-byte into the uploaded object. Previously the buffer stored
+        // `String` and decoded codec bytes via `from_utf8_lossy`, which REPLACES
+        // invalid bytes (U+FFFD) and corrupts non-UTF-8 payloads.
+        let (endpoint, captured) = spawn_mock_s3().await;
+        let settings = serde_json::json!({
+            "bucket": "b",
+            "prefix": "p/",
+            "endpoint": endpoint,
+            "force_path_style": true,
+            "access_key_id": "test",
+            "secret_access_key": "test",
+            "codec": "msgpack",
+        });
+        let output = S3Output::from_config(&settings, None).expect("config");
+
+        // Two events so we also exercise the `\n` join over binary lines.
+        let event1 = Event::new("msgpack-bytes-1");
+        let event2 = Event::new("msgpack-bytes-2");
+
+        // Compute the exact bytes we expect: each event's raw codec output joined
+        // by a single `\n`, using the SAME codec the output is configured with.
+        let codec = create_codec_from_settings(&settings, "plain").expect("codec");
+        let enc1 = codec.encode(&event1).expect("encode1");
+        let enc2 = codec.encode(&event2).expect("encode2");
+        // Sanity: msgpack output for these events is genuinely non-UTF-8 (so a
+        // lossy String round-trip would have corrupted it).
+        assert!(
+            std::str::from_utf8(&enc1).is_err(),
+            "msgpack payload should be non-UTF-8 for this test to be meaningful",
+        );
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&enc1);
+        expected.push(b'\n');
+        expected.extend_from_slice(&enc2);
+
+        output
+            .output(vec![event1, event2])
+            .await
+            .expect("output");
+        output.flush().await.expect("flush");
+
+        let objects = captured.lock().expect("lock");
+        assert_eq!(objects.len(), 1, "expected one PutObject");
+        let body = &objects[0].2;
+        // Byte-for-byte equality: no replacement characters, no corruption.
+        assert_eq!(
+            body, &expected,
+            "uploaded body must equal the raw encoded bytes joined by \\n",
+        );
+        // Defensively assert the body is not valid UTF-8 (it carries raw msgpack),
+        // confirming we did not silently coerce through a UTF-8 path.
+        assert!(
+            std::str::from_utf8(body).is_err(),
+            "uploaded binary payload must remain non-UTF-8",
+        );
     }
 
     /// Live smoke test against real S3 (or an S3-compatible store).
