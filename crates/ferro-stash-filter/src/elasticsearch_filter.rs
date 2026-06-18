@@ -1,12 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Elasticsearch filter — enrich events by querying Elasticsearch.
 //!
-//! Builds a query from `query_template` (with `%{field}` sprintf
-//! substitution), POSTs it to `{host}/{index}/_search` via reqwest (trying the
-//! configured hosts in order for basic failover), and maps the returned
-//! `hits.hits[]._source` documents into the event. Mirrors the reqwest client
-//! pattern used by the Elasticsearch *output* plugin (shared `reqwest::Client`,
-//! optional basic-auth / API-key, configurable timeout).
+//! Builds a query from `query_template` and POSTs it to
+//! `{host}/{index}/_search` via reqwest (trying the configured hosts in order
+//! for basic failover), then maps the returned `hits.hits[]._source` documents
+//! into the event. Mirrors the reqwest client pattern used by the
+//! Elasticsearch *output* plugin (shared `reqwest::Client`, optional
+//! basic-auth / API-key, configurable timeout).
+//!
+//! ## Injection-safe substitution
+//!
+//! `query_template` is parsed to a [`serde_json::Value`] **once** at config
+//! time (in [`ElasticsearchFilter::from_config`]). At query time the parsed
+//! template is walked recursively and `%{field}` placeholders are substituted
+//! **only at JSON string-value positions** — the substituted value is stored
+//! as a JSON string scalar, so `serde_json` escapes it on serialization and an
+//! event-field value containing `"`, `{`, `}`, `\`, etc. can neither break out
+//! of its string context nor inject query structure. The JSON shape of the
+//! template is fixed at config time and never re-derived from event data, so
+//! an attacker controlling field values cannot rewrite the query DSL and a
+//! value that breaks JSON can never silently fall back to `match_all`.
+//!
+//! A non-empty `query_template` that is not valid JSON is a **config error**
+//! and is rejected loudly in `from_config` (rather than failing open to
+//! `match_all` at runtime). An empty/unset template defaults to `match_all`.
 //!
 //! Compatible with Elasticsearch 7.x/8.x/9.x, `FerroSearch`, and
 //! `OpenSearch`.
@@ -28,8 +45,11 @@ pub struct ElasticsearchFilter {
     hosts: Vec<String>,
     /// Index (or index pattern) to query.
     index: String,
-    /// Query template with `%{field}` substitution.
-    query_template: String,
+    /// Query template, pre-parsed to a JSON value at config time. `%{field}`
+    /// placeholders are substituted at query time **only** at string-value
+    /// positions (see module docs); the JSON structure is fixed here and never
+    /// re-derived from event data, which makes substitution injection-safe.
+    query_template: serde_json::Value,
     /// Maximum number of results.
     result_size: usize,
     /// Fields to copy from ES result into the event.
@@ -70,12 +90,36 @@ impl ElasticsearchFilter {
             .unwrap_or("logstash-*")
             .to_string();
 
-        let query_template = settings
+        // Parse the query template ONCE here. A non-empty template that fails
+        // to parse is a genuine config error and is rejected loudly (we never
+        // fail open to `match_all` at runtime). An empty/unset template
+        // defaults to `match_all`.
+        let query_template_str = settings
             .get("query_template")
             .or_else(|| settings.get("query"))
             .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+            .unwrap_or("");
+        let query_template = if query_template_str.trim().is_empty() {
+            default_match_all()
+        } else {
+            let parsed = serde_json::from_str::<serde_json::Value>(query_template_str).map_err(
+                |e| FerroStashError::Filter {
+                    plugin: "elasticsearch".to_string(),
+                    message: format!("invalid query_template JSON: {e}"),
+                },
+            )?;
+            // The template must be a JSON object (an ES `_search` body); a
+            // bare scalar/array cannot carry a query and would be a config
+            // mistake we should not paper over with `match_all`.
+            if !parsed.is_object() {
+                return Err(FerroStashError::Filter {
+                    plugin: "elasticsearch".to_string(),
+                    message: "query_template must be a JSON object (an Elasticsearch _search body)"
+                        .to_string(),
+                });
+            }
+            parsed
+        };
 
         let result_size = settings
             .get("result_size")
@@ -160,20 +204,18 @@ impl ElasticsearchFilter {
         })
     }
 
-    /// Build the query by substituting `%{field}` references from the event.
-    fn build_query(&self, event: &Event) -> String {
-        event.sprintf(&self.query_template)
-    }
-
-    /// Construct the `_search` request body. When `query_template` is empty (or
-    /// not a JSON object), a `match_all` query is used. `size` is always set
-    /// from `result_size`.
-    fn build_search_body(&self, query: &str) -> serde_json::Value {
-        let mut body = match serde_json::from_str::<serde_json::Value>(query) {
-            Ok(serde_json::Value::Object(map)) => serde_json::Value::Object(map),
-            // Empty or non-object templates -> match_all.
-            _ => serde_json::json!({}),
-        };
+    /// Construct the `_search` request body for this event by walking the
+    /// pre-parsed [`Self::query_template`] and substituting `%{field}`
+    /// placeholders **only at JSON string-value positions** (see
+    /// [`substitute_placeholders`]). Because the structure comes from the
+    /// already-parsed template and substituted values are stored as JSON string
+    /// scalars (escaped on serialization), event data can never break out of a
+    /// string or rewrite the query DSL.
+    ///
+    /// `query` (the `query` clause) defaults to `match_all` and `size` defaults
+    /// to `result_size`, but only if the template did not set them.
+    fn build_search_body(&self, event: &Event) -> serde_json::Value {
+        let mut body = substitute_placeholders(&self.query_template, event);
 
         if let serde_json::Value::Object(map) = &mut body {
             map.entry("query")
@@ -191,9 +233,9 @@ impl ElasticsearchFilter {
     /// `None` on total failure (all hosts errored / non-2xx).
     async fn execute_query(
         &self,
-        query: &str,
+        event: &Event,
     ) -> Option<Vec<IndexMap<String, EventValue>>> {
-        let body = self.build_search_body(query);
+        let body = self.build_search_body(event);
 
         for host in &self.hosts {
             let url = format!(
@@ -268,6 +310,57 @@ fn parse_hits(json: &serde_json::Value) -> Vec<IndexMap<String, EventValue>> {
         .collect()
 }
 
+/// The default `_search` body used when no `query_template` is configured.
+fn default_match_all() -> serde_json::Value {
+    serde_json::json!({ "query": { "match_all": {} } })
+}
+
+/// Walk a pre-parsed JSON template and substitute `%{field}` placeholders
+/// against `event`, **only** at string-value positions.
+///
+/// This is what makes substitution injection-safe: the JSON *structure* of
+/// `template` is fixed (it was parsed at config time, not derived from event
+/// data), and resolved placeholder values are stored back as JSON string
+/// scalars. When the resulting [`serde_json::Value`] is serialized for the
+/// request body, `serde_json` escapes those strings, so a field value
+/// containing `"`, `{`, `}`, `\`, control characters, etc. stays inside its
+/// string position and can neither terminate the string early nor inject query
+/// structure.
+///
+/// Object *keys* are intentionally left untouched (ES query DSL keys are
+/// structural, not data), and missing fields follow `Event::sprintf` semantics
+/// (the literal `%{field}` placeholder is preserved).
+fn substitute_placeholders(template: &serde_json::Value, event: &Event) -> serde_json::Value {
+    match template {
+        // Only string scalars carry `%{field}` placeholders. Resolve via the
+        // event's sprintf (reusing the canonical field-lookup / missing-field
+        // semantics) and store the result as a JSON string — serde_json will
+        // escape it on serialization, so it cannot break out of its context.
+        serde_json::Value::String(s) => {
+            if s.contains("%{") {
+                serde_json::Value::String(event.sprintf(s))
+            } else {
+                template.clone()
+            }
+        }
+        serde_json::Value::Array(items) => serde_json::Value::Array(
+            items
+                .iter()
+                .map(|item| substitute_placeholders(item, event))
+                .collect(),
+        ),
+        serde_json::Value::Object(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (k, v) in map {
+                out.insert(k.clone(), substitute_placeholders(v, event));
+            }
+            serde_json::Value::Object(out)
+        }
+        // Numbers / bools / null are structural and carry no placeholders.
+        other => other.clone(),
+    }
+}
+
 #[async_trait]
 impl FilterPlugin for ElasticsearchFilter {
     fn name(&self) -> &'static str {
@@ -275,9 +368,7 @@ impl FilterPlugin for ElasticsearchFilter {
     }
 
     async fn filter(&self, mut event: Event) -> Result<Vec<Event>> {
-        let query = self.build_query(&event);
-
-        match self.execute_query(&query).await {
+        match self.execute_query(&event).await {
             Some(results) => {
                 if results.is_empty() {
                     event.add_tag(&self.tag_on_failure);
@@ -356,9 +447,18 @@ mod tests {
         let filter = ElasticsearchFilter::from_config(&settings, None).expect("config");
         let mut event = Event::new("test");
         event.set("username", EventValue::String("bob".into()));
-        let query = filter.build_query(&event);
-        assert!(query.contains("bob"));
-        assert!(!query.contains("%{username}"));
+        // The placeholder is resolved at its JSON string-value position; the
+        // structure (parsed once at config time) is preserved and `query`/`size`
+        // defaults are injected.
+        let body = filter.build_search_body(&event);
+        assert_eq!(
+            body.pointer("/term/user").and_then(serde_json::Value::as_str),
+            Some("bob")
+        );
+        // No raw `%{...}` placeholder leaks into the serialized body.
+        let serialized = serde_json::to_string(&body).expect("serialize");
+        assert!(serialized.contains("bob"));
+        assert!(!serialized.contains("%{username}"));
     }
 
     #[tokio::test]
@@ -380,18 +480,21 @@ mod tests {
 
     #[test]
     fn test_build_search_body_empty_template_match_all() {
+        // An empty/unset template defaults to `match_all`.
         let settings = serde_json::json!({ "result_size": 5 });
         let filter = ElasticsearchFilter::from_config(&settings, None).expect("config");
-        let body = filter.build_search_body("");
+        let body = filter.build_search_body(&Event::new("test"));
         assert!(body.get("query").and_then(|q| q.get("match_all")).is_some());
         assert_eq!(body.get("size").and_then(serde_json::Value::as_u64), Some(5));
     }
 
     #[test]
     fn test_build_search_body_preserves_template_query() {
-        let settings = serde_json::json!({});
+        let settings = serde_json::json!({
+            "query_template": r#"{"query":{"term":{"user":"bob"}}}"#
+        });
         let filter = ElasticsearchFilter::from_config(&settings, None).expect("config");
-        let body = filter.build_search_body(r#"{"query":{"term":{"user":"bob"}}}"#);
+        let body = filter.build_search_body(&Event::new("test"));
         assert_eq!(
             body.pointer("/query/term/user")
                 .and_then(serde_json::Value::as_str),
@@ -399,6 +502,144 @@ mod tests {
         );
         // size injected from default result_size (1)
         assert_eq!(body.get("size").and_then(serde_json::Value::as_u64), Some(1));
+    }
+
+    // ----- Injection-safety regression tests -----
+
+    /// (a) A field value containing a double-quote (and braces / backslash)
+    /// must NOT produce a `match_all` query and must NOT break the query: the
+    /// value stays inside its JSON string position, properly escaped.
+    #[test]
+    fn test_build_search_body_value_with_quote_is_escaped_not_match_all() {
+        let settings = serde_json::json!({
+            "query_template": "{\"query\":{\"term\":{\"user\":\"%{username}\"}}}"
+        });
+        let filter = ElasticsearchFilter::from_config(&settings, None).expect("config");
+        let mut event = Event::new("test");
+        // Classic injection attempt: terminate the string and inject structure.
+        event.set(
+            "username",
+            EventValue::String(r#"x"}},"match_all":{"#.into()),
+        );
+        let body = filter.build_search_body(&event);
+
+        // The structure is intact: still a `term` on `user`, NOT `match_all`.
+        assert_eq!(
+            body.pointer("/query/term/user")
+                .and_then(serde_json::Value::as_str),
+            Some(r#"x"}},"match_all":{"#)
+        );
+        assert!(
+            body.pointer("/query/match_all").is_none(),
+            "injected match_all must not appear: {body:?}"
+        );
+
+        // The serialized request body re-parses cleanly (the quote was escaped),
+        // and the only `match_all` present is none (template had a `term`).
+        let serialized = serde_json::to_string(&body).expect("serialize");
+        let reparsed: serde_json::Value =
+            serde_json::from_str(&serialized).expect("escaped body must be valid JSON");
+        assert_eq!(
+            reparsed
+                .pointer("/query/term/user")
+                .and_then(serde_json::Value::as_str),
+            Some(r#"x"}},"match_all":{"#)
+        );
+        assert!(reparsed.pointer("/query/match_all").is_none());
+    }
+
+    /// A value containing `{`, `}`, `\` and a newline must not corrupt the body.
+    #[test]
+    fn test_build_search_body_value_with_braces_and_backslash() {
+        let settings = serde_json::json!({
+            "query_template": "{\"query\":{\"match\":{\"raw\":\"%{payload}\"}}}"
+        });
+        let filter = ElasticsearchFilter::from_config(&settings, None).expect("config");
+        let mut event = Event::new("test");
+        event.set(
+            "payload",
+            EventValue::String("a{b}c\\d\ne".into()),
+        );
+        let body = filter.build_search_body(&event);
+        assert_eq!(
+            body.pointer("/query/match/raw")
+                .and_then(serde_json::Value::as_str),
+            Some("a{b}c\\d\ne")
+        );
+        // Round-trips through serialization unbroken.
+        let serialized = serde_json::to_string(&body).expect("serialize");
+        let reparsed: serde_json::Value =
+            serde_json::from_str(&serialized).expect("valid JSON");
+        assert_eq!(
+            reparsed
+                .pointer("/query/match/raw")
+                .and_then(serde_json::Value::as_str),
+            Some("a{b}c\\d\ne")
+        );
+    }
+
+    /// (b) A malformed non-empty `query_template` is rejected at config time
+    /// (loudly), not silently turned into `match_all`.
+    #[test]
+    fn test_malformed_query_template_rejected_at_config_time() {
+        let settings = serde_json::json!({
+            "query_template": "{not valid json"
+        });
+        let err = ElasticsearchFilter::from_config(&settings, None)
+            .expect_err("malformed template must be a config error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("query_template"),
+            "error should mention query_template: {msg}"
+        );
+    }
+
+    /// A non-empty template that parses but is not a JSON object (e.g. a bare
+    /// scalar/array) is also a config error rather than a silent `match_all`.
+    #[test]
+    fn test_non_object_query_template_rejected_at_config_time() {
+        let settings = serde_json::json!({ "query_template": "[1,2,3]" });
+        ElasticsearchFilter::from_config(&settings, None)
+            .expect_err("non-object template must be a config error");
+
+        let settings = serde_json::json!({ "query_template": "\"just a string\"" });
+        ElasticsearchFilter::from_config(&settings, None)
+            .expect_err("scalar template must be a config error");
+    }
+
+    /// (c) Normal `%{field}` substitution still queries the intended term.
+    #[test]
+    fn test_normal_substitution_queries_intended_term() {
+        let settings = serde_json::json!({
+            "query_template": "{\"query\":{\"term\":{\"user.id\":\"%{uid}\"}}}"
+        });
+        let filter = ElasticsearchFilter::from_config(&settings, None).expect("config");
+        let mut event = Event::new("test");
+        event.set("uid", EventValue::String("u-42".into()));
+        let body = filter.build_search_body(&event);
+        assert_eq!(
+            body.pointer("/query/term/user.id")
+                .and_then(serde_json::Value::as_str),
+            Some("u-42")
+        );
+        assert!(body.pointer("/query/match_all").is_none());
+    }
+
+    /// Missing fields preserve the literal `%{field}` placeholder (Logstash-ish
+    /// behavior) — and crucially do NOT collapse to `match_all`.
+    #[test]
+    fn test_missing_field_preserves_placeholder_not_match_all() {
+        let settings = serde_json::json!({
+            "query_template": "{\"query\":{\"term\":{\"user\":\"%{absent}\"}}}"
+        });
+        let filter = ElasticsearchFilter::from_config(&settings, None).expect("config");
+        let body = filter.build_search_body(&Event::new("test"));
+        assert_eq!(
+            body.pointer("/query/term/user")
+                .and_then(serde_json::Value::as_str),
+            Some("%{absent}")
+        );
+        assert!(body.pointer("/query/match_all").is_none());
     }
 
     #[test]
@@ -467,6 +708,101 @@ mod tests {
             }
         });
         format!("http://{addr}")
+    }
+
+    /// Like [`spawn_mock_es`], but also captures the request body the client
+    /// sent and exposes it via the returned channel receiver. Reads the full
+    /// request (headers + body) so we can assert on the exact bytes ES receives.
+    fn spawn_mock_es_capture(
+        response_json: &'static str,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                // Read the request until we've consumed the Content-Length body.
+                let mut raw: Vec<u8> = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    let n = match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    raw.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&raw);
+                    if let Some(header_end) = text.find("\r\n\r\n") {
+                        let headers = &text[..header_end];
+                        let content_len = headers
+                            .lines()
+                            .find_map(|l| {
+                                let l = l.to_ascii_lowercase();
+                                l.strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        let body_start = header_end + 4;
+                        if raw.len() >= body_start + content_len {
+                            break;
+                        }
+                    }
+                }
+                let text = String::from_utf8_lossy(&raw).into_owned();
+                let body = text
+                    .split_once("\r\n\r\n")
+                    .map(|(_, b)| b.to_string())
+                    .unwrap_or_default();
+                let _ = tx.send(body);
+
+                let resp_body = response_json;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    resp_body.len(),
+                    resp_body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    /// End-to-end (d): a field value carrying an injection payload is sent to ES
+    /// as a properly-escaped JSON string — the wire body parses cleanly, keeps
+    /// the configured `term` structure, and contains NO injected `match_all`.
+    #[tokio::test]
+    async fn test_injection_payload_escaped_on_the_wire() {
+        let (host, rx) =
+            spawn_mock_es_capture(r#"{"hits":{"hits":[{"_source":{"ok":true}}]}}"#);
+        let settings = serde_json::json!({
+            "hosts": [host],
+            "index": "users",
+            "query_template": "{\"query\":{\"term\":{\"user\":\"%{username}\"}}}",
+            "target": "es_result"
+        });
+        let filter = ElasticsearchFilter::from_config(&settings, None).expect("config");
+        let mut event = Event::new("test");
+        event.set(
+            "username",
+            EventValue::String(r#"x"}},"match_all":{"#.into()),
+        );
+        let _ = filter.filter(event).await.expect("filter");
+
+        let sent = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("mock server captured a request body");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&sent).expect("ES received well-formed JSON");
+        assert_eq!(
+            parsed
+                .pointer("/query/term/user")
+                .and_then(serde_json::Value::as_str),
+            Some(r#"x"}},"match_all":{"#)
+        );
+        assert!(
+            parsed.pointer("/query/match_all").is_none(),
+            "no injected match_all on the wire: {sent}"
+        );
     }
 
     #[tokio::test]
