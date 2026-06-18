@@ -21,7 +21,7 @@ use ferro_stash_core::settings_helpers::SettingsExt;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use tokio::sync::OnceCell;
-use tracing::info;
+use tracing::{error, info, warn};
 
 /// S3 output configuration — mirrors the Logstash S3 output settings.
 ///
@@ -389,8 +389,13 @@ impl S3Output {
     /// Upload a detached payload; on failure, restore it (and its byte count) to
     /// the front of the buffer so events are never lost on a transient error.
     ///
-    /// The pipeline can then retry or DLQ on the next `output()`/`flush()`. Any
-    /// events buffered concurrently during the failed upload are preserved by
+    /// Returns `Ok(())` on a successful upload, or the upload error (with the
+    /// payload already restored to the buffer) on failure. Callers decide whether
+    /// the failure is reportable: the rotation path (`output()`) swallows it
+    /// (events stay buffered for the next rotation/flush), while the terminal
+    /// `flush()`/`close()` path surfaces it.
+    ///
+    /// Any events buffered concurrently during the failed upload are preserved by
     /// re-prepending the detached lines ahead of them.
     async fn upload_or_restore(
         &self,
@@ -471,7 +476,26 @@ impl OutputPlugin for S3Output {
         };
 
         if let Some((key, payload, detached_bytes)) = rotated {
-            self.upload_or_restore(&key, payload, detached_bytes).await?;
+            // Ownership model: for a *buffering* output, a rotation upload failure
+            // must NOT propagate as an `output()` Err. `upload_or_restore` has
+            // already put the detached payload back into the buffer, so the events
+            // are safely retained and re-attempted on the next rotation or on
+            // `flush()`/`close()`. Propagating `Err` here would make the core
+            // pipeline DLQ this batch (pipeline.rs ~580-590) even though the events
+            // are retained — and the failed payload spans events from MANY prior
+            // already-`Ok`'d `output()` calls, which the per-call DLQ can't own
+            // correctly anyway. Returning `Err` therefore double-handles the events
+            // (they upload on the next rotation AND land in the DLQ → duplicates +
+            // spurious failure accounting). We log and return `Ok(())` instead; the
+            // buffering output owns the retry.
+            if let Err(e) = self.upload_or_restore(&key, payload, detached_bytes).await {
+                warn!(
+                    bucket = %self.config.bucket,
+                    key = %key,
+                    error = %e,
+                    "S3 output: rotation upload failed; events retained in buffer for retry on next rotation/flush"
+                );
+            }
         }
 
         Ok(())
@@ -494,7 +518,27 @@ impl OutputPlugin for S3Output {
         };
 
         if let Some((key, payload, detached_bytes)) = rotated {
-            self.upload_or_restore(&key, payload, detached_bytes).await?;
+            // Terminal attempt: `flush()`/`close()` is the *last* upload with no
+            // further retry, so unlike the rotation path we surface the failure as
+            // an `Err`. `upload_or_restore` still restores the payload to the buffer
+            // (no data loss within the process lifetime), but at shutdown there is
+            // no later flush to drain it.
+            //
+            // Known residual of the buffering model: a *persistent* S3 outage that
+            // lasts through `close()` loses the still-buffered events when the
+            // process exits — they only ever lived in the in-RAM buffer. This loss
+            // is bounded by the existing `S3_MAX_BUFFERED_LINES` cap (the buffer can
+            // never grow without limit). A durable on-disk spill at shutdown is out
+            // of scope for this in-memory buffering output.
+            if let Err(e) = self.upload_or_restore(&key, payload, detached_bytes).await {
+                error!(
+                    bucket = %self.config.bucket,
+                    key = %key,
+                    error = %e,
+                    "S3 output: final flush upload failed; unflushed buffered events are unrecoverable at shutdown"
+                );
+                return Err(e);
+            }
         }
 
         Ok(())
@@ -766,8 +810,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_s3_output_upload_failure_preserves_buffer() {
-        // Regression for finding #1: a transient PutObject error must NOT lose the
-        // buffered events — they stay in the buffer (and byte count) for retry/DLQ.
+        // Regression for finding #1 (data-loss) + round-13 finding (dup/DLQ): a
+        // transient rotation PutObject error must NOT lose the buffered events —
+        // they stay in the buffer (and byte count) for retry on the next
+        // rotation/flush. AND `output()` must return `Ok(())` rather than `Err`:
+        // this is a *buffering* output that owns its own retry, so propagating an
+        // error would make the core pipeline DLQ a batch that is actually retained
+        // (→ later re-uploads = duplicates + spurious failure accounting).
         let (endpoint, attempts) = spawn_failing_mock_s3().await;
         let settings = serde_json::json!({
             "bucket": "b",
@@ -782,9 +831,14 @@ mod tests {
         });
         let output = S3Output::from_config(&settings, None).expect("config");
 
-        // Rotation path: output() triggers an upload that fails.
+        // Rotation path: output() triggers an upload that fails. The buffering
+        // output swallows the failure (retains events) and returns Ok — so the
+        // pipeline does NOT DLQ this batch.
         let result = output.output(vec![Event::new("keep-me")]).await;
-        assert!(result.is_err(), "upload failure must surface an error");
+        assert!(
+            result.is_ok(),
+            "rotation upload failure must be swallowed (events retained for retry), not surfaced as Err"
+        );
         assert!(attempts.load(Ordering::SeqCst) >= 1, "PutObject was attempted");
 
         // The event is preserved in the buffer (not lost) and bytes are restored.
@@ -794,6 +848,107 @@ mod tests {
         assert!(
             output.current_bytes.load(Ordering::Relaxed) > 0,
             "byte counter must be restored on failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_s3_output_transient_rotation_failure_then_flush_uploads_once() {
+        // Regression for round-13 finding: a transient rotation-upload failure
+        // followed by a successful flush must upload the events EXACTLY ONCE (no
+        // duplicate) and the failed `output()` must NOT have returned Err (so the
+        // pipeline would not also DLQ the same events). This is the end-to-end
+        // proof that the buffering output owns retry rather than double-handing the
+        // events to the pipeline DLQ.
+        //
+        // The mock fails every PutObject while `fail` is set (so the rotation
+        // upload genuinely fails even after the AWS SDK's internal retries) and
+        // succeeds once the test clears `fail` before calling flush(). This lets us
+        // observe the single surviving object from the flush retry.
+        let captured: Arc<std::sync::Mutex<Vec<Vec<u8>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let cap_handle = Arc::clone(&captured);
+        let att_handle = Arc::clone(&attempts);
+        let fail_handle = Arc::clone(&fail);
+        let app = Router::new().route(
+            "/:bucket/*key",
+            put(
+                move |_p: Path<(String, String)>, body: Bytes| {
+                    let cap_handle = Arc::clone(&cap_handle);
+                    let att_handle = Arc::clone(&att_handle);
+                    let fail_handle = Arc::clone(&fail_handle);
+                    async move {
+                        att_handle.fetch_add(1, Ordering::SeqCst);
+                        if fail_handle.load(Ordering::SeqCst) {
+                            (StatusCode::INTERNAL_SERVER_ERROR, "boom")
+                        } else {
+                            if let Ok(mut g) = cap_handle.lock() {
+                                g.push(body.to_vec());
+                            }
+                            (StatusCode::OK, "ok")
+                        }
+                    }
+                },
+            ),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+        let endpoint = format!("http://{addr}");
+
+        let settings = serde_json::json!({
+            "bucket": "b",
+            "prefix": "p/",
+            "endpoint": endpoint,
+            "force_path_style": true,
+            "access_key_id": "test",
+            "secret_access_key": "test",
+            "rotation_strategy": "size",
+            // Force rotation on the first event so output() drives the upload.
+            "size_file": 1,
+        });
+        let output = S3Output::from_config(&settings, None).expect("config");
+
+        // Rotation upload fails — but the buffering output retains the event and
+        // returns Ok (no DLQ double-handling).
+        let result = output.output(vec![Event::new("once-only")]).await;
+        assert!(
+            result.is_ok(),
+            "transient rotation failure must not surface as Err (would cause DLQ dup)"
+        );
+        // Event retained for retry.
+        assert_eq!(
+            output.buffer.lock().expect("lock").len(),
+            1,
+            "event must remain buffered after the transient rotation failure"
+        );
+
+        // Clear the transient fault so the next upload (flush) succeeds, then flush
+        // uploads the retained event exactly once.
+        fail.store(false, Ordering::SeqCst);
+        output.flush().await.expect("flush should succeed");
+        assert!(
+            output.buffer.lock().expect("lock").is_empty(),
+            "buffer must drain after the successful flush"
+        );
+
+        let objects = captured.lock().expect("lock");
+        assert_eq!(
+            objects.len(),
+            1,
+            "the event must be uploaded EXACTLY ONCE (no duplicate from retry + DLQ)"
+        );
+        assert!(
+            String::from_utf8_lossy(&objects[0]).contains("once-only"),
+            "the single uploaded object must carry the retained event"
+        );
+        // Two PutObject attempts total: the failed rotation + the successful flush.
+        assert!(
+            attempts.load(Ordering::SeqCst) >= 2,
+            "expected a failed rotation attempt followed by a successful flush attempt"
         );
     }
 
