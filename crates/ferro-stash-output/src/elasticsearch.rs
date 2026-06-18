@@ -431,12 +431,14 @@ impl ElasticsearchOutput {
                         //
                         // Only a well-formed bulk response counts as delivered:
                         // it MUST parse as JSON, carry a boolean `errors` field
-                        // and an array `items` field, and `items.len()` MUST
-                        // equal the number of events we sent (the bulk response
-                        // acknowledges exactly the actions submitted). Anything
-                        // else is treated as a FAILURE so the pipeline can
-                        // retry/DLQ — the same path the retriable 5xx/429 branch
-                        // uses. The 256 MB read cap above still applies.
+                        // and an array `items` field, `items.len()` MUST equal the
+                        // number of events we sent, and EACH item MUST itself be a
+                        // genuine bulk item (a one-entry object keyed by a known
+                        // bulk action whose value carries a numeric `status`) —
+                        // see the per-item validation below. Anything else is
+                        // treated as a FAILURE so the pipeline can retry/DLQ — the
+                        // same path the retriable 5xx/429 branch uses. The 256 MB
+                        // read cap above still applies.
                         // Bounded snippet of the (possibly unexpected) body for
                         // diagnostics; never logs/embeds the body unbounded.
                         let snippet = ferro_stash_core::bounded_snippet(
@@ -493,19 +495,98 @@ impl ElasticsearchOutput {
                             ));
                             continue;
                         }
-                        // Well-formed bulk response: apply item-level-error detection.
-                        if errors_present {
-                            let failed = items
-                                .iter()
-                                .filter(|item| {
-                                    item.as_object()
-                                        .and_then(|object| object.values().next())
-                                        .is_some_and(|value| value.get("error").is_some())
-                                })
-                                .count();
+                        // Well-formed top-level shape (boolean `errors` + array
+                        // `items` with a matching count) is necessary but NOT
+                        // sufficient: a misrouted proxy / WAF / mock can return
+                        // `200 {"errors":false,"items":[{}]}` — empty,
+                        // count-matched item objects that PASS every shape check
+                        // above yet acknowledge NOTHING. Accepting that is silent
+                        // data loss. Validate that EACH item is a genuine bulk
+                        // item: a one-entry object keyed by a known bulk action
+                        // (`index`/`create`/`update`/`delete`) whose value is an
+                        // object carrying a numeric `status`.
+                        //
+                        // Treatment:
+                        //   * Any item that is NOT a well-formed bulk item (not an
+                        //     object, missing/unknown action key, multiple keys,
+                        //     or no numeric `status`) means this is not a real ES
+                        //     bulk acknowledgement → treat the whole batch as a
+                        //     retriable FAILURE (same path as the malformed-2xx /
+                        //     5xx branch), so events are retried/DLQ'd rather than
+                        //     silently accepted.
+                        //   * A well-formed item whose `status` is >= 300 (or that
+                        //     carries an `error`) is a per-item failure — even if
+                        //     the top-level `errors` flag is false/absent.
+                        // Only a response where every item is a well-formed bulk
+                        // item with a 2xx `status` counts as fully delivered.
+                        const BULK_ACTIONS: [&str; 4] = ["index", "create", "update", "delete"];
+                        let mut malformed_item = false;
+                        let mut failed = 0usize;
+                        for item in items {
+                            // The item must be a single-action object: exactly one
+                            // entry, keyed by a recognized bulk action, whose value
+                            // is an object.
+                            let Some(object) = item.as_object() else {
+                                malformed_item = true;
+                                break;
+                            };
+                            if object.len() != 1 {
+                                malformed_item = true;
+                                break;
+                            }
+                            let Some((action_key, action_value)) = object.iter().next() else {
+                                malformed_item = true;
+                                break;
+                            };
+                            if !BULK_ACTIONS.contains(&action_key.as_str()) {
+                                malformed_item = true;
+                                break;
+                            }
+                            let Some(result) = action_value.as_object() else {
+                                malformed_item = true;
+                                break;
+                            };
+                            // A genuine per-item result always carries a numeric
+                            // HTTP `status` for the action. Its absence means this
+                            // is not a real ES bulk item (e.g. `{"index":{}}`).
+                            let Some(item_status) =
+                                result.get("status").and_then(serde_json::Value::as_u64)
+                            else {
+                                malformed_item = true;
+                                break;
+                            };
+                            // Per-item failure: a non-2xx status (>= 300) or an
+                            // explicit `error` object. Counted independently of the
+                            // top-level `errors` flag so a `errors:false` response
+                            // that still carries a failed item is not accepted.
+                            if item_status >= 300 || result.get("error").is_some() {
+                                failed += 1;
+                            }
+                        }
+                        if malformed_item {
+                            warn!(
+                                status = %status,
+                                body = %snippet,
+                                "bulk 2xx response contains an item that is not a well-formed bulk \
+                                 item (no recognized action / missing numeric status); not a real \
+                                 bulk acknowledgement, treating as failure"
+                            );
+                            last_err = Some(format!(
+                                "2xx response is not a valid bulk response \
+                                 (item is not a well-formed bulk item): {snippet}"
+                            ));
+                            continue;
+                        }
+                        // `errors_present` is the server's claim; `failed` is what
+                        // the per-item scan actually found. Treat the batch as a
+                        // failure if either says so (so a lying `errors:false` that
+                        // still carries a non-2xx item is caught).
+                        if errors_present || failed > 0 {
                             warn!(
                                 events = events.len(),
-                                failed, "bulk request completed with errors"
+                                failed,
+                                errors = errors_present,
+                                "bulk request completed with item-level errors"
                             );
                             return Err(FerroStashError::Output {
                                 plugin: "elasticsearch".to_string(),
@@ -1184,6 +1265,157 @@ mod tests {
         assert!(
             result.is_ok(),
             "a well-formed bulk 200 with matching item count must succeed: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_200_empty_item_objects_are_treated_as_failure() {
+        // Round-18 HIGH regression: a misrouted proxy / WAF / mock can return
+        // `200 {"errors":false,"items":[{}]}` — empty, count-matched item
+        // objects that PASS the round-15 shape checks (boolean `errors`, array
+        // `items`, `items.len() == events.len()`) yet acknowledge NO
+        // index/create/update/delete operation. Accepting this is silent data
+        // loss: it must be treated as a FAILURE so the events are retried/DLQ'd.
+        let app = Router::new().route(
+            "/_bulk",
+            post(|| async {
+                Json(serde_json::json!({
+                    "errors": false,
+                    "items": [{}]
+                }))
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+
+        let settings = serde_json::json!({
+            "hosts": [format!("http://{addr}")],
+            "index": "test",
+            // No retries so the single attempt's fake-items 200 resolves to Err fast.
+            "retry_max_interval": 0,
+        });
+        let output = ElasticsearchOutput::from_config(&settings, None).expect("config");
+        let result = output.output(vec![Event::new("hello")]).await;
+
+        assert!(
+            result.is_err(),
+            "a 2xx response whose items are empty objects (no real bulk action) \
+             must be treated as a failure, not silently delivered"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_200_item_missing_status_is_treated_as_failure() {
+        // Companion to the empty-item case: an item that names a bulk action but
+        // carries no numeric `status` (e.g. `{"index":{}}`) is not a genuine ES
+        // bulk acknowledgement either — every real per-item result carries the
+        // action's HTTP `status`. Treat it as a retriable failure.
+        let app = Router::new().route(
+            "/_bulk",
+            post(|| async {
+                Json(serde_json::json!({
+                    "errors": false,
+                    "items": [{ "index": {} }]
+                }))
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+
+        let settings = serde_json::json!({
+            "hosts": [format!("http://{addr}")],
+            "index": "test",
+            "retry_max_interval": 0,
+        });
+        let output = ElasticsearchOutput::from_config(&settings, None).expect("config");
+        let result = output.output(vec![Event::new("hello")]).await;
+
+        assert!(
+            result.is_err(),
+            "a 2xx bulk item with no numeric `status` must be treated as a failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_200_well_formed_item_with_status_succeeds() {
+        // The positive control for the round-18 per-item validation: a genuine
+        // bulk item (`{"index":{"status":201}}`) with `errors:false` and a
+        // matching item count must still succeed — the per-item check only
+        // rejects fake/empty/malformed items, never the happy path.
+        let app = Router::new().route(
+            "/_bulk",
+            post(|| async {
+                Json(serde_json::json!({
+                    "errors": false,
+                    "items": [{ "index": { "status": 201 } }]
+                }))
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+
+        let settings = serde_json::json!({
+            "hosts": [format!("http://{addr}")],
+            "index": "test",
+        });
+        let output = ElasticsearchOutput::from_config(&settings, None).expect("config");
+        let result = output.output(vec![Event::new("hello")]).await;
+
+        assert!(
+            result.is_ok(),
+            "a well-formed bulk item with a 2xx status must succeed: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_200_per_item_non_2xx_with_errors_false_is_treated_as_failure() {
+        // A lying `errors:false` response that nonetheless carries a per-item
+        // non-2xx `status` (here 403) must be treated as a failure: the per-item
+        // scan catches the failed item independently of the top-level `errors`
+        // flag, so the events are retried/DLQ'd rather than silently accepted.
+        let app = Router::new().route(
+            "/_bulk",
+            post(|| async {
+                Json(serde_json::json!({
+                    "errors": false,
+                    "items": [{
+                        "index": {
+                            "status": 403,
+                            "error": {
+                                "type": "security_exception",
+                                "reason": "action [indices:data/write/bulk[s]] is unauthorized"
+                            }
+                        }
+                    }]
+                }))
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+
+        let settings = serde_json::json!({
+            "hosts": [format!("http://{addr}")],
+            "index": "test",
+            "retry_max_interval": 0,
+        });
+        let output = ElasticsearchOutput::from_config(&settings, None).expect("config");
+        let result = output.output(vec![Event::new("hello")]).await;
+
+        assert!(
+            result.is_err(),
+            "a per-item non-2xx status with errors:false must be treated as a failure"
         );
     }
 
