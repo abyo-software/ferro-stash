@@ -444,19 +444,27 @@ impl ElasticsearchInput {
                         event.add_tag(tag);
                     }
 
-                    // Track last value
-                    if let Some(ref field) = self.tracking_field {
-                        if let Some(val) = hit.get("_source").and_then(|s| s.get(field)) {
-                            last_tracking_value =
-                                Some(val.to_string().trim_matches('"').to_string());
-                        }
-                    }
+                    // Compute this hit's tracking value BEFORE the send (the
+                    // `event` is moved into `send`), but DO NOT commit it to
+                    // `last_tracking_value` until the send SUCCEEDS.
+                    let hit_tracking_value =
+                        extract_hit_tracking_value(hit, self.tracking_field.as_deref());
 
                     // Downstream channel closed: stop early but still close the
-                    // PIT in the epilogue. Preserve any tracking value gathered so
-                    // far (DD round-20 Finding #3).
+                    // PIT in the epilogue. Return the tracking value of the LAST
+                    // SUCCESSFULLY EMITTED hit — NOT this undelivered one — so the
+                    // saved cursor never advances past a document that was never
+                    // delivered. Advancing it here would `gt`-filter the
+                    // undelivered doc out of the next run, skipping it permanently
+                    // (data loss, DD round-21 MEDIUM). PIT-close still runs via the
+                    // epilogue (DD round-20 Finding #3).
                     if sender.send(event).await.is_err() {
                         return Ok(last_tracking_value);
+                    }
+
+                    // Send succeeded: only NOW advance the cursor past this hit.
+                    if hit_tracking_value.is_some() {
+                        last_tracking_value = hit_tracking_value;
                     }
                     total_docs += 1;
                 }
@@ -652,6 +660,27 @@ async fn es_status_error(
         plugin: "elasticsearch".to_string(),
         message: format!("{op} request failed with HTTP status {status}: {snippet}"),
     }
+}
+
+/// Extract the tracking-field value from a single search hit's `_source`.
+///
+/// Returns `None` when no `tracking_field` is configured, the hit has no
+/// `_source`, or that source lacks the field. The JSON-encoded value has its
+/// surrounding quotes trimmed so a string field yields the bare string (matching
+/// the `gt` range filter built in `run_search`).
+///
+/// Factored out of `run_search`'s per-hit loop so the cursor-advance contract
+/// (DD round-21 MEDIUM) is unit-testable without driving a full closed-channel
+/// HTTP mock: the caller commits this value to the saved cursor ONLY after the
+/// hit's `sender.send` succeeds, so a hit whose send fails never advances it.
+fn extract_hit_tracking_value(
+    hit: &serde_json::Value,
+    tracking_field: Option<&str>,
+) -> Option<String> {
+    let field = tracking_field?;
+    hit.get("_source")
+        .and_then(|s| s.get(field))
+        .map(|val| val.to_string().trim_matches('"').to_string())
 }
 
 /// Parse a schedule string into a polling interval in seconds, clamped to a
@@ -1402,5 +1431,236 @@ mod tests {
 
         // No events were emitted on the error path.
         assert!(rx.try_recv().is_err(), "no events on the error path");
+    }
+
+    // ---- DD round-21 MEDIUM: a failed send must NOT advance the tracking cursor ----
+
+    /// Pure simulation of `run_search`'s per-hit cursor-advance loop, factored so
+    /// the DD round-21 MEDIUM contract is testable WITHOUT racing `mpsc`
+    /// backpressure to pick which hit's send fails. `send_succeeds(i)` decides
+    /// whether the i-th hit's `sender.send` succeeds; on the first failure we
+    /// return the cursor accumulated SO FAR (mirroring the real
+    /// `return Ok(last_tracking_value)` early-out). This is byte-for-byte the same
+    /// advance rule the production loop uses: `extract_hit_tracking_value` BEFORE
+    /// the send, commit to `last_tracking_value` only AFTER a successful send.
+    fn simulate_cursor_advance(
+        hits: &[serde_json::Value],
+        tracking_field: Option<&str>,
+        send_succeeds: impl Fn(usize) -> bool,
+    ) -> Option<String> {
+        let mut last_tracking_value: Option<String> = None;
+        for (i, hit) in hits.iter().enumerate() {
+            let hit_tracking_value = extract_hit_tracking_value(hit, tracking_field);
+            if !send_succeeds(i) {
+                // Send failed: return the last SUCCESSFULLY-sent hit's value,
+                // NOT this undelivered hit's.
+                return last_tracking_value;
+            }
+            if hit_tracking_value.is_some() {
+                last_tracking_value = hit_tracking_value;
+            }
+        }
+        last_tracking_value
+    }
+
+    fn tracking_hits(n: usize) -> Vec<serde_json::Value> {
+        (0..n)
+            .map(|i| {
+                serde_json::json!({
+                    "_index": "logs",
+                    "_id": format!("doc-{i}"),
+                    "_source": {"@timestamp": format!("ts-{i}")},
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_extract_hit_tracking_value() {
+        let hit = serde_json::json!({
+            "_source": {"@timestamp": "2024-01-01T00:00:00Z", "n": 5},
+        });
+        // String field: surrounding JSON quotes are trimmed.
+        assert_eq!(
+            extract_hit_tracking_value(&hit, Some("@timestamp")).as_deref(),
+            Some("2024-01-01T00:00:00Z")
+        );
+        // Numeric field: JSON-encoded as-is.
+        assert_eq!(
+            extract_hit_tracking_value(&hit, Some("n")).as_deref(),
+            Some("5")
+        );
+        // No tracking field configured / missing field / missing _source → None.
+        assert_eq!(extract_hit_tracking_value(&hit, None), None);
+        assert_eq!(extract_hit_tracking_value(&hit, Some("absent")), None);
+        assert_eq!(
+            extract_hit_tracking_value(&serde_json::json!({}), Some("@timestamp")),
+            None
+        );
+    }
+
+    #[test]
+    fn test_cursor_does_not_advance_past_undelivered_hit() {
+        // THE round-21 MEDIUM regression (deterministic, no mpsc timing): a page
+        // of ts-0..ts-4 where the send of ts-3 FAILS. The advanced/saved cursor
+        // must be ts-2 (last successfully sent) — NOT ts-3 (the undelivered hit).
+        // If it were ts-3, the next run's `gt` filter would skip the
+        // never-delivered document permanently (data loss).
+        let hits = tracking_hits(5);
+        let failed_at = 3usize; // ts-0,ts-1,ts-2 succeed; ts-3 send fails
+        let cursor =
+            simulate_cursor_advance(&hits, Some("@timestamp"), |i| i < failed_at);
+        assert_eq!(
+            cursor.as_deref(),
+            Some("ts-2"),
+            "cursor must stop at the last successfully-sent hit (ts-2), not advance \
+             past the undelivered ts-{failed_at}"
+        );
+        assert_ne!(
+            cursor.as_deref(),
+            Some("ts-3"),
+            "cursor advanced past the UNDELIVERED hit ts-3 — data loss"
+        );
+    }
+
+    #[test]
+    fn test_cursor_none_when_first_send_fails() {
+        // If the VERY FIRST hit's send fails, nothing was delivered, so the cursor
+        // must stay None (not advance to ts-0). Saving None leaves the prior saved
+        // cursor untouched, so ts-0 is retried next run rather than skipped.
+        let hits = tracking_hits(3);
+        let cursor = simulate_cursor_advance(&hits, Some("@timestamp"), |_| false);
+        assert_eq!(cursor, None, "no hit delivered ⇒ cursor must not advance");
+    }
+
+    #[test]
+    fn test_cursor_advances_to_last_when_all_sends_succeed() {
+        // Happy path: every send succeeds, so the cursor advances to the last hit.
+        let hits = tracking_hits(4);
+        let cursor = simulate_cursor_advance(&hits, Some("@timestamp"), |_| true);
+        assert_eq!(cursor.as_deref(), Some("ts-3"));
+    }
+
+    #[test]
+    fn test_cursor_skips_hits_missing_tracking_field() {
+        // A delivered hit that lacks the tracking field must not clobber the cursor
+        // with None: the last hit that HAD the field wins. (Mirrors the production
+        // `if hit_tracking_value.is_some()` guard.)
+        let hits = vec![
+            serde_json::json!({"_id": "a", "_source": {"@timestamp": "ts-0"}}),
+            serde_json::json!({"_id": "b", "_source": {"other": 1}}), // no @timestamp
+            serde_json::json!({"_id": "c", "_source": {"@timestamp": "ts-2"}}),
+        ];
+        // All sends succeed ⇒ cursor = ts-2 (b's missing field did not reset it).
+        assert_eq!(
+            simulate_cursor_advance(&hits, Some("@timestamp"), |_| true).as_deref(),
+            Some("ts-2")
+        );
+        // Now ts-2 (index 2) fails to send: cursor must be ts-0 (b had no field),
+        // NOT ts-2.
+        assert_eq!(
+            simulate_cursor_advance(&hits, Some("@timestamp"), |i| i < 2).as_deref(),
+            Some("ts-0")
+        );
+    }
+
+    /// Spawn a mock ES that returns a real PIT id and then a single full page of
+    /// `page_size` tracking-bearing hits with NO `sort` cursor (so the search
+    /// terminates after one page), answering the best-effort PIT close with 200.
+    /// Used by the integration-level closed-channel regression below.
+    async fn spawn_mock_es_full_page_with_tracking(page_size: usize) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock listener");
+        let addr = listener.local_addr().expect("local addr");
+        let search_body =
+            serde_json::json!({ "hits": { "hits": tracking_hits(page_size) } }).to_string();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            for _ in 0..8u8 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let body = search_body.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    let Ok(n) = stream.read(&mut buf).await else {
+                        return;
+                    };
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let request_line = req.lines().next().unwrap_or("");
+                    let (status_line, resp_body) = if request_line.starts_with("DELETE")
+                        && request_line.contains("/_pit")
+                    {
+                        ("HTTP/1.1 200 OK", r#"{"succeeded":true}"#.to_string())
+                    } else if request_line.contains("/_pit") {
+                        ("HTTP/1.1 200 OK", r#"{"id":"pit-track-1"}"#.to_string())
+                    } else {
+                        ("HTTP/1.1 200 OK", body)
+                    };
+                    let response = format!(
+                        "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                        resp_body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.flush().await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn test_run_search_does_not_save_cursor_when_all_sends_fail() {
+        // Integration-level half of the round-21 regression, made DETERMINISTIC by
+        // closing the channel BEFORE `run_search` runs: every `sender.send` fails
+        // (the receiver is already dropped), so no hit is delivered and the cursor
+        // must NOT be saved (stays None) — the prior saved cursor (none here) is
+        // left untouched, so all hits are retried next run rather than skipped.
+        //
+        // (The "last-successfully-sent vs undelivered" boundary in the MIDDLE of a
+        // page is covered race-free by `test_cursor_does_not_advance_past_*` above,
+        // which exercises the exact same advance rule via `simulate_cursor_advance`
+        // without fighting mpsc backpressure to pin which send fails.)
+        let page_size = 5usize;
+        let host = spawn_mock_es_full_page_with_tracking(page_size).await;
+
+        let meta_path = std::env::temp_dir().join(format!(
+            "ferro_stash_es_track_{}_{}.last",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let meta_path_str = meta_path.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&meta_path);
+
+        let settings = serde_json::json!({
+            "hosts": [host],
+            "index": "logs",
+            "size": page_size,
+            "tracking_field": "@timestamp",
+            "last_run_metadata_path": meta_path_str,
+        });
+        let input = ElasticsearchInput::from_config(&settings).expect("config");
+
+        // Close the channel up front: drop the receiver so the FIRST send fails.
+        let (tx, rx) = mpsc::channel(16);
+        drop(rx);
+
+        let result = tokio::time::timeout(Duration::from_secs(10), input.run_search(&tx)).await;
+        let result = result.expect("run_search must terminate, not hang");
+        // A closed downstream channel is an Ok early-return (not a search error).
+        result.expect("run_search should return Ok on a downstream channel close");
+
+        // No hit was ever delivered, so no cursor should have been written.
+        let saved = input.load_last_value();
+        let _ = std::fs::remove_file(&meta_path);
+        assert_eq!(
+            saved, None,
+            "no hit was delivered ⇒ the tracking cursor must not be saved/advanced \
+             (got {saved:?}); advancing it would skip every undelivered hit"
+        );
     }
 }

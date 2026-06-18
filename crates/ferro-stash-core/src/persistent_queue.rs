@@ -266,8 +266,11 @@ impl PersistentQueue {
         self.write_seq += 1;
         self.current_segment_count += 1;
 
-        // Checkpoint periodically
-        if self.write_seq % self.config.checkpoint_interval as u64 == 0 {
+        // Checkpoint periodically. `checkpoint_interval` is an unvalidated
+        // `usize` from config; a value of 0 would make this modulo a
+        // division-by-zero panic (same zero-period class as the output flush
+        // timer). Clamp the divisor to >=1.
+        if self.write_seq % (self.config.checkpoint_interval.max(1) as u64) == 0 {
             self.checkpoint()?;
         }
 
@@ -604,6 +607,27 @@ mod tests {
         let batch2 = pq.dequeue(10).expect("dequeue");
         assert_eq!(batch2.len(), 5);
         assert_eq!(pq.pending(), 0);
+    }
+
+    #[test]
+    fn test_pq_zero_checkpoint_interval_does_not_panic() {
+        // A config of `checkpoint_interval: 0` must not cause a
+        // division-by-zero panic on the modulo in `enqueue` (zero-period
+        // class). Enqueue must succeed and events remain readable.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = PqConfig {
+            path: dir.path().to_string_lossy().to_string(),
+            checkpoint_interval: 0,
+            ..Default::default()
+        };
+        let mut pq = PersistentQueue::open(config).expect("open");
+        for i in 0..5 {
+            pq.enqueue(&format!(r#"{{"msg":"event {i}"}}"#))
+                .expect("enqueue must not panic with checkpoint_interval=0");
+        }
+        assert_eq!(pq.pending(), 5);
+        let batch = pq.dequeue(5).expect("dequeue");
+        assert_eq!(batch.len(), 5);
     }
 
     #[test]

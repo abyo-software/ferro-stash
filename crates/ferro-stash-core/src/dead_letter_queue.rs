@@ -167,7 +167,10 @@ impl DeadLetterQueue {
             self.total_bytes += line.len() as u64 + 1;
             self.events_written += 1;
 
-            if self.events_written % self.config.flush_interval == 0 {
+            // `flush_interval` is an unvalidated `usize` from config; a value of
+            // 0 would make this modulo a division-by-zero panic (same zero-period
+            // class as the output flush timer). Clamp the divisor to >=1.
+            if self.events_written % self.config.flush_interval.max(1) == 0 {
                 writer
                     .flush()
                     .map_err(|e| FerroStashError::Pipeline(format!("DLQ flush error: {e}")))?;
@@ -260,7 +263,10 @@ impl DeadLetterQueue {
             self.total_bytes += line.len() as u64 + 1;
             self.events_written += 1;
 
-            if self.events_written % self.config.flush_interval == 0 {
+            // `flush_interval` is an unvalidated `usize` from config; a value of
+            // 0 would make this modulo a division-by-zero panic (same zero-period
+            // class as the output flush timer). Clamp the divisor to >=1.
+            if self.events_written % self.config.flush_interval.max(1) == 0 {
                 writer
                     .flush()
                     .map_err(|e| FerroStashError::Pipeline(format!("DLQ flush error: {e}")))?;
@@ -412,6 +418,35 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].plugin_name, "grok");
         assert_eq!(entries[1].reason, "mapping error");
+    }
+
+    #[test]
+    fn test_dlq_zero_flush_interval_does_not_panic() {
+        // A config of `flush_interval: 0` must not cause a division-by-zero
+        // panic on the modulo in `write` (zero-period class). Writing must
+        // succeed and the events must be readable.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = DlqConfig {
+            path: dir.path().to_string_lossy().to_string(),
+            flush_interval: 0,
+            ..Default::default()
+        };
+        let mut dlq = DeadLetterQueue::open(config).expect("open");
+        for i in 0..3 {
+            dlq.write(
+                "filter",
+                "grok",
+                "boom",
+                serde_json::json!({"message": format!("line {i}")}),
+            )
+            .expect("write must not panic with flush_interval=0");
+        }
+        // Also exercise the convenience push() path which shares the modulo.
+        dlq.push(&Event::new("pushed"), "err", "plugin", Utc::now())
+            .expect("push must not panic with flush_interval=0");
+        dlq.close().expect("close");
+        let entries = dlq.read_all().expect("read");
+        assert_eq!(entries.len(), 4);
     }
 
     #[test]

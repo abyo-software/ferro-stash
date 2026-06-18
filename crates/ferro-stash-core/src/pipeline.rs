@@ -501,6 +501,18 @@ async fn run_filter_worker(
     }
 }
 
+/// Clamps a flush interval to a non-zero minimum.
+///
+/// `tokio::time::interval` panics if constructed with a period of zero, and the
+/// output flush interval is derived from the unvalidated `batch_delay_ms`
+/// config value. A `batch_delay_ms: 0` (config typo or `--batch-delay 0`) would
+/// otherwise panic the spawned output task and silently stop all delivery.
+/// The 1ms floor avoids the panic while preserving fast-flush intent without
+/// imposing extra batching latency on legitimate small values.
+fn clamp_flush_interval(interval: std::time::Duration) -> std::time::Duration {
+    interval.max(std::time::Duration::from_millis(1))
+}
+
 async fn run_outputs(
     mut rx: mpsc::Receiver<Event>,
     outputs: Arc<Vec<Box<dyn OutputPlugin>>>,
@@ -510,7 +522,12 @@ async fn run_outputs(
     dlq: Option<SharedDeadLetterQueue>,
 ) {
     let mut collector = BatchCollector::new(config);
-    let flush_interval = collector.flush_interval();
+    // `flush_interval` is derived from the unvalidated `batch_delay_ms` config
+    // (`Duration::from_millis(batch_delay_ms)`). `tokio::time::interval` PANICS
+    // if given a zero period, which would silently kill this spawned output task
+    // and halt all delivery. Clamp to a 1ms floor: enough to avoid the panic
+    // while preserving fast-flush intent for legitimate small values.
+    let flush_interval = clamp_flush_interval(collector.flush_interval());
     let mut flush_timer = tokio::time::interval(flush_interval);
     flush_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -635,6 +652,33 @@ mod tests {
         let snap = metrics.snapshot();
         assert_eq!(snap.events_in, 0);
         assert_eq!(snap.events_out, 0);
+    }
+
+    #[test]
+    fn test_clamp_flush_interval_floors_zero() {
+        // A `batch_delay_ms: 0` config yields `Duration::ZERO`, which would
+        // panic `tokio::time::interval`. The clamp must floor it to >=1ms.
+        let clamped = clamp_flush_interval(std::time::Duration::ZERO);
+        assert!(clamped >= std::time::Duration::from_millis(1));
+        assert_eq!(clamped, std::time::Duration::from_millis(1));
+    }
+
+    #[test]
+    fn test_clamp_flush_interval_preserves_nonzero() {
+        // Legitimate non-zero values pass through unchanged (no large floor
+        // imposed that would alter batching latency).
+        for ms in [1u64, 2, 5, 100, 5000] {
+            let d = std::time::Duration::from_millis(ms);
+            assert_eq!(clamp_flush_interval(d), d);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_zero_flush_interval_does_not_panic_interval() {
+        // End-to-end: constructing the output flush timer from a clamped
+        // zero-period flush interval must not panic.
+        let clamped = clamp_flush_interval(std::time::Duration::ZERO);
+        let _timer = tokio::time::interval(clamped);
     }
 
     #[test]
