@@ -368,28 +368,96 @@ impl ElasticsearchOutput {
                                 continue;
                             }
                         };
-                        // Check for item-level errors
-                        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
-                            if json["errors"].as_bool() == Some(true) {
-                                let failed = json["items"].as_array().map_or(0, |items| {
-                                    items
-                                        .iter()
-                                        .filter(|item| {
-                                            item.as_object()
-                                                .and_then(|object| object.values().next())
-                                                .is_some_and(|value| value.get("error").is_some())
-                                        })
-                                        .count()
-                                });
+                        // A 2xx status alone does NOT mean Elasticsearch
+                        // acknowledged the batch: a proxy / auth gateway / WAF /
+                        // misrouted host can return HTTP 200 with HTML or a
+                        // non-bulk body like `{"ok":true}`. Treating such a
+                        // response as delivered is silent data loss — the events
+                        // are recorded as written even though no item was ever
+                        // acknowledged (same class as the round-14 form bug).
+                        //
+                        // Only a well-formed bulk response counts as delivered:
+                        // it MUST parse as JSON, carry a boolean `errors` field
+                        // and an array `items` field, and `items.len()` MUST
+                        // equal the number of events we sent (the bulk response
+                        // acknowledges exactly the actions submitted). Anything
+                        // else is treated as a FAILURE so the pipeline can
+                        // retry/DLQ — the same path the retriable 5xx/429 branch
+                        // uses. The 256 MB read cap above still applies.
+                        // Bounded snippet of the (possibly unexpected) body for
+                        // diagnostics; never logs/embeds the body unbounded.
+                        let snippet = ferro_stash_core::bounded_snippet(
+                            &String::from_utf8_lossy(&body_bytes),
+                            crate::ERROR_BODY_SNIPPET_LIMIT,
+                        );
+                        let json = match serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+                            Ok(json) => json,
+                            Err(e) => {
                                 warn!(
-                                    events = events.len(),
-                                    failed, "bulk request completed with errors"
+                                    status = %status,
+                                    error = %e,
+                                    body = %snippet,
+                                    "bulk 2xx response is not valid JSON (proxy/WAF/misrouted host?), \
+                                     treating as failure"
                                 );
-                                return Err(FerroStashError::Output {
-                                    plugin: "elasticsearch".to_string(),
-                                    message: format!("bulk item-level errors: {failed} failed"),
-                                });
+                                last_err = Some(format!(
+                                    "2xx response is not a valid bulk response (not JSON): {snippet}"
+                                ));
+                                continue;
                             }
+                        };
+                        let errors_field = json.get("errors").and_then(serde_json::Value::as_bool);
+                        let items = json.get("items").and_then(serde_json::Value::as_array);
+                        let (errors_present, items) = match (errors_field, items) {
+                            (Some(errors), Some(items)) => (errors, items),
+                            _ => {
+                                warn!(
+                                    status = %status,
+                                    body = %snippet,
+                                    "bulk 2xx response is missing the boolean `errors` and/or \
+                                     array `items` fields (not a bulk response), treating as failure"
+                                );
+                                last_err = Some(format!(
+                                    "2xx response is not a valid bulk response \
+                                     (missing errors/items): {snippet}"
+                                ));
+                                continue;
+                            }
+                        };
+                        if items.len() != events.len() {
+                            warn!(
+                                status = %status,
+                                expected = events.len(),
+                                got = items.len(),
+                                body = %snippet,
+                                "bulk 2xx response acknowledged a different number of items than \
+                                 events sent, treating as failure"
+                            );
+                            last_err = Some(format!(
+                                "2xx bulk response acknowledged {} items but {} events were sent",
+                                items.len(),
+                                events.len()
+                            ));
+                            continue;
+                        }
+                        // Well-formed bulk response: apply item-level-error detection.
+                        if errors_present {
+                            let failed = items
+                                .iter()
+                                .filter(|item| {
+                                    item.as_object()
+                                        .and_then(|object| object.values().next())
+                                        .is_some_and(|value| value.get("error").is_some())
+                                })
+                                .count();
+                            warn!(
+                                events = events.len(),
+                                failed, "bulk request completed with errors"
+                            );
+                            return Err(FerroStashError::Output {
+                                plugin: "elasticsearch".to_string(),
+                                message: format!("bulk item-level errors: {failed} failed"),
+                            });
                         }
                         debug!(events = events.len(), status = %status, "bulk request successful");
                         return Ok(());
@@ -928,14 +996,159 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_200_non_bulk_json_body_is_treated_as_failure() {
+        // Round-15 HIGH regression: a 2xx response that is NOT a valid bulk
+        // response (e.g. a proxy/auth-gateway/WAF returns 200 with `{"ok":true}`)
+        // must be treated as a FAILURE, not silently recorded as delivered. The
+        // body parses as JSON but lacks the `errors`/`items` fields.
+        let app = Router::new().route(
+            "/_bulk",
+            post(|| async { Json(serde_json::json!({ "ok": true })) }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+
+        let settings = serde_json::json!({
+            "hosts": [format!("http://{addr}")],
+            "index": "test",
+            // No retries so the single attempt's non-bulk 200 resolves to Err fast.
+            "retry_max_interval": 0,
+        });
+        let output = ElasticsearchOutput::from_config(&settings, None).expect("config");
+        let result = output.output(vec![Event::new("hello")]).await;
+
+        assert!(
+            result.is_err(),
+            "a 2xx response missing errors/items must be treated as a failure, not delivered"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_200_html_body_is_treated_as_failure() {
+        // A misrouted host / WAF returning 200 with an HTML body (not JSON at
+        // all) must also be treated as a failure rather than delivered.
+        let app = Router::new().route(
+            "/_bulk",
+            post(|| async {
+                (
+                    axum::http::StatusCode::OK,
+                    "<html><body>Forbidden by gateway</body></html>",
+                )
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+
+        let settings = serde_json::json!({
+            "hosts": [format!("http://{addr}")],
+            "index": "test",
+            "retry_max_interval": 0,
+        });
+        let output = ElasticsearchOutput::from_config(&settings, None).expect("config");
+        let result = output.output(vec![Event::new("hello")]).await;
+
+        assert!(
+            result.is_err(),
+            "a 2xx response with an HTML (non-JSON) body must be treated as a failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_200_bulk_item_count_mismatch_is_treated_as_failure() {
+        // A well-formed-looking bulk 200 whose `items` count does NOT match the
+        // number of events sent must be treated as a failure: the bulk response
+        // must acknowledge exactly the events submitted.
+        let app = Router::new().route(
+            "/_bulk",
+            post(|| async {
+                // Two events will be sent, but only one item is acknowledged.
+                Json(serde_json::json!({
+                    "errors": false,
+                    "items": [{ "index": { "status": 201 } }]
+                }))
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+
+        let settings = serde_json::json!({
+            "hosts": [format!("http://{addr}")],
+            "index": "test",
+            "retry_max_interval": 0,
+        });
+        let output = ElasticsearchOutput::from_config(&settings, None).expect("config");
+        let result = output
+            .output(vec![Event::new("one"), Event::new("two")])
+            .await;
+
+        assert!(
+            result.is_err(),
+            "a bulk 200 whose items.len() != events.len() must be treated as a failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_200_well_formed_bulk_matching_items_succeeds() {
+        // A well-formed bulk 200 with `errors:false` and `items.len()` equal to
+        // the number of events sent must still succeed — the strict validation
+        // only rejects non-bulk / mismatched responses, never the happy path.
+        let app = Router::new().route(
+            "/_bulk",
+            post(|| async {
+                Json(serde_json::json!({
+                    "errors": false,
+                    "items": [
+                        { "index": { "status": 201 } },
+                        { "index": { "status": 201 } }
+                    ]
+                }))
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+
+        let settings = serde_json::json!({
+            "hosts": [format!("http://{addr}")],
+            "index": "test",
+        });
+        let output = ElasticsearchOutput::from_config(&settings, None).expect("config");
+        let result = output
+            .output(vec![Event::new("one"), Event::new("two")])
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "a well-formed bulk 200 with matching item count must succeed: {result:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_within_cap_success_body_still_parsed() {
         // Sanity companion to the over-limit test: a *within-cap* 200 body with
         // no item-level errors still succeeds through the same capped path, so
         // the cap only rejects oversize bodies and never breaks the happy path.
+        // One event is sent below, so the bulk response must acknowledge
+        // exactly one item (the strict round-15 validation requires
+        // `items.len() == events.len()`).
         let app = Router::new().route(
             "/_bulk",
             post(|| async {
-                Json(serde_json::json!({ "errors": false, "items": [] }))
+                Json(serde_json::json!({
+                    "errors": false,
+                    "items": [{ "index": { "status": 201 } }]
+                }))
             }),
         );
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");

@@ -194,12 +194,29 @@ impl HttpOutput {
         let mut first_error: Option<String> = None;
 
         for event in &events {
-            // Preserve the original single-event form-encoding logic, applied
-            // per event.
+            // Build a proper `application/x-www-form-urlencoded` body by
+            // percent-encoding every key AND value. Hand-joining raw
+            // `k=v` pairs with `&` corrupts the event when a key or value
+            // contains `&`, `=`, `%`, or whitespace: e.g.
+            // `message = "login ok&admin=true"` would be split into multiple
+            // fields (silent corruption/injection) while output() still
+            // returned Ok. Over-encoding via `NON_ALPHANUMERIC` is always
+            // valid form-urlencoded (form receivers accept %20 for space).
             let form_body = event
                 .fields()
                 .iter()
-                .map(|(k, v)| format!("{}={}", k, v.to_string_lossy()))
+                .map(|(k, v)| {
+                    let key = percent_encoding::utf8_percent_encode(
+                        k,
+                        percent_encoding::NON_ALPHANUMERIC,
+                    );
+                    let value = v.to_string_lossy();
+                    let value = percent_encoding::utf8_percent_encode(
+                        &value,
+                        percent_encoding::NON_ALPHANUMERIC,
+                    );
+                    format!("{key}={value}")
+                })
                 .collect::<Vec<_>>()
                 .join("&");
 
@@ -515,6 +532,91 @@ mod tests {
                 "expected a form body containing message={msg} and id={id}; got: {joined}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_http_output_form_percent_encodes_special_chars() {
+        // Round-15 MEDIUM regression: a form-encoded value containing `&`, `=`,
+        // or whitespace must be percent-encoded so the receiver decodes it back
+        // to the ORIGINAL value — not split into extra/injected fields. Before
+        // the fix, `message = "login ok&admin=true"` was joined raw and arrived
+        // as several fields (silent corruption/injection) while output() still
+        // returned Ok.
+        let bodies: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let handler_bodies = Arc::clone(&bodies);
+        let app = Router::new().route(
+            "/events",
+            post(move |body: String| {
+                let handler_bodies = Arc::clone(&handler_bodies);
+                async move {
+                    if let Ok(mut guard) = handler_bodies.lock() {
+                        guard.push(body);
+                    }
+                    (axum::http::StatusCode::OK, "ok")
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+
+        let settings = serde_json::json!({
+            "url": format!("http://{addr}/events"),
+            "format": "form",
+            "retry_count": 0
+        });
+        let output = HttpOutput::from_config(&settings, None).expect("config");
+
+        // A value with `&`, `=`, and a space — the exact injection vector.
+        let nasty_message = "login ok&admin=true";
+        let mut event = Event::new(nasty_message);
+        event.set("note", EventValue::String("a=b & c".into()));
+        let result = output.output(vec![event]).await;
+
+        assert!(result.is_ok(), "form post succeeded => Ok: {result:?}");
+
+        let received = bodies.lock().expect("bodies").clone();
+        assert_eq!(received.len(), 1, "exactly one form body received");
+        let raw = &received[0];
+
+        // The raw wire form must NOT contain the literal special characters of
+        // the value (they must be percent-encoded), so the receiver can't be
+        // fooled into reading extra fields.
+        assert!(
+            !raw.contains("login ok"),
+            "spaces must be percent-encoded on the wire: {raw}"
+        );
+
+        // Decode the form body the way any form receiver would. The decoded
+        // pairs must contain EXACTLY the original fields with the original
+        // values — no field was split off by an embedded `&`/`=`.
+        let decoded: std::collections::HashMap<String, String> =
+            url::form_urlencoded::parse(raw.as_bytes())
+                .into_owned()
+                .collect();
+
+        assert_eq!(
+            decoded.get("message").map(String::as_str),
+            Some(nasty_message),
+            "message must decode back to the original value, not be split: decoded={decoded:?}"
+        );
+        assert_eq!(
+            decoded.get("note").map(String::as_str),
+            Some("a=b & c"),
+            "note must decode back to the original value: decoded={decoded:?}"
+        );
+        // The injection would have created spurious keys like `admin`/`true`/`c`.
+        assert!(
+            !decoded.contains_key("admin"),
+            "no injected `admin` field must appear: decoded={decoded:?}"
+        );
+        assert_eq!(
+            decoded.len(),
+            2,
+            "exactly the two original fields must arrive (message, note): decoded={decoded:?}"
+        );
     }
 
     #[tokio::test]
