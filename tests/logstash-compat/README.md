@@ -49,6 +49,46 @@ If `actual` carries fields the fixture did not list, that's tolerated too —
 the fixture asserts presence, not absence. Use the existing exhaustive
 `tests/e2e/compatibility_test.rs` if you need strict equality.
 
+## Prerequisites — obtaining Logstash
+
+The side-by-side harnesses compare ferro-stash against a **real Logstash**.
+Logstash is distributed by Elastic under the Elastic License v2 / SSPL and
+is **not vendored in this repository** — you provide your own copy. There
+are two supported ways, depending on which harness you run:
+
+**1. Docker (recommended; used by the Rust side-by-side harness).**
+No local install needed — the harness shells out to a pinned image:
+
+```bash
+docker pull docker.elastic.co/logstash/logstash:8.15.3
+# or: docker compose -f tests/logstash-compat/docker-compose.yml pull
+```
+
+See [Docker side-by-side regression harness](#docker-side-by-side-regression-harness)
+below.
+
+**2. Local tarball install (used by `runner.py`, `jruby_parity.py`, and
+`run_smoke_tests.sh`).** Download a Logstash 9.3.x release from Elastic,
+extract it anywhere, and point the harness at it via environment
+variables:
+
+```bash
+# Pick the build for your platform from https://www.elastic.co/downloads/logstash
+curl -fsSLO https://artifacts.elastic.co/downloads/logstash/logstash-9.3.2-linux-x86_64.tar.gz
+tar xzf logstash-9.3.2-linux-x86_64.tar.gz
+
+# jruby_parity.py reads LOGSTASH_HOME (the extracted directory):
+export LOGSTASH_HOME="$PWD/logstash-9.3.2"
+
+# run_smoke_tests.sh reads LOGSTASH_BIN (defaults to `logstash` on PATH):
+export LOGSTASH_BIN="$LOGSTASH_HOME/bin/logstash"
+```
+
+The bundled JVM ships inside the tarball, so no separate Java install is
+required. All harnesses **skip gracefully** when Logstash is absent:
+`jruby_parity.py` exits 0 with a `SKIPPED: requires LOGSTASH_HOME`
+message, and the Rust docker tests are `#[ignore]` by default.
+
 ## Running — Python
 
 ```bash
