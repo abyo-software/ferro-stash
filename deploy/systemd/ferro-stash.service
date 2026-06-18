@@ -1,0 +1,83 @@
+# SPDX-License-Identifier: Apache-2.0
+# Hardened systemd unit for FerroStash (Logstash-compatible pipeline).
+#
+# Install:
+#   sudo install -m0755 target/release/ferro-stash /usr/local/bin/ferro-stash
+#   sudo install -d -m0755 /etc/ferro-stash
+#   sudo install -m0644 config/example.conf /etc/ferro-stash/pipeline.conf
+#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin ferrostash
+#   sudo install -m0644 deploy/systemd/ferro-stash.service \
+#        /etc/systemd/system/ferro-stash.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now ferro-stash
+#
+# Optional GeoIP: drop the database at
+#   /etc/ferro-stash/GeoLite2-City.mmdb
+# and reference it from the pipeline:
+#   geoip { source => "client_ip" database => "/etc/ferro-stash/GeoLite2-City.mmdb" }
+
+[Unit]
+Description=FerroStash — Logstash-compatible data pipeline
+Documentation=https://github.com/ferrosearch/ferro-stash
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# --- Identity (non-root) ---------------------------------------------------
+User=ferrostash
+Group=ferrostash
+
+# --- Process ---------------------------------------------------------------
+# StateDirectory creates/owns /var/lib/ferro-stash (mode 0750) for us and
+# exports it as $STATE_DIRECTORY. We use it as path.data (per-instance lock,
+# instance uuid, persistent queue / DLQ).
+StateDirectory=ferro-stash
+StateDirectoryMode=0750
+ExecStart=/usr/local/bin/ferro-stash \
+    -f /etc/ferro-stash/pipeline.conf \
+    --path.data /var/lib/ferro-stash \
+    --api.http.host 127.0.0.1:9600 \
+    --log.level info
+
+# Reload config on SIGHUP if you enable --config.reload.automatic; otherwise
+# a restart is the safe path.
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+# Graceful shutdown: the binary drains pipelines on SIGTERM.
+KillSignal=SIGTERM
+KillMode=mixed
+
+# --- Resource limits -------------------------------------------------------
+LimitNOFILE=65536
+
+# --- Sandboxing / hardening ------------------------------------------------
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+RemoveIPC=true
+# Only the state dir is writable; everything else (incl. /etc/ferro-stash) is RO.
+ReadWritePaths=/var/lib/ferro-stash
+# Network is required for tcp/udp/http/beats/kafka/es inputs+outputs.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,162 @@
+# SPDX-License-Identifier: Apache-2.0
+name: Release
+
+# Triggered on version tags (e.g. v0.1.0). Builds the release binary, smoke
+# tests it, builds the Docker image, attaches the binary to a GitHub Release,
+# and (only if registry credentials are configured) pushes the image.
+on:
+  push:
+    tags:
+      - "v*"
+  # Allow a manual dry-run from the Actions tab.
+  workflow_dispatch:
+
+permissions:
+  contents: write # create the GitHub Release and upload assets
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build release binary
+    # GitHub-hosted runner: a release tag shouldn't depend on the KVM pool, and
+    # we install the full build toolchain here. (CI uses self-hosted KVM with a
+    # pre-installed toolchain; this job is self-contained instead.)
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=manual-${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Build toolchain: clang (mruby FFI), cmake (vendored librdkafka),
+      # pkg-config/perl (-sys crates). Rust comes pre-installed on
+      # ubuntu-latest; we pin stable explicitly.
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang llvm libclang-dev cmake pkg-config make perl
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      # ferro-stash-ruby depends on artichoke-backend/artichoke-core via a
+      # sibling path (`../../../../artichoke-extended/...` relative to the crate
+      # manifest). From $GITHUB_WORKSPACE that resolves to the parent's parent
+      # dir; clone the `extended` branch there (mirrors .github/workflows/ci.yml).
+      - name: Checkout artichoke-extended (sibling path dep)
+        run: |
+          set -euo pipefail
+          SIBLING="$GITHUB_WORKSPACE/../../artichoke-extended"
+          if [ -d "$SIBLING/.git" ]; then
+            git -C "$SIBLING" fetch --depth=1 origin extended
+            git -C "$SIBLING" reset --hard FETCH_HEAD
+          else
+            rm -rf "$SIBLING"
+            git clone --depth=1 --branch extended \
+              https://github.com/masumi-ryugo/artichoke-extended.git "$SIBLING"
+          fi
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --bin ferro-stash
+
+      # Smoke check: the binary must run. Use --help (always exits 0) and
+      # --version. The binary self-identifies as Logstash-compatible.
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          BIN=target/release/ferro-stash
+          test -x "$BIN"
+          "$BIN" --version
+          "$BIN" --help >/dev/null
+
+      - name: Stage artifact
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp target/release/ferro-stash dist/ferro-stash
+          strip dist/ferro-stash || true
+          ( cd dist && tar -czf "ferro-stash-${{ steps.version.outputs.version }}-x86_64-linux.tar.gz" ferro-stash )
+          ( cd dist && sha256sum "ferro-stash-${{ steps.version.outputs.version }}-x86_64-linux.tar.gz" \
+              > "ferro-stash-${{ steps.version.outputs.version }}-x86_64-linux.tar.gz.sha256" )
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ferro-stash-binary
+          path: dist/*
+          retention-days: 7
+
+      - name: Create GitHub Release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/ferro-stash-${{ steps.version.outputs.version }}-x86_64-linux.tar.gz
+            dist/ferro-stash-${{ steps.version.outputs.version }}-x86_64-linux.tar.gz.sha256
+          generate_release_notes: true
+
+  docker:
+    name: Build Docker image
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Push only when registry credentials are configured. By default this is a
+      # build-only validation (no credentials are assumed to exist).
+      - name: Detect registry credentials
+        id: creds
+        run: |
+          set -euo pipefail
+          if [ -n "${{ secrets.REGISTRY_USERNAME }}" ] && [ -n "${{ secrets.REGISTRY_PASSWORD }}" ]; then
+            echo "push=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "push=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Log in to registry
+        if: steps.creds.outputs.push == 'true'
+        uses: docker/login-action@v3
+        with:
+          # Defaults to Docker Hub if REGISTRY is unset.
+          registry: ${{ vars.REGISTRY }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Compute image tags
+        id: meta
+        run: |
+          set -euo pipefail
+          REPO="${{ vars.IMAGE_REPOSITORY }}"
+          REPO="${REPO:-ferro-stash}"
+          VER="${{ needs.build.outputs.version }}"
+          echo "tags=${REPO}:${VER},${REPO}:latest" >> "$GITHUB_OUTPUT"
+
+      # The Dockerfile clones the artichoke fork itself, so the build context is
+      # just the repo. This recompiles rdkafka + aws-sdk and is slow.
+      - name: Build (and conditionally push) image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: ${{ steps.creds.outputs.push == 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

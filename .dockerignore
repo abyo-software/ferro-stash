@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: Apache-2.0
+# Keep the Docker build context small and reproducible. The artichoke fork is
+# cloned inside the image, not copied from the host.
+
+# Build artifacts (huge)
+target/
+**/target/
+
+# VCS
+.git/
+.gitignore
+.github/
+
+# Fuzzing corpora / artifacts (large, not needed to build)
+fuzz/corpus/
+fuzz/artifacts/
+fuzz/coverage/
+
+# Runtime byproducts (path.data default + logs)
+data/
+crates/*/data/
+*.log
+
+# Editor / OS cruft
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Deploy assets are not needed in the build context
+deploy/
+
+# Docs (not needed to compile the binary)
+*.md
+docs/
+LICENSE
+
+# A pre-existing local artichoke checkout (if any) — the image clones its own
+artichoke-extended/

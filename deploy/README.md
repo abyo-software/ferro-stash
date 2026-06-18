@@ -1,0 +1,190 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+# FerroStash deployment
+
+Production packaging for the `ferro-stash` binary (a Logstash-compatible data
+pipeline). Three delivery methods are provided:
+
+- **Docker** — `../Dockerfile`
+- **systemd** — `systemd/ferro-stash.service`
+- **Helm** — `helm/ferro-stash/`
+
+## Confirmed facts (verified against source)
+
+| Thing | Value |
+|-------|-------|
+| Binary name | `ferro-stash` (crate `ferro-stash-cli`) |
+| Config flag | `-f` / `--path.config` (alias `--config`) |
+| Inline config | `-e` / `--config.string` |
+| Data dir flag | `--path.data` (default `data`, relative to CWD) |
+| API/metrics port | **9600** (`--api.http.host`, default `127.0.0.1:9600`) |
+| Health endpoint | `GET /_health_report` (also `/_node`, `/_node/stats`) |
+| Version / help | `--version` / `-V`, `--help` / `-h` |
+
+The monitoring API defaults to **127.0.0.1**, so containers/pods bind
+`0.0.0.0:9600` instead (the provided Docker `CMD` and Helm args do this).
+
+`--path.data` holds a per-instance lock file, the instance `uuid`, and any
+persistent queue / DLQ state. It must be unique per instance and writable.
+
+## The Artichoke build dependency
+
+`ferro-stash-ruby` depends on a **local fork of Artichoke** via a filesystem
+path dependency:
+
+```
+crates/ferro-stash-ruby/Cargo.toml ->
+    ../../../../artichoke-extended/artichoke-backend
+```
+
+From the crate manifest, the four `..` hops in `../../../../artichoke-extended`
+resolve to the repo checkout's **grandparent** directory (crate → `crates` →
+repo → parent → grandparent), so the fork lives two levels above the crate's
+repo, not directly beside it. The fork is public at
+<https://github.com/masumi-ryugo/artichoke-extended> and the relevant branch is
+**`extended`**.
+
+- **CI / the release workflow** clone it to
+  `$GITHUB_WORKSPACE/../../artichoke-extended`, where
+  `$GITHUB_WORKSPACE = _work/ferro-stash/ferro-stash`, i.e. the fork ends up at
+  `_work/artichoke-extended`.
+- **Docker** reproduces that layout by nesting the repo one extra level: the
+  repo is copied to `/build/ferro-stash/ferro-stash` and the fork is cloned to
+  `/build/artichoke-extended`, so the four-`..` path dep reaches `/build`.
+
+A fresh clone of `ferro-stash` alone will **not** build without this fork.
+
+Build toolchain needed: Rust stable, **clang** (mruby FFI), **cmake** (vendored
+librdkafka for the kafka plugins), pkg-config. TLS uses rustls — no system
+OpenSSL required. At runtime only `ca-certificates` is needed for outbound TLS.
+
+---
+
+## Docker
+
+```bash
+# Build (slow first time: compiles rdkafka, aws-sdk, mruby).
+docker build -t ferro-stash:latest .
+
+# Run with a mounted pipeline config + metrics API on 9600.
+docker run --rm -it \
+  -v "$PWD/config/example.conf:/etc/ferro-stash/pipeline.conf:ro" \
+  -p 9600:9600 \
+  ferro-stash:latest
+
+# Check the API.
+curl http://127.0.0.1:9600/_node
+curl http://127.0.0.1:9600/_health_report
+```
+
+The image:
+- runs as non-root uid/gid `65532`,
+- ships `ca-certificates` + `tini` (signal forwarding / zombie reaping),
+- uses the writable volume `/var/lib/ferro-stash` as `path.data`,
+- binds the API on `0.0.0.0:9600`,
+- default `CMD` reads `/etc/ferro-stash/pipeline.conf`.
+
+### Optional GeoIP database
+
+The `geoip` filter reads a user-supplied MaxMind `.mmdb` at runtime (not
+vendored). Mount it and point the filter at it:
+
+```bash
+docker run --rm -it \
+  -v "$PWD/pipeline.conf:/etc/ferro-stash/pipeline.conf:ro" \
+  -v "$PWD/GeoLite2-City.mmdb:/etc/ferro-stash/GeoLite2-City.mmdb:ro" \
+  -p 9600:9600 ferro-stash:latest
+```
+
+```conf
+filter {
+  geoip {
+    source   => "client_ip"
+    database => "/etc/ferro-stash/GeoLite2-City.mmdb"
+  }
+}
+```
+
+---
+
+## systemd
+
+```bash
+# Binary + config.
+sudo install -m0755 target/release/ferro-stash /usr/local/bin/ferro-stash
+sudo install -d -m0755 /etc/ferro-stash
+sudo install -m0644 config/example.conf /etc/ferro-stash/pipeline.conf
+
+# Service account (non-root).
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin ferrostash
+
+# Unit.
+sudo install -m0644 deploy/systemd/ferro-stash.service \
+     /etc/systemd/system/ferro-stash.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now ferro-stash
+
+# Logs / status.
+systemctl status ferro-stash
+journalctl -u ferro-stash -f
+```
+
+The unit:
+- runs as `ferrostash:ferrostash`,
+- uses `StateDirectory=ferro-stash` (`/var/lib/ferro-stash`, mode 0750) as
+  `path.data`,
+- binds the API on `127.0.0.1:9600` (front it with a reverse proxy if remote
+  access is needed),
+- is hardened: `ProtectSystem=strict`, `NoNewPrivileges`, `PrivateTmp`,
+  `ProtectHome`, restricted syscalls/address-families, with only
+  `/var/lib/ferro-stash` writable (`ReadWritePaths`).
+
+For GeoIP, place the database at `/etc/ferro-stash/GeoLite2-City.mmdb` (the
+config directory is read-only to the service, which is correct — the db is read
+only) and reference it from `pipeline.conf` as above.
+
+> Note: `MemoryDenyWriteExecute` is intentionally left `false` — the `script`
+> filter uses a Cranelift JIT that needs writable+executable memory.
+
+---
+
+## Helm
+
+```bash
+# Lint.
+helm lint deploy/helm/ferro-stash
+
+# Install (set your image + pipeline).
+helm install fs deploy/helm/ferro-stash \
+  --set image.repository=myrepo/ferro-stash \
+  --set image.tag=0.1.0 \
+  --set-file pipelineConf=./my-pipeline.conf
+```
+
+Key values (`deploy/helm/ferro-stash/values.yaml`):
+
+| Value | Purpose |
+|-------|---------|
+| `image.repository` / `image.tag` | container image (tag defaults to chart appVersion) |
+| `pipelineConf` | the Logstash `.conf` pipeline; rendered into a ConfigMap and mounted at `/etc/ferro-stash/pipeline.conf`; changes roll the pods (checksum annotation) |
+| `service.port` | API/metrics port (default 9600) |
+| `resources` | container requests/limits |
+| `persistence.enabled` | use a PVC for `path.data` instead of `emptyDir` |
+| `geoip.enabled` + `geoip.existingSecret` | mount a `.mmdb` from a Secret |
+| `probes.*` | liveness/readiness against `/_health_report` |
+
+The pod runs non-root (uid 65532) with `readOnlyRootFilesystem: true`; the only
+writable mount is the `path.data` volume at `/var/lib/ferro-stash`.
+
+### Providing the GeoIP database
+
+```bash
+kubectl create secret generic ferro-stash-geoip \
+  --from-file=GeoLite2-City.mmdb=./GeoLite2-City.mmdb
+
+helm upgrade fs deploy/helm/ferro-stash \
+  --set geoip.enabled=true \
+  --set geoip.existingSecret=ferro-stash-geoip
+```
+
+The database mounts at `/etc/ferro-stash/GeoLite2-City.mmdb`; reference that
+path in the `geoip` filter's `database =>` option.

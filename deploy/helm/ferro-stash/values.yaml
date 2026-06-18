@@ -1,0 +1,115 @@
+# SPDX-License-Identifier: Apache-2.0
+# Default values for the ferro-stash chart.
+
+image:
+  repository: ferro-stash
+  # Overridden per-environment; defaults to the chart appVersion when empty.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+replicaCount: 1
+
+# Pod-level scheduling.
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}
+podLabels: {}
+
+# Extra CLI args appended to the container command (e.g. ["--log.level","debug"]).
+extraArgs: []
+
+# Container resources. Tune to your pipeline throughput.
+resources:
+  requests:
+    cpu: 250m
+    memory: 128Mi
+  limits:
+    cpu: "2"
+    memory: 1Gi
+
+# Monitoring / metrics API (default container port 9600).
+service:
+  type: ClusterIP
+  port: 9600
+  annotations: {}
+
+# Liveness/readiness use the /_health_report endpoint exposed by the API.
+probes:
+  enabled: true
+  initialDelaySeconds: 5
+  periodSeconds: 10
+
+# Security context — runs as the non-root uid baked into the image (65532).
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+# The pipeline configuration (Logstash .conf DSL). Rendered into a ConfigMap
+# and mounted at /etc/ferro-stash/pipeline.conf. Replace with your pipeline.
+pipelineConf: |
+  input {
+    beats {
+      port => 5044
+    }
+  }
+
+  filter {
+    grok {
+      match => { "message" => "%{COMBINEDAPACHELOG}" }
+    }
+    date {
+      match => ["timestamp", "dd/MMM/yyyy:HH:mm:ss Z"]
+    }
+  }
+
+  output {
+    stdout {
+      codec => "json"
+    }
+  }
+
+# Persistent state directory (path.data: per-instance lock, uuid, queues, DLQ).
+persistence:
+  enabled: false
+  # storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+  size: 1Gi
+  # Used only when persistence.enabled is false.
+  emptyDir: {}
+
+# Optional GeoIP database (.mmdb) for the geoip filter. Provide it via an
+# existing Secret (key -> file) mounted read-only into the config dir.
+geoip:
+  enabled: false
+  # Name of a Secret containing the .mmdb file.
+  existingSecret: ""
+  # Key inside the Secret and the filename it is mounted as.
+  secretKey: GeoLite2-City.mmdb
+  mountPath: /etc/ferro-stash/GeoLite2-City.mmdb
+
+# Extra environment variables for the container.
+env: []
+#  - name: RUST_LOG
+#    value: info
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
