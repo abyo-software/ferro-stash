@@ -14,6 +14,16 @@
 //! (`/etc/resolv.conf`) is used; if the `nameserver` config option is set the
 //! filter resolves against that server (UDP/53) instead.
 //!
+//! An explicitly-configured `nameserver` is **validated at config time**
+//! ([`DnsFilter::from_config`]): an unparseable address is a hard config error
+//! ([`FerroStashError::Filter`]) that fails the pipeline loudly at startup.
+//! This is deliberate — silently falling back to the system resolver when an
+//! operator asked for a specific (often *internal*) nameserver would leak the
+//! hostnames they intended to keep on the internal resolver to whatever
+//! `/etc/resolv.conf` points at, and resolve them differently. The
+//! system-resolver path is therefore taken **only** when no `nameserver` is
+//! configured at all.
+//!
 //! Each lookup is also bounded in latency (see [`LOOKUP_TIMEOUT`]): the resolver
 //! is built with a tight per-attempt timeout / single attempt, and every lookup
 //! is additionally wrapped in a hard `tokio::time::timeout`. This prevents a
@@ -29,7 +39,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use ferro_stash_core::condition::Condition;
-use ferro_stash_core::error::Result;
+use ferro_stash_core::error::{FerroStashError, Result};
 use ferro_stash_core::event::{Event, EventValue};
 use ferro_stash_core::plugin::FilterPlugin;
 use hickory_resolver::TokioResolver;
@@ -66,9 +76,14 @@ pub struct DnsFilter {
     reverse: Vec<String>,
     /// Action to take with the result.
     action: DnsAction,
-    /// Custom nameserver to resolve against (e.g. `8.8.8.8`). When `None` the
-    /// system resolver configuration is used.
-    nameserver: Option<String>,
+    /// Custom nameserver to resolve against (e.g. `8.8.8.8`). The address is
+    /// validated/parsed at config time ([`Self::from_config`]), so `Some` means
+    /// an operator explicitly chose this server and it is known-parseable.
+    /// `None` means no nameserver was configured → the system resolver is used.
+    /// This is the only signal that drives the resolver build; there is no
+    /// silent fall-through from a configured-but-bad nameserver to the system
+    /// resolver.
+    nameserver: Option<IpAddr>,
     /// Whether to add a tag on failure.
     tag_on_failure: String,
     /// Lazily-built, reused resolver. Only a *successful* build is memoized
@@ -106,10 +121,23 @@ impl DnsFilter {
             _ => DnsAction::Replace,
         };
 
-        let nameserver = settings
-            .get("nameserver")
-            .and_then(|v| v.as_str())
-            .map(String::from);
+        // Validate an explicitly-configured nameserver at config time. An
+        // operator who names a specific resolver (commonly an *internal* one)
+        // must NOT silently fall through to the system resolver if the value is
+        // unusable — that would leak the very hostnames they intended to keep on
+        // the internal resolver and resolve them differently. So an unparseable
+        // nameserver is a hard, loud startup error rather than a warn-and-ignore.
+        let nameserver = match settings.get("nameserver").and_then(|v| v.as_str()) {
+            Some(ns) => Some(ns.parse::<IpAddr>().map_err(|e| FerroStashError::Filter {
+                plugin: "dns".to_string(),
+                message: format!(
+                    "invalid `nameserver` {ns:?}: {e}. Provide a valid IP address \
+                     (e.g. \"8.8.8.8\" or \"2001:4860:4860::8888\"), or omit \
+                     `nameserver` to use the system resolver (/etc/resolv.conf)."
+                ),
+            })?),
+            None => None,
+        };
 
         let tag_on_failure = settings
             .get("tag_on_failure")
@@ -128,36 +156,31 @@ impl DnsFilter {
         })
     }
 
-    /// Build the resolver. Honors a custom `nameserver` (UDP/53) if configured,
-    /// otherwise reads the system configuration. Returns `Err` only when the
-    /// build genuinely fails (e.g. unreadable `/etc/resolv.conf`); the error is
-    /// surfaced to the caller so a *transient* failure is not memoized.
+    /// Build the resolver. Honors the explicitly-configured `nameserver`
+    /// (UDP/53) if one was set, otherwise reads the system configuration.
+    /// Returns `Err` only when the build genuinely fails (e.g. unreadable
+    /// `/etc/resolv.conf` on the system path); the error is surfaced to the
+    /// caller so a *transient* failure is not memoized.
+    ///
+    /// Note there is **no** silent fall-through from a configured nameserver to
+    /// the system resolver: the address was already validated in
+    /// [`Self::from_config`], so [`Self::nameserver`] being `Some` means an
+    /// operator-chosen server, and being `None` means none was configured.
     ///
     /// The resulting resolver always uses the bounded options from
-    /// [`Self::bounded_options`] so no single lookup can exhaust hickory's
+    /// [`Self::apply_bounded_options`] so no single lookup can exhaust hickory's
     /// default ~10s budget.
     fn build_resolver(&self) -> std::result::Result<TokioResolver, String> {
         let provider = TokioConnectionProvider::default();
-        if let Some(ns) = &self.nameserver {
-            match ns.parse::<IpAddr>() {
-                Ok(ip) => {
-                    let group = NameServerConfigGroup::from_ips_clear(&[ip], 53, true);
-                    let config = ResolverConfig::from_parts(None, Vec::new(), group);
-                    let mut builder = TokioResolver::builder_with_config(config, provider);
-                    self.apply_bounded_options(builder.options_mut());
-                    Ok(builder.build())
-                }
-                Err(e) => {
-                    warn!(
-                        nameserver = %ns,
-                        error = %e,
-                        "dns: invalid nameserver address; falling back to system resolver"
-                    );
-                    self.build_system_resolver(provider)
-                }
+        match self.nameserver {
+            Some(ip) => {
+                let group = NameServerConfigGroup::from_ips_clear(&[ip], 53, true);
+                let config = ResolverConfig::from_parts(None, Vec::new(), group);
+                let mut builder = TokioResolver::builder_with_config(config, provider);
+                self.apply_bounded_options(builder.options_mut());
+                Ok(builder.build())
             }
-        } else {
-            self.build_system_resolver(provider)
+            None => self.build_system_resolver(provider),
         }
     }
 
@@ -351,7 +374,64 @@ mod tests {
         });
         let filter = DnsFilter::from_config(&settings, None).expect("config");
         assert_eq!(filter.action, DnsAction::Append);
-        assert_eq!(filter.nameserver, Some("8.8.8.8".to_string()));
+        assert_eq!(
+            filter.nameserver,
+            Some("8.8.8.8".parse::<IpAddr>().expect("valid v4"))
+        );
+    }
+
+    #[test]
+    fn test_dns_invalid_nameserver_rejected_at_config_time() {
+        // Finding (DD R5): an explicitly-configured but unparseable `nameserver`
+        // must NOT silently fall back to the system resolver (an internal-name
+        // leak / wrong-answer risk). It is a hard config error at startup.
+        let settings = serde_json::json!({
+            "resolve": ["host"],
+            "nameserver": "not-an-ip"
+        });
+        let err = DnsFilter::from_config(&settings, None)
+            .expect_err("invalid nameserver must be rejected at config time");
+        match err {
+            FerroStashError::Filter { plugin, message } => {
+                assert_eq!(plugin, "dns");
+                assert!(
+                    message.contains("nameserver"),
+                    "error should explain the bad nameserver: {message}"
+                );
+            }
+            other => panic!("expected FerroStashError::Filter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_dns_valid_nameserver_parsed_at_config_time() {
+        // A valid nameserver (v4 or v6) parses to the IP that drives the build —
+        // and it never routes through the system resolver.
+        let v4 = DnsFilter::from_config(&serde_json::json!({ "nameserver": "8.8.8.8" }), None)
+            .expect("valid v4 nameserver");
+        assert_eq!(
+            v4.nameserver,
+            Some("8.8.8.8".parse::<IpAddr>().expect("v4"))
+        );
+
+        let v6 = DnsFilter::from_config(
+            &serde_json::json!({ "nameserver": "2001:4860:4860::8888" }),
+            None,
+        )
+        .expect("valid v6 nameserver");
+        assert_eq!(
+            v6.nameserver,
+            Some("2001:4860:4860::8888".parse::<IpAddr>().expect("v6"))
+        );
+    }
+
+    #[test]
+    fn test_dns_no_nameserver_uses_system_resolver() {
+        // No nameserver configured => system resolver path (nameserver None).
+        // This is the ONLY case in which the system resolver is used.
+        let filter = DnsFilter::from_config(&serde_json::json!({ "resolve": ["host"] }), None)
+            .expect("config without nameserver");
+        assert_eq!(filter.nameserver, None);
     }
 
     #[tokio::test]

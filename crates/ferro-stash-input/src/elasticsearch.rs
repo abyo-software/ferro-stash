@@ -58,7 +58,7 @@ impl std::fmt::Debug for ElasticsearchInput {
 
 impl ElasticsearchInput {
     pub fn from_config(settings: &serde_json::Value) -> Result<Self> {
-        let hosts = settings
+        let hosts: Vec<String> = settings
             .get("hosts")
             .and_then(|v| v.as_array())
             .map_or_else(
@@ -69,6 +69,19 @@ impl ElasticsearchInput {
                         .collect()
                 },
             );
+        // A configured-but-empty `hosts` array (or an array of non-strings) must
+        // be rejected here. `next_host()` indexes `self.hosts[0]`, so an empty
+        // vector would panic on the first poll. The localhost default only
+        // applies when the key is ABSENT (handled by `map_or_else` above); once
+        // the key is present we honor it strictly and fail loudly rather than
+        // silently substituting a default. Mirrors the kafka input's
+        // `bootstrap_servers must contain at least one broker` check.
+        if hosts.is_empty() {
+            return Err(FerroStashError::Input {
+                plugin: "elasticsearch".to_string(),
+                message: "hosts must contain at least one URL string".to_string(),
+            });
+        }
         let index = settings
             .get("index")
             .and_then(|v| v.as_str())
@@ -560,6 +573,33 @@ mod tests {
         });
         let input = ElasticsearchInput::from_config(&settings).expect("config");
         assert_eq!(input.next_host(), "http://host1:9200");
+    }
+
+    #[test]
+    fn test_es_input_empty_hosts_array_rejected() {
+        // Round-5 Finding #3: a configured-but-empty `hosts` array must be
+        // rejected at config time. Previously this produced an empty
+        // `self.hosts`, and `next_host()` (`&self.hosts[0]`) panicked on the
+        // first poll. The localhost default applies only when the key is absent.
+        let settings = serde_json::json!({ "hosts": [] });
+        let err = ElasticsearchInput::from_config(&settings)
+            .expect_err("empty hosts array must be rejected");
+        assert!(
+            matches!(err, FerroStashError::Input { ref plugin, .. } if plugin == "elasticsearch"),
+            "expected elasticsearch Input error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_es_input_hosts_array_of_non_strings_rejected() {
+        // An array containing only non-string values collects to an empty
+        // `hosts` vector and must likewise be rejected (not silently
+        // defaulted), since the key is present.
+        let settings = serde_json::json!({ "hosts": [123, true, null] });
+        assert!(
+            ElasticsearchInput::from_config(&settings).is_err(),
+            "hosts array with no usable string entries must be rejected"
+        );
     }
 
     #[test]

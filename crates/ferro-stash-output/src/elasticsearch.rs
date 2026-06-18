@@ -76,14 +76,27 @@ enum BulkAction {
 
 impl ElasticsearchOutput {
     pub fn from_config(settings: &serde_json::Value, condition: Option<Condition>) -> Result<Self> {
-        let hosts = match settings.get("hosts") {
+        let hosts: Vec<String> = match settings.get("hosts") {
             Some(serde_json::Value::Array(a)) => a
                 .iter()
                 .filter_map(|v| v.as_str().map(String::from))
                 .collect(),
             Some(serde_json::Value::String(s)) => vec![s.clone()],
+            // Not configured at all => default host (preserves prior behavior).
             _ => vec!["http://localhost:9200".to_string()],
         };
+        // A configured-but-empty `hosts` (e.g. `hosts => []` or an array of
+        // non-strings like `hosts => [9200]`) collects to an empty vec. Reject
+        // it at config time — otherwise the first `output()` call would panic in
+        // `next_host()` via `idx % self.hosts.len()` (divide-by-zero) and the
+        // out-of-bounds index. Mirrors the kafka output's `bootstrap_servers`
+        // contract: fail loudly at config time rather than at runtime.
+        if hosts.is_empty() {
+            return Err(FerroStashError::Output {
+                plugin: "elasticsearch".to_string(),
+                message: "hosts is empty (configure at least one host URL)".to_string(),
+            });
+        }
 
         let index = settings
             .get("index")
@@ -684,5 +697,24 @@ mod tests {
         });
         let output = ElasticsearchOutput::from_config(&settings, None).expect("config");
         assert_eq!(output.hosts, vec!["http://single:9200"]);
+    }
+
+    #[test]
+    fn test_config_empty_hosts_array_rejected() {
+        // A configured-but-empty `hosts` array must be rejected at config time
+        // rather than panicking at runtime in `next_host()` (`% 0` /
+        // out-of-bounds). A non-string array (which also collects to empty) must
+        // be rejected the same way.
+        let empty = serde_json::json!({ "hosts": [], "index": "test" });
+        assert!(
+            ElasticsearchOutput::from_config(&empty, None).is_err(),
+            "empty hosts array must be rejected at config time"
+        );
+
+        let non_strings = serde_json::json!({ "hosts": [9200], "index": "test" });
+        assert!(
+            ElasticsearchOutput::from_config(&non_strings, None).is_err(),
+            "array of non-strings collects to empty and must be rejected"
+        );
     }
 }

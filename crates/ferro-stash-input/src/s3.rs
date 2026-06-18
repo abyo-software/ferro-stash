@@ -40,7 +40,24 @@ pub struct S3InputConfig {
     /// empty object when the codec is named without a settings block.
     pub codec_settings: serde_json::Value,
     pub delete_after_read: bool,
+    /// Maximum object size (bytes) that will be fetched and decoded. Objects
+    /// whose `ListObjectsV2`-reported size exceeds this are skipped (logged and
+    /// marked seen) rather than streamed into memory — `GetObject` buffers the
+    /// whole body, so a multi-GB object would otherwise OOM the process.
+    /// Default is [`DEFAULT_MAX_OBJECT_SIZE`] (100 MB). Oversized objects are
+    /// SKIPPED, never truncated.
+    pub max_object_size: u64,
 }
+
+/// Default `max_object_size`: 100 MB (100_000_000 bytes). Objects larger than
+/// this are skipped to bound memory use, since `GetObject` reads the entire
+/// body into memory before decoding.
+pub const DEFAULT_MAX_OBJECT_SIZE: u64 = 100_000_000;
+
+/// Minimum poll interval (seconds). A configured `interval` below this is
+/// clamped up to avoid a tight polling loop that hammers S3 (retry storm,
+/// throttling, cost) when the prefix is small or the list call errors.
+pub const MIN_POLL_INTERVAL_SECS: u64 = 1;
 
 // Manual Debug to avoid leaking `secret_access_key` into logs / error context.
 impl std::fmt::Debug for S3InputConfig {
@@ -58,6 +75,7 @@ impl std::fmt::Debug for S3InputConfig {
             .field("codec", &self.codec)
             .field("codec_settings", &self.codec_settings)
             .field("delete_after_read", &self.delete_after_read)
+            .field("max_object_size", &self.max_object_size)
             .finish()
     }
 }
@@ -84,11 +102,21 @@ impl S3Input {
             .unwrap_or_else(|| "us-east-1".to_string());
         let access_key_id = settings.get_string("access_key_id");
         let secret_access_key = settings.get_string("secret_access_key");
-        let interval = settings.get_u64("interval").unwrap_or(60);
+        // Clamp the poll interval to a sane minimum. `interval => 0` would make
+        // `Duration::from_secs(0)` a no-op sleep, turning the poll loop into a
+        // tight spin against S3 (retry storm / throttling / cost) — so we floor
+        // it at `MIN_POLL_INTERVAL_SECS`.
+        let interval = settings
+            .get_u64("interval")
+            .unwrap_or(60)
+            .max(MIN_POLL_INTERVAL_SECS);
         // Resolve the codec name and its sub-settings so they are honored rather
         // than dropped.
         let (codec, codec_settings) = resolve_codec(settings, "plain");
         let delete_after_read = settings.get_bool("delete_after_read").unwrap_or(false);
+        let max_object_size = settings
+            .get_u64("max_object_size")
+            .unwrap_or(DEFAULT_MAX_OBJECT_SIZE);
 
         Ok(Self {
             config: S3InputConfig {
@@ -101,6 +129,7 @@ impl S3Input {
                 codec,
                 codec_settings,
                 delete_after_read,
+                max_object_size,
             },
             test_data: None,
         })
@@ -203,17 +232,31 @@ impl InputPlugin for S3Input {
         info!(bucket = %self.config.bucket, "S3 input connected; starting poll loop");
 
         loop {
-            // One poll cycle. On a downstream-closed signal, stop entirely.
-            if self
+            // One poll cycle. The outcome decides whether we stop, back off, or
+            // wait the normal poll interval.
+            let wait = match self
                 .poll_once(&client, codec.as_ref(), &sender, &mut seen)
                 .await
             {
-                info!("S3 input: downstream channel closed, stopping");
-                break;
-            }
+                PollOutcome::Closed => {
+                    info!("S3 input: downstream channel closed, stopping");
+                    break;
+                }
+                // A list error means we got no usable listing this cycle. Back
+                // off (the poll interval, already floored at >= 1s) before
+                // retrying instead of spinning on a persistent error.
+                PollOutcome::ListError => {
+                    debug!(
+                        backoff_secs = self.config.interval,
+                        "S3 input: poll error, backing off before retry"
+                    );
+                    poll_interval
+                }
+                PollOutcome::Polled => poll_interval,
+            };
 
             tokio::select! {
-                () = tokio::time::sleep(poll_interval) => {}
+                () = tokio::time::sleep(wait) => {}
                 () = shutdown.wait() => {
                     info!("S3 input shutting down");
                     break;
@@ -227,15 +270,16 @@ impl InputPlugin for S3Input {
 
 impl S3Input {
     /// Lists objects under the prefix, fetches/decodes/emits each new one, and
-    /// optionally deletes it. Returns `true` if the downstream channel closed
-    /// (caller should stop).
+    /// optionally deletes it. The returned [`PollOutcome`] tells the caller
+    /// whether the downstream closed (stop), the listing errored (back off), or
+    /// the cycle completed normally.
     async fn poll_once(
         &self,
         client: &Client,
         codec: &dyn Codec,
         sender: &mpsc::Sender<Event>,
         seen: &mut HashSet<String>,
-    ) -> bool {
+    ) -> PollOutcome {
         let mut continuation: Option<String> = None;
 
         loop {
@@ -251,7 +295,7 @@ impl S3Input {
                 Ok(resp) => resp,
                 Err(e) => {
                     warn!(bucket = %self.config.bucket, error = %e, "S3 ListObjectsV2 failed");
-                    return false;
+                    return PollOutcome::ListError;
                 }
             };
 
@@ -262,6 +306,23 @@ impl S3Input {
                     continue;
                 }
                 let key = key.to_string();
+
+                // Guard against unbounded buffering: `GetObject` reads the whole
+                // body into memory, so before fetching we consult the
+                // list-reported size. An object over `max_object_size` is logged,
+                // marked `seen` (so it is not retried on every poll forever), and
+                // skipped — never truncated.
+                if Self::is_oversized(object.size(), self.config.max_object_size) {
+                    warn!(
+                        bucket = %self.config.bucket,
+                        key = %key,
+                        size = object.size().unwrap_or_default(),
+                        limit = self.config.max_object_size,
+                        "S3 object exceeds max_object_size; skipping (not truncated)"
+                    );
+                    Self::record_emitted(seen, &key);
+                    continue;
+                }
 
                 match self.fetch_and_emit(client, codec, sender, &key).await {
                     FetchResult::Emitted => {
@@ -290,7 +351,7 @@ impl S3Input {
                     FetchResult::Skipped => {
                         // Transient fetch/decode error — leave unseen to retry next cycle.
                     }
-                    FetchResult::ChannelClosed => return true,
+                    FetchResult::ChannelClosed => return PollOutcome::Closed,
                 }
             }
 
@@ -305,7 +366,7 @@ impl S3Input {
             }
         }
 
-        false
+        PollOutcome::Polled
     }
 
     /// Fetches a single object, decodes it, and emits the events.
@@ -363,6 +424,21 @@ impl S3Input {
         FetchResult::Emitted
     }
 
+    /// Decides whether an object should be skipped for exceeding the size cap,
+    /// given its `ListObjectsV2`-reported size and the configured `limit`.
+    ///
+    /// A known size strictly greater than `limit` is oversized. A `None`/missing
+    /// or negative size is treated as **not** oversized here — the list-size
+    /// check is the primary defense; an unknown size still proceeds to
+    /// `GetObject` (the `Skipped` path handles fetch/decode errors). Extracted as
+    /// a pure function so the decision is unit-testable without any AWS calls.
+    fn is_oversized(size: Option<i64>, limit: u64) -> bool {
+        match size {
+            Some(sz) if sz >= 0 => (sz as u64) > limit,
+            _ => false,
+        }
+    }
+
     /// Records a successfully-emitted object's key as `seen`.
     ///
     /// This is the single point that enforces the **emitted-once ⇒ seen**
@@ -411,6 +487,17 @@ fn s3_metadata(bucket: &str, key: Option<&str>) -> EventValue {
         obj.insert("key".to_string(), serde_json::Value::String(key.to_string()));
     }
     EventValue::from(serde_json::Value::Object(obj))
+}
+
+/// Outcome of a single poll cycle (`poll_once`), driving the run loop's wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PollOutcome {
+    /// The cycle completed (possibly emitting events); wait the poll interval.
+    Polled,
+    /// `ListObjectsV2` failed; back off before retrying instead of spinning.
+    ListError,
+    /// The downstream channel closed; the plugin should stop.
+    Closed,
 }
 
 /// Outcome of fetching/emitting a single S3 object.
@@ -638,6 +725,92 @@ mod tests {
             re_emitted, 0,
             "a delete failure must NOT cause the object to be re-emitted on the next poll"
         );
+    }
+
+    #[test]
+    fn test_s3_max_object_size_default() {
+        // Round-5 Finding #1: default cap is 100 MB.
+        let settings = serde_json::json!({ "bucket": "b" });
+        let input = S3Input::from_config(&settings).expect("config");
+        assert_eq!(input.config.max_object_size, DEFAULT_MAX_OBJECT_SIZE);
+        assert_eq!(input.config.max_object_size, 100_000_000);
+    }
+
+    #[test]
+    fn test_s3_max_object_size_override() {
+        let settings = serde_json::json!({ "bucket": "b", "max_object_size": 5_000_000 });
+        let input = S3Input::from_config(&settings).expect("config");
+        assert_eq!(input.config.max_object_size, 5_000_000);
+    }
+
+    #[test]
+    fn test_s3_is_oversized_decision() {
+        // Round-5 Finding #1: the pure size-decision used by `poll_once` before
+        // any `GetObject` call.
+        let limit = 1_000u64;
+        // Over the limit → skip.
+        assert!(S3Input::is_oversized(Some(1_001), limit));
+        // Exactly at / under the limit → fetch.
+        assert!(!S3Input::is_oversized(Some(1_000), limit));
+        assert!(!S3Input::is_oversized(Some(0), limit));
+        // Unknown or nonsensical size → not oversized (list-size is the primary
+        // check; `GetObject`/decode errors are handled by the `Skipped` path).
+        assert!(!S3Input::is_oversized(None, limit));
+        assert!(!S3Input::is_oversized(Some(-1), limit));
+    }
+
+    /// Round-5 Finding #1 regression: an object whose listed size exceeds
+    /// `max_object_size` must be SKIPPED (logged + marked seen) and never
+    /// fetched/emitted — guarding against multi-GB-object OOM. This drives the
+    /// exact per-object decision path used at the top of `poll_once`'s inner
+    /// loop, without any AWS calls.
+    #[test]
+    fn test_s3_oversized_object_skipped_and_marked_seen() {
+        let max_object_size = DEFAULT_MAX_OBJECT_SIZE; // 100 MB
+        let mut seen: HashSet<String> = HashSet::new();
+        let key = "logs/huge-2026-06-19.json".to_string();
+        // A 2 GB object, reported by ListObjectsV2.
+        let listed_size = Some(2_000_000_000i64);
+
+        let mut emitted = 0usize;
+        // --- Mirror the production per-object branch in `poll_once`. ---
+        if S3Input::is_oversized(listed_size, max_object_size) {
+            // Skip path: mark seen, do NOT fetch/emit.
+            S3Input::record_emitted(&mut seen, &key);
+        } else {
+            emitted += 1; // would call fetch_and_emit
+        }
+
+        assert_eq!(emitted, 0, "oversized object must not be emitted/fetched");
+        assert!(
+            seen.contains(&key),
+            "oversized object must be marked seen so it isn't retried forever"
+        );
+
+        // --- Next poll cycle: the object is still listed; the top-of-loop guard
+        // (`seen.contains(key)`) must skip it without re-evaluating size. ---
+        let mut re_emitted = 0usize;
+        if !(key.ends_with('/') || seen.contains(&key)) {
+            re_emitted += 1;
+        }
+        assert_eq!(re_emitted, 0, "oversized-and-seen object must not be retried");
+    }
+
+    #[test]
+    fn test_s3_interval_zero_clamped_to_minimum() {
+        // Round-5 Finding #2: `interval => 0` must be floored, otherwise
+        // `Duration::from_secs(0)` makes the poll loop a tight spin.
+        let settings = serde_json::json!({ "bucket": "b", "interval": 0 });
+        let input = S3Input::from_config(&settings).expect("config");
+        assert_eq!(input.config.interval, MIN_POLL_INTERVAL_SECS);
+        assert!(input.config.interval >= 1);
+    }
+
+    #[test]
+    fn test_s3_interval_above_minimum_preserved() {
+        let settings = serde_json::json!({ "bucket": "b", "interval": 30 });
+        let input = S3Input::from_config(&settings).expect("config");
+        assert_eq!(input.config.interval, 30);
     }
 
     #[tokio::test]
