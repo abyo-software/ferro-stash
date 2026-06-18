@@ -293,8 +293,16 @@ impl ElasticsearchFilter {
 
             let status = response.status();
             if !status.is_success() {
+                // Bound the logged error body: a misconfigured/compromised/
+                // proxy-fronted host could return an arbitrarily large
+                // non-2xx body. Buffering and logging it verbatim for every
+                // event hitting the filter is a log-amplification / memory-
+                // pressure vector, so we truncate to a fixed-size snippet
+                // (UTF-8-boundary-safe, with a `… (N bytes total)` marker)
+                // before emitting the warning.
                 let text = response.text().await.unwrap_or_default();
-                warn!(url = %url, status = %status, body = %text, "elasticsearch filter: non-success response");
+                let snippet = ferro_stash_core::bounded_snippet(&text, 512);
+                warn!(url = %url, status = %status, body = %snippet, "elasticsearch filter: non-success response");
                 continue;
             }
 
@@ -831,6 +839,75 @@ mod tests {
             }
         });
         (format!("http://{addr}"), rx)
+    }
+
+    /// Like [`spawn_mock_es`], but returns a non-2xx status with a caller-
+    /// supplied (potentially very large) body, so we can exercise the
+    /// error-body bounding path. Returns the host URL.
+    fn spawn_mock_es_error(status_line: &'static str, body: String) -> String {
+        let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                // Drain the request (best-effort).
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let resp = format!(
+                    "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// Regression for the DD finding: a misconfigured/hostile ES host that
+    /// returns a *very large* non-2xx body must not be buffered+logged
+    /// verbatim. The filter must still fail over gracefully (apply
+    /// `tag_on_failure`), and the snippet we log is bounded by the shared
+    /// `bounded_snippet(.., 512)` helper — verified here to truncate the same
+    /// oversized body to 512 bytes with the `… (N bytes total)` marker.
+    #[tokio::test]
+    async fn test_large_error_body_is_bounded_and_fails_over() {
+        // A 100 KiB error body — far larger than the 512-byte log bound.
+        let huge = "E".repeat(100 * 1024);
+        let host = spawn_mock_es_error("HTTP/1.1 500 Internal Server Error", huge.clone());
+        let settings = serde_json::json!({
+            "hosts": [host],
+            "index": "users",
+            "timeout": 5
+        });
+        let filter = ElasticsearchFilter::from_config(&settings, None).expect("config");
+        // Non-2xx on the only host => failover exhausts => failure tag applied.
+        let result = filter.filter(Event::new("test")).await.expect("filter");
+        assert!(
+            result[0].has_tag("_elasticsearch_lookup_failure"),
+            "non-2xx response must still tag failure"
+        );
+
+        // The exact snippet the warn! line emits is bounded: it is the first
+        // 512 bytes of the body plus the truncation marker, NOT the full body.
+        let snippet = ferro_stash_core::bounded_snippet(&huge, 512);
+        assert!(
+            snippet.len() < huge.len(),
+            "snippet must be smaller than the raw body"
+        );
+        assert!(
+            snippet.starts_with(&"E".repeat(512)),
+            "snippet keeps the leading bytes"
+        );
+        assert!(
+            snippet.contains(&format!("({} bytes total)", huge.len())),
+            "snippet carries the truncation marker with the true total size: {snippet}"
+        );
+        // Critically, the full body is never reproduced in what we log.
+        assert!(
+            !snippet.contains(&"E".repeat(513)),
+            "snippet must not contain more than the 512-byte bound of body content"
+        );
     }
 
     /// End-to-end (d): a field value carrying an injection payload is sent to ES

@@ -10,6 +10,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
+use ferro_stash_core::bounded_snippet;
 use ferro_stash_core::error::{FerroStashError, Result};
 use ferro_stash_core::event::{Event, EventValue};
 use ferro_stash_core::plugin::InputPlugin;
@@ -485,20 +486,6 @@ async fn es_status_error(
     }
 }
 
-/// Truncate `body` to at most `limit` bytes (on a UTF-8 char boundary),
-/// appending a `…` marker when truncation occurs.
-fn bounded_snippet(body: &str, limit: usize) -> String {
-    if body.len() <= limit {
-        return body.to_string();
-    }
-    // Walk back to a char boundary so we never split a multi-byte sequence.
-    let mut end = limit;
-    while end > 0 && !body.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}… ({} bytes total)", &body[..end], body.len())
-}
-
 /// Parse a schedule string into a polling interval in seconds, clamped to a
 /// minimum of 1.
 ///
@@ -798,33 +785,6 @@ mod tests {
         assert!(validate_schedule("30").is_ok());
         // Unparseable strings fall back to the default and are not rejected.
         assert!(validate_schedule("garbage").is_ok());
-    }
-
-    // ---- DD round-6 Finding #1: bounded snippet helper ----
-
-    #[test]
-    fn test_bounded_snippet_short_body_unchanged() {
-        assert_eq!(bounded_snippet("short body", 512), "short body");
-    }
-
-    #[test]
-    fn test_bounded_snippet_truncates_long_body() {
-        let body = "x".repeat(1000);
-        let snippet = bounded_snippet(&body, 512);
-        assert!(snippet.starts_with(&"x".repeat(512)));
-        assert!(snippet.contains("1000 bytes total"));
-        // Bounded: snippet is the 512 prefix + a short suffix marker.
-        assert!(snippet.len() < 1000);
-    }
-
-    #[test]
-    fn test_bounded_snippet_respects_char_boundary() {
-        // Multi-byte chars must not be split mid-sequence (would panic on a
-        // non-boundary slice). Each `あ` is 3 bytes; limit 4 falls mid-char.
-        let body = "あああ"; // 9 bytes
-        let snippet = bounded_snippet(body, 4);
-        assert!(snippet.starts_with("あ"));
-        assert!(snippet.contains("9 bytes total"));
     }
 
     // ---- DD round-6 Finding #1: non-2xx HTTP responses must error ----

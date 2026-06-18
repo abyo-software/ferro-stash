@@ -21,6 +21,14 @@ use ferro_stash_core::multi_pipeline::PipelineBus;
 use ferro_stash_core::plugin::OutputPlugin;
 use tokio::sync::RwLock;
 
+/// Maximum number of bytes of an HTTP error-response body that is read into a
+/// log line or error message on a diagnostic/failure path.
+///
+/// Bounds the body via [`ferro_stash_core::bounded_snippet`] so a
+/// misconfigured/hostile/proxy-fronted endpoint returning a huge error body
+/// cannot amplify logs or pressure memory per request/retry.
+pub(crate) const ERROR_BODY_SNIPPET_LIMIT: usize = 512;
+
 /// Creates an output plugin by name.
 pub fn create_output(
     name: &str,

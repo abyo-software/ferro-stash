@@ -7,6 +7,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
+use ferro_stash_core::bounded_snippet;
 use ferro_stash_core::condition::Condition;
 use ferro_stash_core::error::{FerroStashError, Result};
 use ferro_stash_core::event::Event;
@@ -155,7 +156,10 @@ impl DatadogOutput {
                     }
 
                     let retriable = status.is_server_error() || status.as_u16() == 429;
-                    let body = resp.text().await.unwrap_or_default();
+                    let body = bounded_snippet(
+                        &resp.text().await.unwrap_or_default(),
+                        crate::ERROR_BODY_SNIPPET_LIMIT,
+                    );
                     warn!(status = %status, attempt, body = %body, "Datadog log intake error");
                     last_error = Some(format!("HTTP {status}: {body}"));
                     if !retriable {

@@ -9,6 +9,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
+use ferro_stash_core::bounded_snippet;
 use ferro_stash_core::condition::Condition;
 use ferro_stash_core::error::{FerroStashError, Result};
 use ferro_stash_core::event::Event;
@@ -342,7 +343,10 @@ impl OutputPlugin for ElasticsearchOutput {
                         last_err = Some(format!("HTTP {status}"));
                         continue;
                     } else {
-                        let body_text = response.text().await.unwrap_or_default();
+                        let body_text = bounded_snippet(
+                            &response.text().await.unwrap_or_default(),
+                            crate::ERROR_BODY_SNIPPET_LIMIT,
+                        );
                         error!(status = %status, body = %body_text, "bulk request failed");
                         return Err(FerroStashError::Output {
                             plugin: "elasticsearch".to_string(),
@@ -653,6 +657,55 @@ mod tests {
         let output = ElasticsearchOutput::from_config(&settings, None).expect("config");
         let result = output.output(vec![]).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_bulk_error_body_is_bounded() {
+        // Regression: a non-2xx bulk response with a huge error body must not be
+        // read/logged/returned unbounded. The diagnostic body is truncated via
+        // `bounded_snippet`, so the returned error message stays capped and
+        // carries the `bytes total` truncation marker.
+        let huge_len = crate::ERROR_BODY_SNIPPET_LIMIT * 8;
+        let huge_body = "E".repeat(huge_len);
+        let huge_for_handler = huge_body.clone();
+        let app = Router::new().route(
+            "/_bulk",
+            post(move || {
+                let huge = huge_for_handler.clone();
+                async move { (axum::http::StatusCode::BAD_REQUEST, huge) }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+
+        let settings = serde_json::json!({
+            "hosts": [format!("http://{addr}")],
+            "index": "test"
+        });
+        let output = ElasticsearchOutput::from_config(&settings, None).expect("config");
+        let result = output.output(vec![Event::new("hello")]).await;
+
+        let err = result.expect_err("non-2xx bulk response must fail output");
+        let message = err.to_string();
+        // The full body would be 8x the limit; the message must be far smaller.
+        assert!(
+            message.len() < huge_len,
+            "error message must not embed the unbounded body (len {})",
+            message.len()
+        );
+        // The bounded snippet is at most the limit of body bytes plus marker.
+        assert!(
+            message.contains(&format!("{huge_len} bytes total")),
+            "error message must carry the truncation marker: {message}"
+        );
+        // No unbounded run: the verbatim body must not appear in full.
+        assert!(
+            !message.contains(&huge_body),
+            "error message must not contain the full body verbatim"
+        );
     }
 
     #[tokio::test]
