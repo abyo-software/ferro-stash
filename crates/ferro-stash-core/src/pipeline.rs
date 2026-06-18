@@ -2,6 +2,7 @@
 //! Pipeline engine — orchestrates input → filter → output flow.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
@@ -210,10 +211,16 @@ impl Pipeline {
         let pq = self.persistent_queue;
         let dlq = self.dead_letter_queue.clone();
 
+        // Channel capacity is derived from the unvalidated `max_events` config
+        // (`pipeline.buffer_size`, a `usize`). `tokio::sync::mpsc::channel` asserts
+        // `buffer > 0` and PANICS on a zero capacity, so a `buffer_size: 0` config
+        // would panic the pipeline at startup. Clamp to >=1 (same zero-config class
+        // as the output flush interval and the PQ/DLQ modulo clamps).
+        let cap = buffer_config.max_events.max(1);
         // Input → Filter channel
-        let (input_tx, input_rx) = mpsc::channel::<Event>(buffer_config.max_events);
+        let (input_tx, input_rx) = mpsc::channel::<Event>(cap);
         // Filter → Output channel
-        let (output_tx, output_rx) = mpsc::channel::<Event>(buffer_config.max_events);
+        let (output_tx, output_rx) = mpsc::channel::<Event>(cap);
 
         // Spawn input tasks
         // When a persistent queue is enabled, inputs write to PQ first.
@@ -257,37 +264,27 @@ impl Pipeline {
             input_handles.push(handle);
         }
 
-        // PQ drainer: reads persisted events and sends them to the filter channel
+        // PQ drainer: reads persisted events and sends them to the filter channel.
+        //
+        // The drainer owns a CLONE of `input_tx`. In auto-exit mode the pipeline
+        // signals completion by dropping the ORIGINAL `input_tx` once finite inputs
+        // finish; but the drainer's clone would otherwise keep the filter channel
+        // open forever while it loops over an empty PQ, so the filter workers would
+        // block in `recv()` and the pipeline would never terminate. To avoid that
+        // hang we hand the drainer an `inputs_done` flag: once it is set AND the PQ
+        // is empty, the drainer drains-then-exits, dropping its `input_tx` clone so
+        // the filter workers see channel-closed. In non-auto-exit (long-running)
+        // mode the flag is never set, preserving the previous shutdown-only behavior.
+        let inputs_done = Arc::new(AtomicBool::new(false));
+        let mut drainer_handle = None;
         if let Some(ref pq_handle) = pq {
             let pq_drain = pq_handle.clone();
             let tx = input_tx.clone();
             let sig = shutdown.clone();
-            tokio::spawn(async move {
-                loop {
-                    if sig.is_shutdown() {
-                        break;
-                    }
-                    match pq_drain.pop() {
-                        Ok(Some(event)) => {
-                            if tx.send(event).await.is_err() {
-                                break;
-                            }
-                        }
-                        Ok(None) => {
-                            // No events in PQ, wait briefly
-                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "PQ drain error");
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                        }
-                    }
-                }
-                // Checkpoint on exit
-                if let Err(e) = pq_drain.checkpoint() {
-                    warn!(error = %e, "PQ checkpoint error on shutdown");
-                }
-            });
+            let done_flag = Arc::clone(&inputs_done);
+            drainer_handle = Some(tokio::spawn(async move {
+                run_pq_drainer(pq_drain, tx, sig, done_flag).await;
+            }));
         }
 
         // Keep input_tx alive — don't close the channel yet.
@@ -371,8 +368,23 @@ impl Pipeline {
             }
         }
 
-        // Now close the input channel to drain filters/outputs
+        // Inputs (and any PQ writer) are done. Signal the drainer so that, once
+        // the PQ is empty, it drains-then-exits and drops its `input_tx` clone.
+        // Without this, the drainer's clone keeps the filter channel open forever
+        // in auto-exit mode and the pipeline never terminates. We reach this point
+        // either after a shutdown signal (drainer already stopping) or after finite
+        // inputs completed (auto-exit), so flagging inputs-done here is always safe.
+        inputs_done.store(true, Ordering::SeqCst);
+
+        // Now close the input channel to drain filters/outputs.
         drop(input_tx);
+
+        // Await the PQ drainer so its `input_tx` clone is dropped before we wait on
+        // the filter workers — otherwise the workers would block on a channel the
+        // drainer still holds open.
+        if let Some(handle) = drainer_handle {
+            let _ = handle.await;
+        }
 
         // Wait for filter and output workers to drain
         for handle in filter_handles {
@@ -391,6 +403,58 @@ impl Pipeline {
         );
 
         Ok(())
+    }
+}
+
+/// Drains a persistent queue into the filter channel until shutdown or, in
+/// auto-exit mode, until inputs are done and the PQ is fully drained.
+///
+/// Stop conditions, in priority order:
+/// 1. Shutdown requested (`sig.is_shutdown()`) — exit immediately (after the
+///    in-flight checkpoint), matching the previous behavior.
+/// 2. The downstream channel is closed (`tx.send` errors) — nothing left to
+///    feed; exit.
+/// 3. `inputs_done` is set AND the PQ yields no more events — drain-then-exit:
+///    the loop keeps popping while events remain and only exits once the queue
+///    is observed empty, so PQ-buffered events are NOT dropped on the way out.
+///
+/// When `inputs_done` is never set (long-running, non-auto-exit pipelines), the
+/// drainer keeps polling the empty PQ until shutdown, preserving prior behavior.
+async fn run_pq_drainer(
+    pq_drain: SharedPersistentQueue,
+    tx: mpsc::Sender<Event>,
+    sig: ShutdownSignal,
+    inputs_done: Arc<AtomicBool>,
+) {
+    loop {
+        if sig.is_shutdown() {
+            break;
+        }
+        match pq_drain.pop() {
+            Ok(Some(event)) => {
+                if tx.send(event).await.is_err() {
+                    break;
+                }
+            }
+            Ok(None) => {
+                // PQ is currently empty. If inputs are done, no more events can
+                // ever arrive, so drain-then-exit (we already popped until empty
+                // above, so it is safe to leave now without dropping events).
+                if inputs_done.load(Ordering::SeqCst) {
+                    break;
+                }
+                // Otherwise wait briefly for new persisted events.
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            Err(e) => {
+                warn!(error = %e, "PQ drain error");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+    }
+    // Checkpoint on exit
+    if let Err(e) = pq_drain.checkpoint() {
+        warn!(error = %e, "PQ checkpoint error on shutdown");
     }
 }
 
@@ -624,6 +688,49 @@ async fn send_batch(
 mod tests {
     use super::*;
     use crate::shutdown::ShutdownController;
+    use std::sync::atomic::AtomicUsize;
+
+    /// A finite input that emits `count` events then returns (completes).
+    #[derive(Debug)]
+    struct FiniteInput {
+        count: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl InputPlugin for FiniteInput {
+        fn name(&self) -> &str {
+            "finite"
+        }
+        async fn run(
+            &mut self,
+            sender: mpsc::Sender<Event>,
+            _shutdown: ShutdownSignal,
+        ) -> Result<()> {
+            for i in 0..self.count {
+                if sender.send(Event::new(format!("ev-{i}"))).await.is_err() {
+                    break;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// An output that counts every event it receives.
+    #[derive(Debug)]
+    struct CountingOutput {
+        seen: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl OutputPlugin for CountingOutput {
+        fn name(&self) -> &str {
+            "counting"
+        }
+        async fn output(&self, events: Vec<Event>) -> Result<()> {
+            self.seen.fetch_add(events.len(), Ordering::SeqCst);
+            Ok(())
+        }
+    }
 
     #[tokio::test]
     async fn test_pipeline_config_default() {
@@ -864,5 +971,114 @@ mod tests {
             );
             pq.close().expect("close recovered pipeline");
         }
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_zero_buffer_size_does_not_panic() {
+        // A `pipeline.buffer_size: 0` config yields `max_events: 0`. The channel
+        // construction in `run` would panic (`mpsc::channel` asserts buffer > 0)
+        // without the `.max(1)` clamp. With an immediate shutdown and no inputs,
+        // the pipeline must start, clamp the capacity, and stop cleanly.
+        let config = PipelineConfig {
+            buffer: crate::buffer::BufferConfig {
+                max_events: 0,
+                ..crate::buffer::BufferConfig::default()
+            },
+            ..PipelineConfig::default()
+        };
+        let pipeline = Pipeline::new(config);
+        let (controller, signal) = ShutdownController::new();
+        controller.shutdown();
+        let result = pipeline.run(signal).await;
+        assert!(result.is_ok(), "zero buffer_size must not panic the pipeline");
+    }
+
+    #[tokio::test]
+    async fn test_pq_drainer_stops_on_inputs_done_after_draining() {
+        // Isolated drainer lifecycle test: the drainer must drain ALL persisted
+        // events first, then exit once `inputs_done` is set and the PQ is empty
+        // (drain-then-exit, not exit-immediately, so no events are dropped).
+        let dir = tempfile::tempdir().expect("tempdir for drainer test");
+        let pq_path = dir.path().to_string_lossy().to_string();
+        let pq = SharedPersistentQueue::new(pq_path, 1_073_741_824).expect("open PQ");
+
+        // Pre-load 25 events.
+        for i in 0..25 {
+            pq.push(&Event::new(format!("drain-{i}"))).expect("push");
+        }
+
+        let (tx, mut rx) = mpsc::channel::<Event>(64);
+        let (_controller, signal) = ShutdownController::new();
+        let inputs_done = Arc::new(AtomicBool::new(false));
+
+        // Signal inputs-done up front: there is no live producer, so the drainer
+        // should drain the 25 buffered events and then exit on observed-empty.
+        inputs_done.store(true, Ordering::SeqCst);
+
+        let drainer = tokio::spawn(run_pq_drainer(
+            pq.clone(),
+            tx,
+            signal,
+            Arc::clone(&inputs_done),
+        ));
+
+        // The drainer must terminate (its tx clone dropped) within the timeout.
+        tokio::time::timeout(std::time::Duration::from_secs(5), drainer)
+            .await
+            .expect("drainer must exit once inputs are done and PQ is drained")
+            .expect("drainer task should not panic");
+
+        // All 25 events must have been forwarded (none dropped on exit).
+        let mut received = 0;
+        while rx.recv().await.is_some() {
+            received += 1;
+        }
+        assert_eq!(received, 25, "drainer must forward every PQ event before exit");
+    }
+
+    #[tokio::test]
+    async fn test_auto_exit_pipeline_with_pq_terminates() {
+        // End-to-end regression for the drainer hang: an auto-exit pipeline with a
+        // persisted queue and a FINITE input must terminate within a timeout.
+        // Before the fix, the drainer's `input_tx` clone kept the filter channel
+        // open forever, so the filter workers blocked in `recv()` and `run` never
+        // returned.
+        let dir = tempfile::tempdir().expect("tempdir for auto-exit PQ test");
+        let pq_path = dir.path().to_string_lossy().to_string();
+
+        let config = PipelineConfig {
+            auto_exit_on_inputs_done: true,
+            workers: 2,
+            queue: QueueType::Persisted(PqConfig {
+                path: pq_path,
+                checkpoint_interval: 1,
+                ..PqConfig::default()
+            }),
+            ..PipelineConfig::default()
+        };
+        let mut pipeline = Pipeline::new(config);
+
+        let seen = Arc::new(AtomicUsize::new(0));
+        pipeline.add_input(Box::new(FiniteInput { count: 10 }));
+        pipeline.add_output(Box::new(CountingOutput {
+            seen: Arc::clone(&seen),
+        }));
+
+        let (_controller, signal) = ShutdownController::new();
+        // No shutdown is triggered: termination must come solely from inputs-done
+        // + drainer drain-then-exit, NOT from an external shutdown signal.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            pipeline.run(signal),
+        )
+        .await;
+
+        let run_result = result.expect("auto-exit + PQ pipeline must terminate without shutdown");
+        assert!(run_result.is_ok(), "pipeline run should succeed");
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            10,
+            "all 10 finite-input events should flow through PQ to the output"
+        );
     }
 }

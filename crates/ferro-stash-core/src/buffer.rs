@@ -39,7 +39,12 @@ pub struct EventBuffer {
 
 impl EventBuffer {
     pub fn new(config: BufferConfig) -> Self {
-        let (sender, receiver) = mpsc::channel(config.max_events);
+        // `max_events` is an unvalidated `usize` from config (`pipeline.buffer_size`).
+        // `tokio::sync::mpsc::channel` asserts `buffer > 0` and PANICS on a zero
+        // capacity, so a `buffer_size: 0` config would panic at construction.
+        // Clamp the divisor to >=1 (same zero-config class as the interval/modulo
+        // clamps), preserving the requested capacity for all legitimate values.
+        let (sender, receiver) = mpsc::channel(config.max_events.max(1));
         Self {
             sender,
             receiver,
@@ -215,6 +220,27 @@ mod tests {
         let buffer = EventBuffer::new(config);
         assert_eq!(buffer.config().max_events, 500);
         assert_eq!(buffer.config().batch_size, 50);
+    }
+
+    #[tokio::test]
+    async fn test_event_buffer_zero_max_events_does_not_panic() {
+        // A `pipeline.buffer_size: 0` config yields `max_events: 0`, which would
+        // make `tokio::sync::mpsc::channel(0)` panic (it asserts buffer > 0).
+        // The clamp must floor the capacity to 1 so construction succeeds.
+        let config = BufferConfig {
+            max_events: 0,
+            ..Default::default()
+        };
+        // Must not panic at construction.
+        let buffer = EventBuffer::new(config);
+        let sender = buffer.sender();
+        let mut receiver = buffer.into_receiver();
+
+        // The clamped capacity-1 channel is fully functional.
+        sender.send(Event::new("z")).await.ok();
+        let event = receiver.recv().await;
+        assert!(event.is_some());
+        assert_eq!(event.as_ref().and_then(|e| e.message()), Some("z"));
     }
 
     #[test]
