@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Datadog output plugin — sends events to the Datadog Log Intake API.
 //!
-//! Production-shaped stub: config parsing, Datadog JSON format, batching, and the
-//! `OutputPlugin` trait are fully wired. The HTTP POST is stubbed. For production,
-//! enable the actual HTTP calls (reqwest is already a dependency via the http output).
+//! Sends events to the Datadog Log Intake HTTP API (`/api/v2/logs`) using a
+//! shared `reqwest` client, batching, and retry/backoff on transient failures.
+
+use std::time::Duration;
 
 use async_trait::async_trait;
 use ferro_stash_core::condition::Condition;
@@ -11,7 +12,13 @@ use ferro_stash_core::error::{FerroStashError, Result};
 use ferro_stash_core::event::Event;
 use ferro_stash_core::plugin::OutputPlugin;
 use ferro_stash_core::settings_helpers::SettingsExt;
-use tracing::{info, warn};
+use reqwest::Client;
+use tracing::{debug, info, warn};
+
+/// Number of send attempts (1 initial + retries) for transient failures.
+const DATADOG_MAX_ATTEMPTS: usize = 4;
+/// Base backoff between retries (doubled per attempt, capped).
+const DATADOG_BACKOFF_BASE_MS: u64 = 250;
 
 /// Datadog output configuration — mirrors the Logstash datadog output settings.
 #[derive(Debug, Clone)]
@@ -30,6 +37,10 @@ pub struct DatadogOutputConfig {
 pub struct DatadogOutput {
     config: DatadogOutputConfig,
     condition: Option<Condition>,
+    /// Pre-built request URL (`{scheme}://{host}/api/v2/logs`).
+    url: String,
+    /// Shared HTTP client (connection pooling + timeout).
+    client: Client,
 }
 
 impl DatadogOutput {
@@ -65,6 +76,17 @@ impl DatadogOutput {
             })
             .unwrap_or_default();
 
+        let scheme = if use_ssl { "https" } else { "http" };
+        let url = format!("{scheme}://{host}/api/v2/logs");
+
+        let client = Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|e| FerroStashError::Output {
+                plugin: "datadog".to_string(),
+                message: format!("HTTP client error: {e}"),
+            })?;
+
         Ok(Self {
             config: DatadogOutputConfig {
                 api_key,
@@ -77,6 +99,57 @@ impl DatadogOutput {
                 tags,
             },
             condition,
+            url,
+            client,
+        })
+    }
+
+    /// POST a single payload to the Datadog Log Intake API with retry/backoff.
+    async fn post_payload(&self, payload: &str, event_count: usize) -> Result<()> {
+        let mut last_error: Option<String> = None;
+
+        for attempt in 0..DATADOG_MAX_ATTEMPTS {
+            if attempt > 0 {
+                let backoff = DATADOG_BACKOFF_BASE_MS * (1u64 << (attempt - 1).min(4));
+                tokio::time::sleep(Duration::from_millis(backoff)).await;
+                debug!(attempt, "retrying Datadog log intake request");
+            }
+
+            let response = self
+                .client
+                .post(&self.url)
+                .header("DD-API-KEY", &self.config.api_key)
+                .header("Content-Type", "application/json")
+                .body(payload.to_string())
+                .send()
+                .await;
+
+            match response {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() {
+                        debug!(event_count, status = %status, "Datadog logs accepted");
+                        return Ok(());
+                    }
+
+                    let retriable = status.is_server_error() || status.as_u16() == 429;
+                    let body = resp.text().await.unwrap_or_default();
+                    warn!(status = %status, attempt, body = %body, "Datadog log intake error");
+                    last_error = Some(format!("HTTP {status}: {body}"));
+                    if !retriable {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, attempt, "Datadog request failed");
+                    last_error = Some(format!("request failed: {e}"));
+                }
+            }
+        }
+
+        Err(FerroStashError::Output {
+            plugin: "datadog".to_string(),
+            message: last_error.unwrap_or_else(|| "request failed".to_string()),
         })
     }
 
@@ -131,32 +204,21 @@ impl OutputPlugin for DatadogOutput {
     }
 
     async fn output(&self, events: Vec<Event>) -> Result<()> {
-        warn!("Datadog output plugin: using stub implementation — configure real Datadog connection for production");
+        if events.is_empty() {
+            return Ok(());
+        }
 
-        let scheme = if self.config.use_ssl { "https" } else { "http" };
-        let url = format!("{}://{}/api/v2/logs", scheme, self.config.host);
-
-        // Process in batches.
+        // Process in batches; each batch is a single POST to the log intake API.
         for chunk in events.chunks(self.config.batch_size) {
             let payload = self.format_datadog_payload(chunk);
-
             info!(
-                url = %url,
+                url = %self.url,
                 event_count = chunk.len(),
                 payload_bytes = payload.len(),
-                "Datadog output: would POST {} events to {}",
+                "Datadog output: POSTing {} events",
                 chunk.len(),
-                url,
             );
-
-            // Production implementation:
-            // reqwest::Client::new()
-            //     .post(&url)
-            //     .header("DD-API-KEY", &self.config.api_key)
-            //     .header("Content-Type", "application/json")
-            //     .body(payload)
-            //     .send()
-            //     .await?;
+            self.post_payload(&payload, chunk.len()).await?;
         }
 
         Ok(())
@@ -170,6 +232,12 @@ impl OutputPlugin for DatadogOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{http::HeaderMap, http::StatusCode, routing::post, Router};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use tokio::net::TcpListener;
 
     #[test]
     fn test_datadog_config_defaults() {
@@ -232,23 +300,148 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_datadog_output_stub_succeeds() {
+    async fn test_datadog_output_empty_is_ok() {
         let settings = serde_json::json!({ "api_key": "key" });
         let output = DatadogOutput::from_config(&settings, None).expect("config");
-        let result = output.output(vec![Event::new("test")]).await;
+        let result = output.output(vec![]).await;
         assert!(result.is_ok());
     }
 
+    /// Spawns a mock Datadog intake server, returns (host:port, request-counter,
+    /// captured-api-key).
+    async fn spawn_mock_intake(
+        status: StatusCode,
+    ) -> (String, Arc<AtomicUsize>, Arc<std::sync::Mutex<Option<String>>>) {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let api_key = Arc::new(std::sync::Mutex::new(None));
+        let req_handle = Arc::clone(&requests);
+        let key_handle = Arc::clone(&api_key);
+        let app = Router::new().route(
+            "/api/v2/logs",
+            post(move |headers: HeaderMap, _body: String| {
+                let req_handle = Arc::clone(&req_handle);
+                let key_handle = Arc::clone(&key_handle);
+                async move {
+                    req_handle.fetch_add(1, Ordering::SeqCst);
+                    if let Some(v) = headers.get("DD-API-KEY").and_then(|v| v.to_str().ok()) {
+                        if let Ok(mut guard) = key_handle.lock() {
+                            *guard = Some(v.to_string());
+                        }
+                    }
+                    (status, "")
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+        (addr.to_string(), requests, api_key)
+    }
+
     #[tokio::test]
-    async fn test_datadog_output_batching() {
+    async fn test_datadog_output_posts_logs() {
+        let (host, requests, api_key) = spawn_mock_intake(StatusCode::ACCEPTED).await;
+        let settings = serde_json::json!({
+            "api_key": "secret-key",
+            "host": host,
+            "use_ssl": false,
+        });
+        let output = DatadogOutput::from_config(&settings, None).expect("config");
+        let result = output.output(vec![Event::new("hello")]).await;
+        assert!(result.is_ok(), "expected ok, got {result:?}");
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            api_key.lock().expect("lock").as_deref(),
+            Some("secret-key"),
+            "DD-API-KEY header must be forwarded"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_datadog_output_batching_multiple_posts() {
+        let (host, requests, _key) = spawn_mock_intake(StatusCode::OK).await;
         let settings = serde_json::json!({
             "api_key": "key",
-            "batch_size": 2
+            "host": host,
+            "use_ssl": false,
+            "batch_size": 2,
         });
         let output = DatadogOutput::from_config(&settings, None).expect("config");
         let events = vec![Event::new("e1"), Event::new("e2"), Event::new("e3")];
-        // Should process 2 batches (2+1) without error
+        // 3 events / batch_size 2 => 2 POSTs.
         let result = output.output(events).await;
         assert!(result.is_ok());
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_datadog_output_non_2xx_errors() {
+        // 400 is non-retriable => single attempt, returns Err.
+        let (host, requests, _key) = spawn_mock_intake(StatusCode::BAD_REQUEST).await;
+        let settings = serde_json::json!({
+            "api_key": "key",
+            "host": host,
+            "use_ssl": false,
+        });
+        let output = DatadogOutput::from_config(&settings, None).expect("config");
+        let result = output.output(vec![Event::new("bad")]).await;
+        assert!(result.is_err(), "non-2xx must return an error");
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_datadog_output_retries_transient() {
+        // Server returns 503 on first attempt, then 202.
+        let requests = Arc::new(AtomicUsize::new(0));
+        let req_handle = Arc::clone(&requests);
+        let app = Router::new().route(
+            "/api/v2/logs",
+            post(move || {
+                let req_handle = Arc::clone(&req_handle);
+                async move {
+                    let n = req_handle.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        (StatusCode::SERVICE_UNAVAILABLE, "retry")
+                    } else {
+                        (StatusCode::ACCEPTED, "ok")
+                    }
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+        let settings = serde_json::json!({
+            "api_key": "key",
+            "host": addr.to_string(),
+            "use_ssl": false,
+        });
+        let output = DatadogOutput::from_config(&settings, None).expect("config");
+        let result = output.output(vec![Event::new("hi")]).await;
+        assert!(result.is_ok(), "should succeed after retry: {result:?}");
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+    }
+
+    /// Live smoke test against the real Datadog Log Intake API.
+    /// Gated behind `DATADOG_API_KEY` (and optional `DATADOG_HOST`); run with
+    /// `cargo test -p ferro-stash-output -- --ignored datadog_live`.
+    #[tokio::test]
+    #[ignore = "requires DATADOG_API_KEY env var and network access"]
+    async fn datadog_live_smoke() {
+        let api_key = std::env::var("DATADOG_API_KEY").expect("DATADOG_API_KEY");
+        let mut settings = serde_json::json!({ "api_key": api_key });
+        if let Ok(host) = std::env::var("DATADOG_HOST") {
+            settings["host"] = serde_json::Value::String(host);
+        }
+        let output = DatadogOutput::from_config(&settings, None).expect("config");
+        let event = Event::new("ferro-stash datadog live smoke test");
+        output
+            .output(vec![event])
+            .await
+            .expect("live Datadog POST should succeed");
     }
 }

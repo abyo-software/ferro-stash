@@ -1,17 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Kafka output plugin — produces messages to Apache Kafka topics.
 //!
-//! Production-shaped stub: config parsing, batching, and the `OutputPlugin` trait are
-//! fully wired. The actual Kafka producer is stubbed. Replace with `rdkafka` producer
-//! for production use.
+//! Uses the `rdkafka` `FutureProducer`. Events are serialized via the configured
+//! codec, optionally keyed via a Logstash field reference, and produced to the
+//! configured topic with compression/acks/retries applied at the librdkafka level.
+
+use std::time::Duration;
 
 use async_trait::async_trait;
+use ferro_stash_codec::{create_codec, Codec};
 use ferro_stash_core::condition::Condition;
 use ferro_stash_core::error::{FerroStashError, Result};
 use ferro_stash_core::event::Event;
 use ferro_stash_core::plugin::OutputPlugin;
 use ferro_stash_core::settings_helpers::SettingsExt;
-use tracing::{info, warn};
+use rdkafka::config::ClientConfig;
+use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
+use rdkafka::util::Timeout;
+use tokio::sync::OnceCell;
+use tracing::{debug, info};
+
+/// How long `send()` blocks if the librdkafka queue is full before erroring.
+const KAFKA_QUEUE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long to wait for outstanding deliveries on flush/close.
+const KAFKA_FLUSH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Kafka compression type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +45,17 @@ impl CompressionType {
             _ => Self::None,
         }
     }
+
+    /// The librdkafka `compression.type` config value.
+    fn rdkafka_value(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Gzip => "gzip",
+            Self::Snappy => "snappy",
+            Self::Lz4 => "lz4",
+            Self::Zstd => "zstd",
+        }
+    }
 }
 
 /// Kafka output configuration — mirrors the Logstash kafka output settings.
@@ -49,10 +72,24 @@ pub struct KafkaOutputConfig {
     pub retries: usize,
 }
 
-#[derive(Debug)]
 pub struct KafkaOutput {
     config: KafkaOutputConfig,
     condition: Option<Condition>,
+    /// Codec used to serialize each event payload.
+    codec: Box<dyn Codec>,
+    /// Lazily-built producer (creation can fail; deferred out of `from_config`).
+    producer: OnceCell<FutureProducer>,
+}
+
+impl std::fmt::Debug for KafkaOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KafkaOutput")
+            .field("config", &self.config)
+            .field("condition", &self.condition)
+            .field("codec", &self.codec)
+            .field("producer_built", &self.producer.get().is_some())
+            .finish()
+    }
 }
 
 impl KafkaOutput {
@@ -89,6 +126,9 @@ impl KafkaOutput {
             .unwrap_or_else(|| "1".to_string());
         let retries = settings.get_u64("retries").unwrap_or(3) as usize;
 
+        // Build the codec used to serialize event payloads (config error => fail loud).
+        let codec_impl = create_codec(&codec, settings)?;
+
         Ok(Self {
             config: KafkaOutputConfig {
                 bootstrap_servers,
@@ -102,7 +142,58 @@ impl KafkaOutput {
                 retries,
             },
             condition,
+            codec: codec_impl,
+            producer: OnceCell::new(),
         })
+    }
+
+    /// Returns the producer, building it on first use.
+    async fn producer(&self) -> Result<&FutureProducer> {
+        self.producer
+            .get_or_try_init(|| async {
+                let mut cfg = ClientConfig::new();
+                cfg.set("bootstrap.servers", self.config.bootstrap_servers.join(","))
+                    .set("client.id", &self.config.client_id)
+                    .set("acks", &self.config.acks)
+                    .set(
+                        "compression.type",
+                        self.config.compression_type.rdkafka_value(),
+                    )
+                    .set(
+                        "message.send.max.retries",
+                        self.config.retries.to_string(),
+                    )
+                    // `batch_size` mirrors librdkafka's batch.size (bytes).
+                    .set("batch.size", self.config.batch_size.to_string());
+
+                cfg.create::<FutureProducer>()
+                    .map_err(|e| FerroStashError::Output {
+                        plugin: "kafka".to_string(),
+                        message: format!("failed to create Kafka producer: {e}"),
+                    })
+            })
+            .await
+    }
+
+    /// Serialize an event to bytes via the configured codec.
+    fn encode(&self, event: &Event) -> Result<Vec<u8>> {
+        self.codec.encode(event).map_err(|e| FerroStashError::Output {
+            plugin: "kafka".to_string(),
+            message: format!("codec encode error: {e}"),
+        })
+    }
+
+    /// Resolve the partition key for an event from the configured field reference.
+    /// Returns `None` when no key is configured or the reference resolves empty.
+    fn resolve_key(&self, event: &Event) -> Option<String> {
+        let template = self.config.key.as_ref()?;
+        let resolved = event.sprintf(template);
+        // An unresolved `%{field}` template or empty result yields no key.
+        if resolved.is_empty() || resolved == *template {
+            None
+        } else {
+            Some(resolved)
+        }
     }
 }
 
@@ -113,24 +204,67 @@ impl OutputPlugin for KafkaOutput {
     }
 
     async fn output(&self, events: Vec<Event>) -> Result<()> {
-        warn!("Kafka output plugin: using stub implementation — configure real Kafka connection for production");
+        if events.is_empty() {
+            return Ok(());
+        }
 
+        let producer = self.producer().await?;
+
+        // Serialize payloads + keys up front (codec errors fail before producing).
+        let mut records: Vec<(Vec<u8>, Option<String>)> = Vec::with_capacity(events.len());
+        for event in &events {
+            let payload = self.encode(event)?;
+            let key = self.resolve_key(event);
+            records.push((payload, key));
+        }
+
+        // Produce each record and await its delivery acknowledgement. librdkafka
+        // batches/compresses internally and a background thread drives delivery,
+        // so awaiting in order does not serialize the network round-trips.
+        for (payload, key) in &records {
+            let mut record: FutureRecord<'_, str, [u8]> =
+                FutureRecord::to(&self.config.topic).payload(payload.as_slice());
+            if let Some(k) = key {
+                record = record.key(k.as_str());
+            }
+            producer
+                .send(record, Timeout::After(KAFKA_QUEUE_TIMEOUT))
+                .await
+                .map_err(|(kafka_err, _msg)| FerroStashError::Output {
+                    plugin: "kafka".to_string(),
+                    message: format!("Kafka delivery failed: {kafka_err}"),
+                })?;
+        }
+
+        debug!(
+            topic = %self.config.topic,
+            event_count = records.len(),
+            "Kafka output: delivered events"
+        );
         info!(
             topic = %self.config.topic,
-            event_count = events.len(),
-            "Kafka output: would produce {} events to topic '{}'",
-            events.len(),
-            self.config.topic,
+            event_count = records.len(),
+            "Kafka output: produced events"
         );
 
-        // Production implementation would:
-        // 1. Serialize events using the configured codec
-        // 2. Optionally extract the key from each event via self.config.key field reference
-        // 3. Batch produce to self.config.topic
-        // 4. Apply compression_type, acks, retries settings
-        // 5. Handle producer errors with retry logic
-
         Ok(())
+    }
+
+    async fn flush(&self) -> Result<()> {
+        if let Some(producer) = self.producer.get() {
+            producer
+                .flush(Timeout::After(KAFKA_FLUSH_TIMEOUT))
+                .map_err(|e| FerroStashError::Output {
+                    plugin: "kafka".to_string(),
+                    message: format!("Kafka flush failed: {e}"),
+                })?;
+        }
+        Ok(())
+    }
+
+    async fn close(&self) -> Result<()> {
+        // Ensure all buffered messages are delivered before dropping the producer.
+        self.flush().await
     }
 
     fn condition(&self) -> Option<&Condition> {
@@ -194,12 +328,76 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_kafka_output_codec_built() {
+        // Unknown codec must fail loudly at config time.
+        let settings = serde_json::json!({ "topic": "t", "codec": "no-such-codec" });
+        assert!(KafkaOutput::from_config(&settings, None).is_err());
+    }
+
     #[tokio::test]
-    async fn test_kafka_output_stub_succeeds() {
+    async fn test_kafka_output_empty_is_ok() {
+        // Empty batches must not build a producer or connect.
         let settings = serde_json::json!({ "topic": "test" });
         let output = KafkaOutput::from_config(&settings, None).expect("config");
-        let events = vec![Event::new("test event")];
-        let result = output.output(events).await;
+        let result = output.output(vec![]).await;
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_kafka_resolve_key() {
+        let settings = serde_json::json!({ "topic": "t", "key": "%{[user]}" });
+        let output = KafkaOutput::from_config(&settings, None).expect("config");
+        let mut event = Event::new("hi");
+        event.set(
+            "user",
+            ferro_stash_core::event::EventValue::String("alice".into()),
+        );
+        assert_eq!(output.resolve_key(&event).as_deref(), Some("alice"));
+
+        // Unresolved template yields no key.
+        let no_field = Event::new("hi");
+        assert!(output.resolve_key(&no_field).is_none());
+
+        // No key configured at all.
+        let settings2 = serde_json::json!({ "topic": "t" });
+        let output2 = KafkaOutput::from_config(&settings2, None).expect("config");
+        assert!(output2.resolve_key(&Event::new("x")).is_none());
+    }
+
+    #[test]
+    fn test_kafka_compression_rdkafka_value() {
+        assert_eq!(CompressionType::None.rdkafka_value(), "none");
+        assert_eq!(CompressionType::Gzip.rdkafka_value(), "gzip");
+        assert_eq!(CompressionType::Snappy.rdkafka_value(), "snappy");
+        assert_eq!(CompressionType::Lz4.rdkafka_value(), "lz4");
+        assert_eq!(CompressionType::Zstd.rdkafka_value(), "zstd");
+    }
+
+    /// Live smoke test against a real Kafka broker.
+    /// Gated behind `KAFKA_BROKERS` (e.g. `localhost:9092`) and `KAFKA_TOPIC`
+    /// (default `ferro-stash-live-test`). The topic must exist or auto-create
+    /// must be enabled. Run with
+    /// `cargo test -p ferro-stash-output -- --ignored kafka_live`.
+    #[tokio::test]
+    #[ignore = "requires a running Kafka broker (KAFKA_BROKERS env var)"]
+    async fn kafka_live_smoke() {
+        let brokers = std::env::var("KAFKA_BROKERS").expect("KAFKA_BROKERS");
+        let topic =
+            std::env::var("KAFKA_TOPIC").unwrap_or_else(|_| "ferro-stash-live-test".to_string());
+        let settings = serde_json::json!({
+            "bootstrap_servers": brokers,
+            "topic": topic,
+            "codec": "json",
+            "key": "%{[user]}",
+        });
+        let output = KafkaOutput::from_config(&settings, None).expect("config");
+        let mut event = Event::new("kafka live smoke");
+        event.set(
+            "user",
+            ferro_stash_core::event::EventValue::String("smoke".into()),
+        );
+        output.output(vec![event]).await.expect("live produce");
+        output.flush().await.expect("flush");
     }
 }
