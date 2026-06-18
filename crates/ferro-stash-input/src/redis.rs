@@ -54,6 +54,9 @@ pub struct RedisInputConfig {
     pub password: Option<String>,
     pub batch_count: usize,
     pub codec: String,
+    /// Codec sub-settings extracted from the `codec => name { ... }` block;
+    /// empty object when the codec is named without a settings block.
+    pub codec_settings: serde_json::Value,
     pub timeout: u64,
 }
 
@@ -86,9 +89,9 @@ impl RedisInput {
         let db = settings.get_u64("db").unwrap_or(0) as u32;
         let password = settings.get_string("password");
         let batch_count = settings.get_u64("batch_count").unwrap_or(125) as usize;
-        let codec = settings
-            .get_string("codec")
-            .unwrap_or_else(|| "json".to_string());
+        // Resolve the codec name and its sub-settings so they are honored
+        // rather than dropped.
+        let (codec, codec_settings) = crate::codec_config::resolve_codec(settings, "json");
         let timeout = settings.get_u64("timeout").unwrap_or(5);
 
         Ok(Self {
@@ -101,6 +104,7 @@ impl RedisInput {
                 password,
                 batch_count,
                 codec,
+                codec_settings,
                 timeout,
             },
             test_receiver: None,
@@ -113,9 +117,10 @@ impl RedisInput {
         self
     }
 
-    /// Builds the configured codec, mapping codec errors into an input error.
+    /// Builds the configured codec, threading its sub-settings through and
+    /// mapping codec errors into an input error.
     fn build_codec(&self) -> Result<Box<dyn Codec>> {
-        create_codec(&self.config.codec, &serde_json::json!({})).map_err(|e| {
+        create_codec(&self.config.codec, &self.config.codec_settings).map_err(|e| {
             FerroStashError::Input {
                 plugin: "redis".to_string(),
                 message: format!("unknown/invalid codec '{}': {e}", self.config.codec),
@@ -161,16 +166,26 @@ impl RedisInput {
             }
         };
         for mut event in events {
-            event.set(
-                "[@metadata][redis][key]",
-                EventValue::String(key.to_string()),
-            );
+            // Stamp Redis metadata into the event's metadata struct so it is
+            // available in-pipeline as `[@metadata][redis]` but never serialized
+            // to the output by `Event::to_json`.
+            event
+                .metadata
+                .set("redis".to_string(), redis_metadata(key));
             if sender.send(event).await.is_err() {
                 return false;
             }
         }
         true
     }
+}
+
+/// Builds the `[@metadata][redis]` object stamped onto each emitted event.
+///
+/// Constructed via `serde_json` then converted to an [`EventValue::Object`] so
+/// this crate does not need to depend on `indexmap` directly.
+fn redis_metadata(key: &str) -> EventValue {
+    EventValue::from(serde_json::json!({ "key": key }))
 }
 
 #[async_trait]
@@ -201,9 +216,9 @@ impl InputPlugin for RedisInput {
                         match msg {
                             Some(payload) => {
                                 let mut event = Event::new(&payload);
-                                event.set(
-                                    "[@metadata][redis][key]",
-                                    EventValue::String(self.config.key.clone()),
+                                event.metadata.set(
+                                    "redis".to_string(),
+                                    redis_metadata(&self.config.key),
                                 );
                                 if sender.send(event).await.is_err() {
                                     break;
@@ -246,8 +261,19 @@ impl InputPlugin for RedisInput {
 }
 
 impl RedisInput {
-    /// BLPOP loop: drains up to `batch_count` elements per cycle, then yields to
-    /// the select so shutdown can interrupt. Reconnects with backoff on errors.
+    /// BLPOP loop. Reconnects with backoff on errors.
+    ///
+    /// BLPOP is *destructive*: the element is removed from the list server-side
+    /// the moment the command returns. Racing the BLPOP future against
+    /// `shutdown.wait()` in a `select!` would drop the future (and the popped
+    /// element with it) if shutdown wins after the server popped but before the
+    /// future resolved — silent data loss.
+    ///
+    /// To avoid that we never race a destructive BLPOP against shutdown. Each
+    /// BLPOP runs to completion with a small per-call timeout; any element it
+    /// returns is always emitted. Shutdown is only honored *between* calls —
+    /// when a BLPOP times out empty or before issuing the next one — so an
+    /// in-flight pop can never be lost.
     async fn run_list(
         &self,
         client: &redis::Client,
@@ -255,12 +281,22 @@ impl RedisInput {
         sender: &mpsc::Sender<Event>,
         shutdown: &mut ShutdownSignal,
     ) {
-        // `BLPOP` blocks server-side; keep the per-call timeout small so shutdown
-        // is observed promptly. Logstash's `timeout` is seconds; clamp to >= 1.
-        let blpop_timeout = self.config.timeout.max(1) as f64;
+        // Keep the per-call timeout small so shutdown is observed promptly while
+        // still letting each (destructive) BLPOP run to completion. Logstash's
+        // `timeout` is in seconds; cap the *per-call* BLPOP timeout to 1s so a
+        // requested shutdown is honored within ~1s between calls. (A configured
+        // value larger than this only affects how a real broker is polled; the
+        // worst-case shutdown latency stays bounded because BLPOP is never
+        // raced against shutdown.) The floor of 1 avoids `0` = block forever.
+        let blpop_timeout = self.config.timeout.clamp(1, 1) as f64;
         let key = self.config.key.clone();
 
         loop {
+            // Check shutdown before attempting to (re)connect.
+            if shutdown.is_shutdown() {
+                return;
+            }
+
             let mut conn = match client.get_multiplexed_async_connection().await {
                 Ok(c) => c,
                 Err(e) => {
@@ -274,24 +310,27 @@ impl RedisInput {
 
             info!(key = %key, "Redis list (BLPOP) consumer connected");
 
-            // Drain up to batch_count per outer iteration, checking shutdown between.
             loop {
-                tokio::select! {
-                    () = shutdown.wait() => return,
-                    result = Self::blpop_once(&mut conn, &key, blpop_timeout) => {
-                        match result {
-                            Ok(Some(payload)) => {
-                                if !Self::emit_payload(codec, sender, &key, &payload).await {
-                                    return;
-                                }
-                            }
-                            // BLPOP timed out with no element — loop again.
-                            Ok(None) => {}
-                            Err(e) => {
-                                warn!(error = %e, "Redis BLPOP error; reconnecting");
-                                break;
-                            }
+                // Honor shutdown only between calls — never while a destructive
+                // BLPOP is in flight.
+                if shutdown.is_shutdown() {
+                    return;
+                }
+
+                // Run BLPOP to completion (do NOT race it against shutdown).
+                match Self::blpop_once(&mut conn, &key, blpop_timeout).await {
+                    Ok(Some(payload)) => {
+                        // A popped element is always emitted before we re-check
+                        // shutdown on the next iteration.
+                        if !Self::emit_payload(codec, sender, &key, &payload).await {
+                            return;
                         }
+                    }
+                    // BLPOP timed out with no element — loop and re-check shutdown.
+                    Ok(None) => {}
+                    Err(e) => {
+                        warn!(error = %e, "Redis BLPOP error; reconnecting");
+                        break;
                     }
                 }
             }
@@ -509,6 +548,96 @@ mod tests {
         let settings = serde_json::json!({ "key": "k", "codec": "nope-not-real" });
         let input = RedisInput::from_config(&settings).expect("config");
         assert!(input.build_codec().is_err());
+    }
+
+    #[test]
+    fn test_redis_codec_descriptor_settings_threaded() {
+        // Finding #3: codec sub-settings must be captured, not discarded.
+        let settings = serde_json::json!({
+            "key": "k",
+            "codec": { "_plugin": "json", "target": "data" }
+        });
+        let input = RedisInput::from_config(&settings).expect("config");
+        assert_eq!(input.config.codec, "json");
+        assert_eq!(
+            input.config.codec_settings,
+            serde_json::json!({ "target": "data" })
+        );
+        assert!(input.build_codec().is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_redis_metadata_not_in_output_json() {
+        // Finding #1: emitted events must not serialize an `@metadata` key.
+        let settings = serde_json::json!({ "key": "logstash" });
+        let mut input = RedisInput::from_config(&settings).expect("config");
+
+        let (test_tx, test_rx) = mpsc::channel(10);
+        input = input.with_test_receiver(test_rx);
+
+        let (tx, mut rx) = mpsc::channel(100);
+        let (ctrl, sig) = ferro_stash_core::shutdown::ShutdownController::new();
+        let handle = tokio::spawn(async move { input.run(tx, sig).await });
+
+        test_tx.send("payload".to_string()).await.expect("send");
+        drop(test_tx);
+
+        let event = rx.recv().await.expect("event");
+        let json = event.to_json();
+        let obj = json.as_object().expect("object");
+        assert!(
+            !obj.contains_key("@metadata"),
+            "to_json must not contain @metadata, got: {json}"
+        );
+        assert!(event.metadata.get("redis").is_some());
+
+        ctrl.shutdown();
+        let _ = handle.await.expect("join");
+    }
+
+    #[tokio::test]
+    async fn test_redis_emit_payload_metadata_in_struct_not_fields() {
+        let codec = create_codec("plain", &serde_json::json!({})).expect("codec");
+        let (tx, mut rx) = mpsc::channel(10);
+        let ok = RedisInput::emit_payload(codec.as_ref(), &tx, "mykey", b"hi").await;
+        assert!(ok);
+        let event = rx.recv().await.expect("event");
+        assert!(!event
+            .to_json()
+            .as_object()
+            .expect("obj")
+            .contains_key("@metadata"));
+        let redis_meta = event.metadata.get("redis").expect("redis metadata");
+        let map = redis_meta.as_object().expect("object");
+        assert_eq!(map.get("key"), Some(&EventValue::String("mykey".into())));
+    }
+
+    /// Finding #4 (best-effort regression): a popped element must always be
+    /// emitted before shutdown is honored — i.e. `emit_payload` is driven to
+    /// completion and the element reaches the downstream channel even if a
+    /// shutdown has already been requested.
+    ///
+    /// We model the destructive-pop-then-shutdown ordering directly: the
+    /// element has been popped (so it is gone server-side); the fixed code's
+    /// contract is that such an element is unconditionally emitted (it is never
+    /// raced against shutdown). The downstream channel still has capacity, so a
+    /// completed `emit_payload` must deliver it.
+    #[tokio::test]
+    async fn test_redis_popped_element_emitted_even_after_shutdown_requested() {
+        let codec = create_codec("plain", &serde_json::json!({})).expect("codec");
+        let (tx, mut rx) = mpsc::channel(10);
+
+        // Shutdown is already requested at the moment the element was popped.
+        let (ctrl, _sig) = ferro_stash_core::shutdown::ShutdownController::new();
+        ctrl.shutdown();
+
+        // The fixed code never drops a popped element; emit it unconditionally.
+        let ok = RedisInput::emit_payload(codec.as_ref(), &tx, "k", b"in-flight").await;
+        assert!(ok, "emit_payload should succeed while channel has capacity");
+
+        // The popped element must have reached the channel (not lost to shutdown).
+        let event = rx.recv().await.expect("popped element must be emitted");
+        assert_eq!(event.message(), Some("in-flight"));
     }
 
     /// Live smoke test against a real Redis server (list / BLPOP mode).

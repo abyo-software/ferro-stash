@@ -31,6 +31,10 @@ pub struct KafkaInputConfig {
     pub auto_offset_reset: AutoOffsetReset,
     pub consumer_threads: usize,
     pub codec: String,
+    /// Codec sub-settings (e.g. `target`, `pattern`) extracted from the
+    /// `codec => name { ... }` block; empty object when the codec is named
+    /// without a settings block.
+    pub codec_settings: serde_json::Value,
     pub client_id: String,
     pub max_poll_records: usize,
 }
@@ -60,13 +64,42 @@ pub struct KafkaInput {
 
 impl KafkaInput {
     pub fn from_config(settings: &serde_json::Value) -> Result<Self> {
-        let bootstrap_servers = settings
-            .get("bootstrap_servers")
-            .and_then(|v| v.as_str())
-            .unwrap_or("localhost:9092")
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .collect();
+        // `bootstrap_servers` accepts both an array of strings and a
+        // comma-separated string (mirrors the `topics` parser below). An empty
+        // result is a configuration error rather than a silent localhost
+        // fallback.
+        let bootstrap_servers: Vec<String> = match settings.get("bootstrap_servers") {
+            Some(serde_json::Value::Array(arr)) => arr
+                .iter()
+                .filter_map(|v| v.as_str())
+                .flat_map(|s| s.split(','))
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            Some(serde_json::Value::String(s)) => s
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            // Unset → Logstash default.
+            None => vec!["localhost:9092".to_string()],
+            // Any other JSON type is a misconfiguration.
+            Some(_) => {
+                return Err(FerroStashError::Input {
+                    plugin: "kafka".to_string(),
+                    message: "bootstrap_servers must be an array of strings or a comma-separated \
+                              string"
+                        .to_string(),
+                });
+            }
+        };
+
+        if bootstrap_servers.is_empty() {
+            return Err(FerroStashError::Input {
+                plugin: "kafka".to_string(),
+                message: "bootstrap_servers must contain at least one broker".to_string(),
+            });
+        }
 
         let topics: Vec<String> = match settings.get("topics") {
             Some(serde_json::Value::Array(arr)) => arr
@@ -105,9 +138,9 @@ impl KafkaInput {
         };
 
         let consumer_threads = settings.get_u64("consumer_threads").unwrap_or(1) as usize;
-        let codec = settings
-            .get_string("codec")
-            .unwrap_or_else(|| "plain".to_string());
+        // Resolve the codec name and its sub-settings (e.g. `target`,
+        // `pattern`) so they are honored rather than dropped.
+        let (codec, codec_settings) = crate::codec_config::resolve_codec(settings, "plain");
         let client_id = settings
             .get_string("client_id")
             .unwrap_or_else(|| "ferro-stash-kafka-input".to_string());
@@ -121,6 +154,7 @@ impl KafkaInput {
                 auto_offset_reset,
                 consumer_threads,
                 codec,
+                codec_settings,
                 client_id,
                 max_poll_records,
             },
@@ -134,9 +168,10 @@ impl KafkaInput {
         self
     }
 
-    /// Builds the configured codec, mapping codec errors into an input error.
+    /// Builds the configured codec, threading its sub-settings through and
+    /// mapping codec errors into an input error.
     fn build_codec(&self) -> Result<Box<dyn Codec>> {
-        create_codec(&self.config.codec, &serde_json::json!({})).map_err(|e| {
+        create_codec(&self.config.codec, &self.config.codec_settings).map_err(|e| {
             FerroStashError::Input {
                 plugin: "kafka".to_string(),
                 message: format!("unknown/invalid codec '{}': {e}", self.config.codec),
@@ -175,17 +210,12 @@ impl KafkaInput {
             }
         };
         for mut event in events {
-            event.set(
-                "[@metadata][kafka][topic]",
-                EventValue::String(topic.to_string()),
-            );
-            event.set(
-                "[@metadata][kafka][partition]",
-                EventValue::Integer(i64::from(partition)),
-            );
-            event.set(
-                "[@metadata][kafka][offset]",
-                EventValue::Integer(offset),
+            // Stamp Kafka metadata into the event's metadata struct (available
+            // in-pipeline as `[@metadata][kafka]` but never serialized to the
+            // output by `Event::to_json`).
+            event.metadata.set(
+                "kafka".to_string(),
+                kafka_metadata(topic, partition, offset),
             );
             if sender.send(event).await.is_err() {
                 return false;
@@ -193,6 +223,18 @@ impl KafkaInput {
         }
         true
     }
+}
+
+/// Builds the `[@metadata][kafka]` object stamped onto each emitted event.
+///
+/// Constructed via `serde_json` then converted to an [`EventValue::Object`] so
+/// this crate does not need to depend on `indexmap` directly.
+fn kafka_metadata(topic: &str, partition: i32, offset: i64) -> EventValue {
+    EventValue::from(serde_json::json!({
+        "topic": topic,
+        "partition": i64::from(partition),
+        "offset": offset,
+    }))
 }
 
 #[async_trait]
@@ -222,9 +264,15 @@ impl InputPlugin for KafkaInput {
                         match msg {
                             Some(payload) => {
                                 let mut event = Event::new(&payload);
-                                event.set("[@metadata][kafka][topic]",
-                                    EventValue::String(self.config.topics.first()
-                                        .cloned().unwrap_or_default()));
+                                let topic = self
+                                    .config
+                                    .topics
+                                    .first()
+                                    .cloned()
+                                    .unwrap_or_default();
+                                event
+                                    .metadata
+                                    .set("kafka".to_string(), kafka_metadata(&topic, 0, 0));
                                 if sender.send(event).await.is_err() {
                                     break;
                                 }
@@ -370,6 +418,126 @@ mod tests {
         let settings = serde_json::json!({ "topics": "a,b,c" });
         let input = KafkaInput::from_config(&settings).expect("config");
         assert_eq!(input.config.topics, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_kafka_bootstrap_servers_array_form() {
+        // Finding #2: the array form must parse, not silently fall back to localhost.
+        let settings = serde_json::json!({
+            "topics": ["t"],
+            "bootstrap_servers": ["b1:9092", "b2:9092"]
+        });
+        let input = KafkaInput::from_config(&settings).expect("config");
+        assert_eq!(
+            input.config.bootstrap_servers,
+            vec!["b1:9092", "b2:9092"]
+        );
+    }
+
+    #[test]
+    fn test_kafka_bootstrap_servers_array_with_embedded_commas() {
+        // An array element that itself contains commas is flattened.
+        let settings = serde_json::json!({
+            "topics": ["t"],
+            "bootstrap_servers": ["b1:9092,b2:9092", "b3:9092"]
+        });
+        let input = KafkaInput::from_config(&settings).expect("config");
+        assert_eq!(
+            input.config.bootstrap_servers,
+            vec!["b1:9092", "b2:9092", "b3:9092"]
+        );
+    }
+
+    #[test]
+    fn test_kafka_bootstrap_servers_empty_array_errors() {
+        // Finding #2: an empty result is a config error, not a localhost default.
+        let settings = serde_json::json!({
+            "topics": ["t"],
+            "bootstrap_servers": []
+        });
+        assert!(KafkaInput::from_config(&settings).is_err());
+    }
+
+    #[test]
+    fn test_kafka_bootstrap_servers_empty_string_errors() {
+        let settings = serde_json::json!({
+            "topics": ["t"],
+            "bootstrap_servers": "  ,  "
+        });
+        assert!(KafkaInput::from_config(&settings).is_err());
+    }
+
+    #[test]
+    fn test_kafka_codec_descriptor_settings_threaded() {
+        // Finding #3: codec sub-settings must be captured, not discarded.
+        let settings = serde_json::json!({
+            "topics": ["t"],
+            "codec": { "_plugin": "json", "target": "data" }
+        });
+        let input = KafkaInput::from_config(&settings).expect("config");
+        assert_eq!(input.config.codec, "json");
+        assert_eq!(
+            input.config.codec_settings,
+            serde_json::json!({ "target": "data" })
+        );
+        // The codec must build with those settings.
+        assert!(input.build_codec().is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_kafka_metadata_not_in_output_json() {
+        // Finding #1: emitted events must not serialize an `@metadata` key.
+        let settings = serde_json::json!({ "topics": ["t"] });
+        let mut input = KafkaInput::from_config(&settings).expect("config");
+
+        let (test_tx, test_rx) = mpsc::channel(10);
+        input = input.with_test_receiver(test_rx);
+
+        let (tx, mut rx) = mpsc::channel(100);
+        let (ctrl, sig) = ferro_stash_core::shutdown::ShutdownController::new();
+        let handle = tokio::spawn(async move { input.run(tx, sig).await });
+
+        test_tx.send("payload".to_string()).await.expect("send");
+        drop(test_tx);
+
+        let event = rx.recv().await.expect("event");
+        let json = event.to_json();
+        let obj = json.as_object().expect("object");
+        assert!(
+            !obj.contains_key("@metadata"),
+            "to_json must not contain @metadata, got: {json}"
+        );
+        // But the metadata is available in-pipeline.
+        assert!(event.metadata.get("kafka").is_some());
+
+        ctrl.shutdown();
+        let _ = handle.await.expect("join");
+    }
+
+    #[tokio::test]
+    async fn test_kafka_emit_payload_metadata_in_struct_not_fields() {
+        // Drive `emit_payload` directly to assert real-path metadata placement.
+        let codec = create_codec("plain", &serde_json::json!({})).expect("codec");
+        let (tx, mut rx) = mpsc::channel(10);
+        let ok = KafkaInput::emit_payload(
+            codec.as_ref(),
+            &tx,
+            b"hi",
+            "my-topic",
+            3,
+            42,
+        )
+        .await;
+        assert!(ok);
+        let event = rx.recv().await.expect("event");
+        // Output JSON has no @metadata.
+        assert!(!event.to_json().as_object().expect("obj").contains_key("@metadata"));
+        // Metadata struct carries topic/partition/offset.
+        let kafka = event.metadata.get("kafka").expect("kafka metadata");
+        let map = kafka.as_object().expect("object");
+        assert_eq!(map.get("topic"), Some(&EventValue::String("my-topic".into())));
+        assert_eq!(map.get("partition"), Some(&EventValue::Integer(3)));
+        assert_eq!(map.get("offset"), Some(&EventValue::Integer(42)));
     }
 
     #[tokio::test]

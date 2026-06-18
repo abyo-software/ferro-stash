@@ -36,6 +36,9 @@ pub struct S3InputConfig {
     pub secret_access_key: Option<String>,
     pub interval: u64,
     pub codec: String,
+    /// Codec sub-settings extracted from the `codec => name { ... }` block;
+    /// empty object when the codec is named without a settings block.
+    pub codec_settings: serde_json::Value,
     pub delete_after_read: bool,
 }
 
@@ -62,9 +65,9 @@ impl S3Input {
         let access_key_id = settings.get_string("access_key_id");
         let secret_access_key = settings.get_string("secret_access_key");
         let interval = settings.get_u64("interval").unwrap_or(60);
-        let codec = settings
-            .get_string("codec")
-            .unwrap_or_else(|| "plain".to_string());
+        // Resolve the codec name and its sub-settings so they are honored rather
+        // than dropped.
+        let (codec, codec_settings) = crate::codec_config::resolve_codec(settings, "plain");
         let delete_after_read = settings.get_bool("delete_after_read").unwrap_or(false);
 
         Ok(Self {
@@ -76,6 +79,7 @@ impl S3Input {
                 secret_access_key,
                 interval,
                 codec,
+                codec_settings,
                 delete_after_read,
             },
             test_data: None,
@@ -88,9 +92,10 @@ impl S3Input {
         self
     }
 
-    /// Builds the configured codec, mapping codec errors into an input error.
+    /// Builds the configured codec, threading its sub-settings through and
+    /// mapping codec errors into an input error.
     fn build_codec(&self) -> Result<Box<dyn Codec>> {
-        create_codec(&self.config.codec, &serde_json::json!({})).map_err(|e| {
+        create_codec(&self.config.codec, &self.config.codec_settings).map_err(|e| {
             FerroStashError::Input {
                 plugin: "s3".to_string(),
                 message: format!("unknown/invalid codec '{}': {e}", self.config.codec),
@@ -154,10 +159,9 @@ impl InputPlugin for S3Input {
         if let Some(ref data) = self.test_data {
             for line in data {
                 let mut event = Event::new(line);
-                event.set(
-                    "[@metadata][s3][bucket]",
-                    EventValue::String(self.config.bucket.clone()),
-                );
+                event
+                    .metadata
+                    .set("s3".to_string(), s3_metadata(&self.config.bucket, None));
                 if sender.send(event).await.is_err() {
                     return Ok(());
                 }
@@ -310,11 +314,12 @@ impl S3Input {
         debug!(key = %key, events = events.len(), "S3 object decoded");
 
         for mut event in events {
-            event.set(
-                "[@metadata][s3][bucket]",
-                EventValue::String(self.config.bucket.clone()),
-            );
-            event.set("[@metadata][s3][key]", EventValue::String(key.to_string()));
+            // Stamp S3 metadata into the event's metadata struct so it is
+            // available in-pipeline as `[@metadata][s3]` but never serialized to
+            // the output by `Event::to_json`.
+            event
+                .metadata
+                .set("s3".to_string(), s3_metadata(&self.config.bucket, Some(key)));
             if sender.send(event).await.is_err() {
                 return FetchResult::ChannelClosed;
             }
@@ -335,6 +340,23 @@ impl S3Input {
             warn!(bucket = %self.config.bucket, key = %key, error = %e, "S3 DeleteObject failed");
         }
     }
+}
+
+/// Builds the `[@metadata][s3]` object stamped onto each emitted event.
+///
+/// Constructed via `serde_json` then converted to an [`EventValue::Object`] so
+/// this crate does not need to depend on `indexmap` directly. `key` is omitted
+/// in test mode where there is no underlying object key.
+fn s3_metadata(bucket: &str, key: Option<&str>) -> EventValue {
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "bucket".to_string(),
+        serde_json::Value::String(bucket.to_string()),
+    );
+    if let Some(key) = key {
+        obj.insert("key".to_string(), serde_json::Value::String(key.to_string()));
+    }
+    EventValue::from(serde_json::Value::Object(obj))
 }
 
 /// Outcome of fetching/emitting a single S3 object.
@@ -431,6 +453,62 @@ mod tests {
         let settings = serde_json::json!({ "bucket": "b", "codec": "no-such-codec" });
         let input = S3Input::from_config(&settings).expect("config");
         assert!(input.build_codec().is_err());
+    }
+
+    #[test]
+    fn test_s3_codec_descriptor_settings_threaded() {
+        // Finding #3: codec sub-settings must be captured, not discarded.
+        let settings = serde_json::json!({
+            "bucket": "b",
+            "codec": { "_plugin": "json", "target": "data" }
+        });
+        let input = S3Input::from_config(&settings).expect("config");
+        assert_eq!(input.config.codec, "json");
+        assert_eq!(
+            input.config.codec_settings,
+            serde_json::json!({ "target": "data" })
+        );
+        assert!(input.build_codec().is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_s3_metadata_not_in_output_json() {
+        // Finding #1: emitted events must not serialize an `@metadata` key.
+        let settings = serde_json::json!({ "bucket": "test-bucket" });
+        let mut input = S3Input::from_config(&settings).expect("config");
+        input = input.with_test_data(vec!["line1".into()]);
+
+        let (tx, mut rx) = mpsc::channel(100);
+        let (ctrl, sig) = ferro_stash_core::shutdown::ShutdownController::new();
+        let handle = tokio::spawn(async move { input.run(tx, sig).await });
+
+        let event = rx.recv().await.expect("event");
+        let json = event.to_json();
+        let obj = json.as_object().expect("object");
+        assert!(
+            !obj.contains_key("@metadata"),
+            "to_json must not contain @metadata, got: {json}"
+        );
+        assert!(event.metadata.get("s3").is_some());
+
+        ctrl.shutdown();
+        let _ = handle.await.expect("join");
+    }
+
+    #[test]
+    fn test_s3_metadata_helper_shape() {
+        let with_key = s3_metadata("bkt", Some("path/obj.json"));
+        let map = with_key.as_object().expect("object");
+        assert_eq!(map.get("bucket"), Some(&EventValue::String("bkt".into())));
+        assert_eq!(
+            map.get("key"),
+            Some(&EventValue::String("path/obj.json".into()))
+        );
+
+        let without_key = s3_metadata("bkt", None);
+        let map = without_key.as_object().expect("object");
+        assert_eq!(map.get("bucket"), Some(&EventValue::String("bkt".into())));
+        assert!(map.get("key").is_none());
     }
 
     #[tokio::test]

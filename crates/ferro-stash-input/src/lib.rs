@@ -17,6 +17,8 @@ pub mod syslog;
 pub mod tcp;
 pub mod udp;
 
+pub mod codec_config;
+
 use std::sync::Arc;
 
 use ferro_stash_core::error::{FerroStashError, Result};
