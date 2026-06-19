@@ -129,10 +129,10 @@ The JRuby custom-logic figure is corroborated across runs (~143–147k); see
 ## Logstash compatibility scope
 
 FerroStash targets the **production-common subset** of Logstash, not its
-full plugin catalogue. It implements **~63% of the plugins bundled with
-Logstash 9.4.2** (70 / 111) — **codecs 100%, filters 74%, inputs 44%, outputs
+full plugin catalogue. It implements **~64% of the plugins bundled with
+Logstash 9.4.2** (71 / 111) — **codecs 100%, filters 74%, inputs 47%, outputs
 43%** — weighted toward the parse/filter hot path; the long tail of connectors
-(JDBC, AWS SQS/SNS/CloudWatch, `http_poller`, RabbitMQ, …) is the main gap. A
+(JDBC, AWS SQS/SNS/CloudWatch, RabbitMQ, …) is the main gap. A
 config that uses a missing plugin **fails fast** at load, so check the full
 **[compatibility matrix](docs/COMPATIBILITY.md)** before migrating. The
 default event shape (`@timestamp`, tags, bracket-notation field
@@ -205,7 +205,7 @@ available, not in CI. See the Notes column and
 [Honest limitations](#honest-limitations) for exactly what each smoke
 test exercises and the per-plugin feature residuals.
 
-### Input plugins (15 registered)
+### Input plugins (16 registered)
 
 | Plugin | Status | Notes |
 |--------|--------|-------|

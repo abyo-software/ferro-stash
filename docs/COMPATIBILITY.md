@@ -2,8 +2,8 @@
 # Logstash 9.4.2 compatibility matrix
 
 **Short answer: FerroStash is not feature-complete with Logstash.** It
-implements the production-common subset — **~63% of the plugins bundled with
-Logstash 9.4.2** (70 of 111), heavily weighted toward the parsing/filtering hot
+implements the production-common subset — **~64% of the plugins bundled with
+Logstash 9.4.2** (71 of 111), heavily weighted toward the parsing/filtering hot
 path. Connector breadth (AWS, JDBC, enterprise messaging) is the main gap.
 
 Two distinct claims, don't conflate them:
@@ -27,9 +27,9 @@ to the standalone plugins they provide); FerroStash side = the
 |----------|---------------:|-----------:|:--------:|
 | Codecs   | 19  | 19 | **100%** |
 | Filters  | 35  | 26 | **74%**  |
-| Inputs   | 34  | 15 | **44%**  |
+| Inputs   | 34  | 16 | **47%**  |
 | Outputs  | 23  | 10 | **43%**  |
-| **Total**| **111** | **70** | **~63%** |
+| **Total**| **111** | **71** | **~64%** |
 
 The hot path most pipelines actually use — `grok` / `dissect` / `kv` / `json` /
 `mutate` / `date` / parse-and-route — is well covered. What's thin is the long
@@ -48,19 +48,19 @@ sleep, split, throttle, translate, truncate, urldecode, useragent, xml
 Painless-subset scripting — the fast alternative to `ruby`), `bytes`,
 `json_encode`
 
-## Inputs — 15/34
+## Inputs — 16/34
 
 **Covered:** beats (also serves `elastic_agent`), dead_letter_queue,
-elasticsearch, file, generator, heartbeat, http, kafka, pipeline (Logstash's
-`logstash` integration input), redis, s3, stdin, syslog, tcp, udp
+elasticsearch, file, generator, heartbeat, http, **http_poller**, kafka, pipeline
+(Logstash's `logstash` integration input), redis, s3, stdin, syslog, tcp, udp
 
 **Missing:** `azure_event_hubs`, `cloudwatch`, `couchdb_changes`,
 `elastic_serverless_forwarder`, `exec`, `ganglia`, `gelf`, `graphite`,
-**`http_poller`**, **`jdbc`**, `jms`, `pipe`, `rabbitmq`, `snmp`, `snmptrap`,
-**`sqs`**, `twitter`, `unix`
+**`jdbc`**, `jms`, `pipe`, `rabbitmq`, `snmp`, `snmptrap`, **`sqs`**, `twitter`,
+`unix`
 
-The notable absences for migrations are **`jdbc`** (database ingestion),
-**`http_poller`**, and the AWS pull inputs (**`sqs`**, `cloudwatch`).
+The notable absences for migrations are **`jdbc`** (database ingestion) and the
+AWS pull inputs (**`sqs`**, `cloudwatch`). _(`http_poller`: added — Wave 1.)_
 
 ## Outputs — 10/23
 
@@ -97,9 +97,19 @@ plain, rubydebug
   an "unknown … plugin" error — it does not silently drop. Check this matrix
   before migrating a pipeline that leans on a connector in the *Missing* lists.
 
-## Roadmap signal
+## Gap-closure plan
 
-The cheapest high-value additions for migration coverage are the connectors most
-real pipelines depend on: `jdbc` (input + output), `http_poller` input, the AWS
-`sqs` / `sns` / `cloudwatch` set, and the `udp` / `csv` / `email` outputs. File
-an issue if one of these blocks you — it helps prioritise.
+Closing the connector gap toward broad coverage, in priority waves. Each new
+plugin keeps Logstash config-key compatibility and ships with compile + unit
+tests plus an `#[ignore]` live smoke test (LocalStack for AWS, a local DB for
+JDBC, etc.), matching the existing connector discipline.
+
+| Wave | Plugins | Notes / infra |
+|------|---------|---------------|
+| **1 — migration blockers** | `http_poller` input · `sqs` input/output · `sns` output · `jdbc` input/output | The connectors real pipelines most depend on. http_poller = reqwest (no infra); sqs/sns = AWS SDK (LocalStack); jdbc = native Rust drivers via `sqlx` (Postgres/MySQL/SQLite/MSSQL), not a Java JDBC driver |
+| **2 — cheap, no external infra** | filters `cidr` · `uuid` · `syslog_pri` · `anonymize`; outputs `udp` · `csv` | Pure logic / reuse — quick coverage bumps |
+| **3 — messaging & web** | `rabbitmq` in/out · `gelf` input · `graphite` in/out · `email` output · `http` filter · `memcached` filter · `cloudwatch` in/out | Each needs its client lib + a local service for the live smoke |
+| **4 — heavy / niche** | `snmp`/`snmptrap` · `jms` · `azure_event_hubs` · `webhdfs` · `lumberjack` · `nagios` · `twitter` · … | Case-by-case as demand warrants |
+
+Status (this branch): **Wave 1 in progress.** File an issue to bump a plugin's
+priority.
