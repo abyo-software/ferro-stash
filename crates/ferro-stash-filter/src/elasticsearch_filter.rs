@@ -1277,17 +1277,37 @@ mod tests {
     #[ignore = "requires a running Elasticsearch; set ES_URL to enable"]
     async fn test_elasticsearch_live_search() {
         let url = std::env::var("ES_URL").expect("ES_URL must be set for this test");
+        let index = "ferro-stash-filter-live";
+        let http = reqwest::Client::new();
+        // Seed a known document and refresh so it is immediately searchable.
+        http.post(format!("{url}/{index}/_doc?refresh=true"))
+            .json(&serde_json::json!({ "marker": "ferro-live", "msg": "hello" }))
+            .send()
+            .await
+            .expect("seed request")
+            .error_for_status()
+            .expect("seed must return 2xx");
+
         let settings = serde_json::json!({
             "hosts": [url],
-            "index": "_all",
+            "index": index,
             "target": "es_result",
             "result_size": 1
+            // default query_template => match_all, which matches the seeded doc
         });
         let filter = ElasticsearchFilter::from_config(&settings, None).expect("config");
         let result = filter.filter(Event::new("test")).await.expect("filter");
-        // We can't assert on cluster contents, but a reachable cluster must
-        // not produce a connection failure tag (it may legitimately have 0
-        // hits -> failure tag, so only assert the call did not panic and ran).
-        let _ = &result[0];
+
+        // The seeded doc guarantees a hit, so the lookup must populate `target`
+        // (and NOT add the failure tag) — proving the real `_search` round-trip
+        // mapped a `hits.hits[]._source` into the event, not just "didn't panic".
+        assert!(
+            result[0].get("es_result").is_some(),
+            "live ES lookup must map the hit into the target field"
+        );
+        assert!(
+            !result[0].has_tag("_elasticsearch_lookup_failure"),
+            "a successful live lookup must not carry the failure tag"
+        );
     }
 }

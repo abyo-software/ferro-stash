@@ -1610,4 +1610,45 @@ mod tests {
             "index source must NOT wrap the event under `doc`: {body}"
         );
     }
+
+    /// Live test against a real Elasticsearch: index an event via the Bulk API
+    /// and confirm it is queryable. Gated behind `ES_URL`; run with
+    /// `ES_URL=http://localhost:9200 cargo test -p ferro-stash-output -- --ignored es_output_live`.
+    #[tokio::test]
+    #[ignore = "requires a running Elasticsearch; set ES_URL to enable"]
+    async fn es_output_live_index() {
+        let url = std::env::var("ES_URL").expect("ES_URL must be set for this test");
+        let index = "ferro-stash-output-live";
+        let http = Client::new();
+        // Clean slate so the count assertion is deterministic across reruns.
+        let _ = http.delete(format!("{url}/{index}")).send().await;
+
+        let settings = serde_json::json!({ "hosts": [url.clone()], "index": index });
+        let output = ElasticsearchOutput::from_config(&settings, None).expect("config");
+        let mut event = Event::new("es output live smoke");
+        event.set("marker", EventValue::String("ferro-out-live".into()));
+        output
+            .output(vec![event])
+            .await
+            .expect("live bulk index should succeed");
+        output.flush().await.expect("flush");
+
+        // Refresh, then confirm the document is actually present in the index.
+        http.post(format!("{url}/{index}/_refresh"))
+            .send()
+            .await
+            .expect("refresh");
+        let count: serde_json::Value = http
+            .get(format!("{url}/{index}/_count"))
+            .send()
+            .await
+            .expect("count request")
+            .json()
+            .await
+            .expect("count json");
+        assert!(
+            count["count"].as_u64().unwrap_or(0) >= 1,
+            "the bulk-indexed document must be countable in ES: {count}"
+        );
+    }
 }
