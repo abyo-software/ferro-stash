@@ -25,10 +25,14 @@ set -euo pipefail
 LINES="${1:-5000000}"
 RUNS="${2:-5}"
 WORKERS="${3:-$(nproc)}"
-# The ruby(mruby) custom filter is ~100x slower than the native path, so the
-# custom group uses a smaller line count (still >> startup for steady-state)
-# to keep wall time sane. Override with CUSTOM_LINES.
-CUSTOM_LINES="${CUSTOM_LINES:-500000}"
+# Custom-logic line counts, per engine speed:
+#  * FS mruby is ~100x slower than the native path — a small count keeps wall
+#    time sane (still >> startup).
+#  * FS Painless and LS JRuby are fast AND JRuby pays a ~7s JVM cold-start, so
+#    they need MANY more lines for the run to dwarf startup (otherwise the
+#    startup-subtraction is ill-conditioned and the row is flagged "raise LINES").
+CUSTOM_LINES_SLOW="${CUSTOM_LINES_SLOW:-300000}"   # FS ruby (mruby)
+CUSTOM_LINES_FAST="${CUSTOM_LINES_FAST:-3000000}"  # FS script / LS ruby (JRuby)
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 PD="${BENCH_DIR:-/tmp/ferro-bench}"
@@ -112,7 +116,7 @@ PY
 
 echo "FerroStash: $("$FS" --version 2>/dev/null | head -1)"
 [ -n "$LS_HOME" ] && echo "Logstash:   $("$LS_HOME/bin/logstash" --version 2>/dev/null | tail -1)" || echo "Logstash:   (LS_HOME unset — FerroStash-only run)"
-echo "lines=$LINES (custom=$CUSTOM_LINES) runs=$RUNS workers=$WORKERS host=$(uname -m) cores=$(nproc)"
+echo "lines=$LINES (custom slow=$CUSTOM_LINES_SLOW fast=$CUSTOM_LINES_FAST) runs=$RUNS workers=$WORKERS host=$(uname -m) cores=$(nproc)"
 echo
 
 RESULTS="$PD/results.md"
@@ -127,9 +131,9 @@ for f in grok dissect json kv csv; do
 done
 measure "FS native(grok+mutate)" fs "$CONF/native.fs.conf" accesslog
 measure "LS native(grok+mutate)" ls "$CONF/native.ls.conf" accesslog
-measure "FS custom: script(JIT)" fs "$CONF/custom_script.fs.conf" accesslog "$CUSTOM_LINES"
-measure "FS custom: ruby(mruby)" fs "$CONF/custom_ruby.fs.conf"   accesslog "$CUSTOM_LINES"
-measure "LS custom: ruby(JRuby)" ls "$CONF/custom_ruby.ls.conf"   accesslog "$CUSTOM_LINES"
+measure "FS custom: script(JIT)" fs "$CONF/custom_script.fs.conf" accesslog "$CUSTOM_LINES_FAST"
+measure "FS custom: ruby(mruby)" fs "$CONF/custom_ruby.fs.conf"   accesslog "$CUSTOM_LINES_SLOW"
+measure "LS custom: ruby(JRuby)" ls "$CONF/custom_ruby.ls.conf"   accesslog "$CUSTOM_LINES_FAST"
 
 echo; echo "================ RESULTS ================"; cat "$RESULTS"
 echo; echo "(saved to $RESULTS)"

@@ -49,10 +49,12 @@ eval "$(./bench/setup_logstash.sh 8.17.0)"   # sets LS_HOME
 LS_HOME="$LS_HOME" ./bench/run_bench.sh 5000000 5 "$(nproc)"
 ```
 
-The slow `ruby` (mruby) custom filter uses a smaller line count than the native
-workloads so wall time stays sane — override with `CUSTOM_LINES` (default
-500,000). Without `LS_HOME` set, only the FerroStash side runs (useful for
-FS-only regression checks). Results are printed and saved to
+The custom-logic group uses per-engine line counts: the slow FS `ruby` (mruby)
+runs `CUSTOM_LINES_SLOW` (default 300k) so wall time stays sane, while the fast
+FS `script` and LS `ruby` (JRuby) run `CUSTOM_LINES_FAST` (default 3M) so the
+run dwarfs JRuby's ~7s JVM cold-start (otherwise the startup-subtraction is
+ill-conditioned and the row is flagged `raise LINES`). Without `LS_HOME` set,
+only the FerroStash side runs (useful for FS-only regression checks). Results are printed and saved to
 `$BENCH_DIR/results.md` (default `/tmp/ferro-bench/results.md`).
 
 ## Honesty notes
