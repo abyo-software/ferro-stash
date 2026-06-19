@@ -10,12 +10,15 @@ rust-version = "1.88.0"
 
 [dependencies]
 ferro-stash-core = { workspace = true }
-artichoke-backend = { path = "../../../../artichoke-extended/artichoke-backend", default-features = false, features = [
+# Artichoke (mruby) fork, pinned to a public revision so a fresh clone builds
+# without needing a sibling checkout. Repo: abyo-software/artichoke-extended
+# (branch `extended`). Bump `rev` to adopt fork updates.
+artichoke-backend = { git = "https://github.com/abyo-software/artichoke-extended", rev = "245b89427ccbcf98b0c116dbfcf57a097c28b151", default-features = false, features = [
     "core-full",
     "stdlib-full",
     "output-strategy-capture",
 ] }
-artichoke-core = { path = "../../../../artichoke-extended/artichoke-core" }
+artichoke-core = { git = "https://github.com/abyo-software/artichoke-extended", rev = "245b89427ccbcf98b0c116dbfcf57a097c28b151" }
 serde_json = { workspace = true }
 indexmap = { workspace = true }
 tracing = { workspace = true }

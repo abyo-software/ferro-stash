@@ -6,21 +6,11 @@
 #
 # Build notes
 # -----------
-# * The `ferro-stash-ruby` crate depends on a LOCAL fork of Artichoke via a
-#   relative path dependency:
-#     crates/ferro-stash-ruby/Cargo.toml ->
-#       ../../../../artichoke-extended/artichoke-backend
-#   That is FOUR `..` hops from the crate dir
-#   (.../ferro-stash-ruby -> crates -> <repo> -> <parent> -> <grandparent>),
-#   so the fork resolves to the repo's GRANDPARENT dir, NOT the repo's parent.
-#   This is why CI clones it to `$GITHUB_WORKSPACE/../../artichoke-extended`
-#   (GITHUB_WORKSPACE = _work/ferro-stash/ferro-stash). To reproduce that here
-#   we nest the repo one extra level: repo at /build/ferro-stash/ferro-stash and
-#   the fork at /build/artichoke-extended. We clone the `extended` branch (this
-#   mirrors .github/workflows/ci.yml). Verified: from
-#   /build/ferro-stash/ferro-stash/crates/ferro-stash-ruby, four `..` =
-#   /build, so .../artichoke-extended/artichoke-backend = /build/artichoke-...
-# * mruby FFI in ferro-stash-ruby needs a C compiler (clang) + cmake; the
+# * The image is built WITH the optional `ruby` filter (`--features ruby`) for
+#   full Logstash drop-in compatibility. Its Artichoke (mruby) dependency is a
+#   rev-pinned git dependency (abyo-software/artichoke-extended), fetched by
+#   cargo — no sibling checkout or submodule needed.
+# * mruby FFI (the ruby feature) needs a C compiler (clang) + cmake; the
 #   `rdkafka` dependency vendors librdkafka and also needs cmake. pkg-config
 #   and perl are required by some -sys crates.
 # * The binary uses rustls for TLS, so no system OpenSSL is needed at
@@ -43,7 +33,7 @@ FROM rust:1.95-bookworm AS builder
 #   cmake       -> vendored librdkafka (rdkafka), other -sys crates
 #   pkg-config  -> -sys crate discovery
 #   perl/make   -> some build scripts
-#   git         -> clone the Artichoke fork sibling
+#   git         -> cargo fetches the Artichoke git dependency
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         clang \
@@ -58,30 +48,13 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
+COPY . /build
 
-# Clone the Artichoke fork so the path dep resolves. Path math (verified):
-# from /build/ferro-stash/ferro-stash/crates/ferro-stash-ruby, the four `..`
-# hops in `../../../../artichoke-extended` land on /build, so the fork must
-# live at /build/artichoke-extended.
-# Pinned to a commit for reproducible image builds (override with
-# --build-arg ARTICHOKE_SHA=... ; bump when the fork advances).
-ARG ARTICHOKE_SHA=245b89427ccbcf98b0c116dbfcf57a097c28b151
-RUN git init -q /build/artichoke-extended \
-    && git -C /build/artichoke-extended remote add origin \
-        https://github.com/masumi-ryugo/artichoke-extended.git \
-    && git -C /build/artichoke-extended fetch --depth 1 origin "$ARTICHOKE_SHA" \
-    && git -C /build/artichoke-extended reset --hard FETCH_HEAD
-
-# Copy the repo into /build/ferro-stash/ferro-stash (one extra nesting level so
-# the four-`..` path dep above reaches /build — this mirrors CI's
-# _work/ferro-stash/ferro-stash layout).
-COPY . /build/ferro-stash/ferro-stash
-WORKDIR /build/ferro-stash/ferro-stash
-
-# Build only the release CLI binary. `--locked` would require Cargo.lock to be
-# in sync with the (unpinned) path dep, which it is not by design, so we omit it.
-RUN cargo build --release --bin ferro-stash \
-    && strip /build/ferro-stash/ferro-stash/target/release/ferro-stash || true
+# Build the release CLI with the `ruby` filter. Artichoke is fetched from its
+# rev-pinned git dependency (recorded in Cargo.lock); no sibling checkout or
+# nesting is needed.
+RUN cargo build --release --bin ferro-stash --features ruby \
+    && strip /build/target/release/ferro-stash || true
 
 # ---------------------------------------------------------------------------
 # Stage 2 — runtime
@@ -100,7 +73,7 @@ RUN apt-get update \
     && mkdir -p /etc/ferro-stash /var/lib/ferro-stash \
     && chown -R ferrostash:ferrostash /var/lib/ferro-stash
 
-COPY --from=builder /build/ferro-stash/ferro-stash/target/release/ferro-stash \
+COPY --from=builder /build/target/release/ferro-stash \
      /usr/local/bin/ferro-stash
 
 # Pipeline config is mounted here; the optional GeoIP database is referenced

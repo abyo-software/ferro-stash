@@ -15,6 +15,23 @@ members = [
     "crates/ferro-script",
     "crates/ferro-stash-e2e",
 ]
+# ferro-stash-ruby embeds the Artichoke mruby interpreter (a heavy native build,
+# pulled as a git dependency). It is kept out of `default-members` so the
+# common commands — bare `cargo build` / `cargo test` / `cargo run` — stay
+# light and artichoke-free. It is still a member (so `-p ferro-stash-ruby` and
+# `--workspace` work); build the ruby filter with
+# `cargo build -p ferro-stash-filter --features ruby`.
+default-members = [
+    "crates/ferro-stash-core",
+    "crates/ferro-stash-config",
+    "crates/ferro-stash-input",
+    "crates/ferro-stash-filter",
+    "crates/ferro-stash-output",
+    "crates/ferro-stash-codec",
+    "crates/ferro-stash-cli",
+    "crates/ferro-script",
+    "crates/ferro-stash-e2e",
+]
 
 [workspace.package]
 version = "0.1.0"

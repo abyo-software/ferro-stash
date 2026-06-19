@@ -12,6 +12,12 @@ rust-version.workspace = true
 name = "ferro-stash"
 path = "src/main.rs"
 
+[features]
+default = []
+# Build the `ruby` filter (embeds Artichoke mruby; needs clang/gcc + cmake).
+# Off by default to keep the default binary light and toolchain-free.
+ruby = ["ferro-stash-filter/ruby"]
+
 [dependencies]
 ferro-stash-core = { workspace = true }
 ferro-stash-config = { workspace = true }

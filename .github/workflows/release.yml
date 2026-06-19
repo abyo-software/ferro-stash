@@ -51,32 +51,14 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
 
-      # ferro-stash-ruby depends on artichoke-backend/artichoke-core via a
-      # sibling path (`../../../../artichoke-extended/...` relative to the crate
-      # manifest). From $GITHUB_WORKSPACE that resolves to the parent's parent
-      # dir; clone the `extended` branch there (mirrors .github/workflows/ci.yml).
-      - name: Checkout artichoke-extended (sibling path dep)
-        env:
-          # Pinned commit for reproducible release builds. Bump when the fork
-          # advances and the main code requires it. (dev CI floats `extended`.)
-          ARTICHOKE_SHA: 245b89427ccbcf98b0c116dbfcf57a097c28b151
-        run: |
-          set -euo pipefail
-          SIBLING="$GITHUB_WORKSPACE/../../artichoke-extended"
-          if [ ! -d "$SIBLING/.git" ]; then
-            rm -rf "$SIBLING"
-            mkdir -p "$SIBLING"
-            git -C "$SIBLING" init -q
-            git -C "$SIBLING" remote add origin \
-              https://github.com/masumi-ryugo/artichoke-extended.git
-          fi
-          git -C "$SIBLING" fetch --depth=1 origin "$ARTICHOKE_SHA"
-          git -C "$SIBLING" reset --hard FETCH_HEAD
-
       - uses: Swatinem/rust-cache@v2
 
+      # The release binary ships WITH the `ruby` filter for full Logstash
+      # drop-in compatibility. Artichoke is fetched from its rev-pinned git
+      # dependency (abyo-software/artichoke-extended) — no sibling checkout
+      # needed. The build deps above (clang/llvm/cmake) cover the mruby FFI.
       - name: Build release binary
-        run: cargo build --release --bin ferro-stash
+        run: cargo build --release --bin ferro-stash --features ruby
 
       # Smoke check: the binary must run. Use --help (always exits 0) and
       # --version. The binary self-identifies as Logstash-compatible.

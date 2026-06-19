@@ -25,26 +25,12 @@ jobs:
     runs-on: [self-hosted, Linux, X64, kvm]
     steps:
       - uses: actions/checkout@v4
-      # ferro-stash-ruby depends on artichoke-backend/artichoke-core via a
-      # sibling path (`../../../../artichoke-extended/...` relative to the
-      # crate manifest). From $GITHUB_WORKSPACE (= _work/ferro-stash/ferro-stash)
-      # that resolves to _work/artichoke-extended, so clone there.
-      - name: Checkout artichoke-extended (sibling path dep)
-        run: |
-          set -euo pipefail
-          SIBLING="$GITHUB_WORKSPACE/../../artichoke-extended"
-          if [ -d "$SIBLING/.git" ]; then
-            git -C "$SIBLING" fetch --depth=1 origin extended
-            git -C "$SIBLING" reset --hard FETCH_HEAD
-          else
-            rm -rf "$SIBLING"
-            git clone --depth=1 --branch extended \
-              https://github.com/masumi-ryugo/artichoke-extended.git "$SIBLING"
-          fi
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov
+      # --workspace includes ferro-stash-ruby (a member), which pulls Artichoke
+      # from its git dependency — no sibling checkout needed.
       - run: cargo llvm-cov --workspace --cobertura --output-path cobertura.xml
       - name: Upload coverage artefact
         uses: actions/upload-artifact@v4

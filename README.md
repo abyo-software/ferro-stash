@@ -258,38 +258,40 @@ filter is measurably *slower* than Logstash's JRuby on the same code
 to be fast, prefer the native `script` (Painless-style) filter, which is
 JIT-compiled and considerably faster than either Ruby engine.
 
-**Fork dependency (important maintenance note):**
-`ferro-stash-ruby` does not depend on a published Artichoke crate. It
-uses a **filesystem path dependency** to a local fork checked out
-alongside this repository:
+**Optional, off by default.** The Ruby filter lives behind the `ruby` cargo
+feature and is **not** built by default, so the common build is light and
+needs no extra toolchain:
+
+```bash
+cargo build                                        # default — no Ruby/Artichoke
+cargo build -p ferro-stash --features ruby         # CLI with the Ruby filter
+```
+
+A pipeline that uses `ruby { ... }` in a binary built without the feature fails
+fast with a clear "rebuild with `--features ruby`" error rather than silently
+dropping the filter.
+
+**Fork dependency (maintenance note):** `ferro-stash-ruby` depends on a fork of
+Artichoke pulled as a **rev-pinned git dependency**, so a fresh clone builds
+the Ruby feature with no sibling checkout:
 
 ```toml
 # crates/ferro-stash-ruby/Cargo.toml
-artichoke-backend = { path = "../../../../artichoke-extended/artichoke-backend", ... }
-artichoke-core    = { path = "../../../../artichoke-extended/artichoke-core" }
+artichoke-backend = { git = "https://github.com/abyo-software/artichoke-extended", rev = "245b894...", ... }
+artichoke-core    = { git = "https://github.com/abyo-software/artichoke-extended", rev = "245b894..." }
 ```
 
-Relative to the crate, that path resolves to a sibling checkout named
-`artichoke-extended` (e.g. `/home/y1/git/artichoke-extended`). Because it
-is a **path** dependency, not a git dependency, no upstream commit or
-branch is pinned inside this repository's `Cargo.toml` or `Cargo.lock` —
-the build simply uses whatever is currently checked out at that path.
-Upstream Artichoke is a low-activity project; the fork carries local
-patches needed for Logstash Ruby-filter compatibility.
+The fork (branch `extended`) carries local patches needed for Logstash
+Ruby-filter compatibility. Notes:
 
-The maintenance implications are real and should not be glossed over:
-
-- **The build will not work from a fresh clone alone** — the
-  `artichoke-extended` fork must be present at the expected relative
-  path. There is no vendored copy or git submodule in this repo.
-- **No reproducible pin.** Whichever branch/commit the fork happens to
-  be on is what gets compiled. (At time of writing the fork was on a
-  branch named `extended`; some docs in this repo refer to an
-  `integration/logstash-compat` branch — treat the on-disk checkout as
-  the source of truth, not the prose.)
-- **Bus-factor and upstream risk.** The Ruby filter's long-term
-  viability is tied to maintaining this fork. It is deliberately isolated
-  in its own crate so the rest of the pipeline is unaffected if Ruby
+- **A fresh clone builds** — `cargo build --features ruby` fetches the pinned
+  fork revision automatically; there is no submodule or sibling-checkout
+  requirement. The default build doesn't fetch it at all.
+- **Reproducible pin.** The exact `rev` is recorded in `Cargo.toml` /
+  `Cargo.lock`; bump it deliberately to adopt fork updates.
+- **Bus-factor and upstream risk.** The Ruby filter's long-term viability is
+  tied to maintaining this fork. It is deliberately isolated in its own crate
+  (and behind a feature) so the rest of the pipeline is unaffected if Ruby
   support is dropped or reworked.
 
 ## Architecture
@@ -320,23 +322,31 @@ More detail: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 ## Build, test, run
 
 ```bash
-cargo build --workspace
-cargo test  --workspace          # 1,165 pass / 16 ignored on the current HEAD
-cargo clippy --workspace -- -D warnings
+# Default build: light, no Ruby/Artichoke (operates on default-members)
+cargo build
+cargo test
+cargo clippy --all-targets
 cargo fmt --all -- --check
 cargo deny check
+
+# Optional Ruby filter (pulls Artichoke from its git dependency; needs clang/gcc + cmake)
+cargo build -p ferro-stash --features ruby
+cargo test  -p ferro-stash-filter --features ruby
 ```
+
+The default build excludes `ferro-stash-ruby` (it is not a `default-member`), so
+it is fast and toolchain-light. `cargo build --workspace` additionally compiles
+the Ruby crate.
 
 ### Prerequisites
 
 - Rust stable (`rust-version = 1.75` workspace-wide; `ferro-stash-ruby`
   raises its own MSRV to 1.88 and uses edition 2024).
-- A C compiler (clang or gcc) — required to compile the Artichoke/mruby
-  FFI in `ferro-stash-ruby`.
 - **`cmake`** — required by the `kafka` plugins, which pull `rdkafka` and
   build a vendored `librdkafka` via CMake. (TLS in the connectors uses
   rustls, so no system OpenSSL is needed.)
-- The `artichoke-extended` fork checked out at the path described above.
+- A C compiler (clang or gcc) — **only** for the optional `ruby` feature
+  (Artichoke/mruby FFI). The default build does not need it.
 - **Runtime, not build-time:** the `geoip` filter needs a user-supplied
   `.mmdb` (GeoLite2/GeoIP2) database file at the configured `database`
   path; it is not vendored.

@@ -26,36 +26,31 @@ The monitoring API defaults to **127.0.0.1**, so containers/pods bind
 `--path.data` holds a per-instance lock file, the instance `uuid`, and any
 persistent queue / DLQ state. It must be unique per instance and writable.
 
-## The Artichoke build dependency
+## The Artichoke build dependency (optional `ruby` feature)
 
-`ferro-stash-ruby` depends on a **local fork of Artichoke** via a filesystem
-path dependency:
+The `ruby` filter is **optional and off by default**. `ferro-stash-ruby`
+depends on a fork of Artichoke pulled as a **rev-pinned git dependency**:
 
+```toml
+# crates/ferro-stash-ruby/Cargo.toml
+artichoke-backend = { git = "https://github.com/abyo-software/artichoke-extended", rev = "245b894...", ... }
 ```
-crates/ferro-stash-ruby/Cargo.toml ->
-    ../../../../artichoke-extended/artichoke-backend
-```
 
-From the crate manifest, the four `..` hops in `../../../../artichoke-extended`
-resolve to the repo checkout's **grandparent** directory (crate → `crates` →
-repo → parent → grandparent), so the fork lives two levels above the crate's
-repo, not directly beside it. The fork is public at
-<https://github.com/masumi-ryugo/artichoke-extended> and the relevant branch is
-**`extended`**.
+The fork is public at <https://github.com/abyo-software/artichoke-extended>
+(branch `extended`). Because it is a git dependency recorded in `Cargo.lock`:
 
-- **CI / the release workflow** clone it to
-  `$GITHUB_WORKSPACE/../../artichoke-extended`, where
-  `$GITHUB_WORKSPACE = _work/ferro-stash/ferro-stash`, i.e. the fork ends up at
-  `_work/artichoke-extended`.
-- **Docker** reproduces that layout by nesting the repo one extra level: the
-  repo is copied to `/build/ferro-stash/ferro-stash` and the fork is cloned to
-  `/build/artichoke-extended`, so the four-`..` path dep reaches `/build`.
+- **A fresh clone builds with no extra checkout** — `cargo build --features
+  ruby` fetches the pinned revision automatically. The default `cargo build`
+  doesn't fetch it at all.
+- **CI / the release workflow / Docker** build with `--features ruby` and rely
+  on cargo to fetch the fork; there is no sibling-checkout or repo-nesting hack.
+- The release binary and Docker image ship **with** the `ruby` filter enabled
+  for full Logstash drop-in compatibility.
 
-A fresh clone of `ferro-stash` alone will **not** build without this fork.
-
-Build toolchain needed: Rust stable, **clang** (mruby FFI), **cmake** (vendored
-librdkafka for the kafka plugins), pkg-config. TLS uses rustls — no system
-OpenSSL required. At runtime only `ca-certificates` is needed for outbound TLS.
+Build toolchain needed: Rust stable, **cmake** (vendored librdkafka for the
+kafka plugins). The `ruby` feature additionally needs **clang/gcc** (mruby FFI)
+— not required for the default build. TLS uses rustls — no system OpenSSL
+required. At runtime only `ca-certificates` is needed for outbound TLS.
 
 ---
 

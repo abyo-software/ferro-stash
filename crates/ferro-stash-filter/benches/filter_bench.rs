@@ -205,6 +205,7 @@ fn bench_date_filter(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(feature = "ruby")]
 fn bench_ruby_filter_simple(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().expect("runtime");
 
@@ -229,6 +230,7 @@ fn bench_ruby_filter_simple(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(feature = "ruby")]
 fn bench_ruby_filter_complex(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().expect("runtime");
 
@@ -322,8 +324,18 @@ criterion_group!(
     bench_dissect_filter,
     bench_kv_filter,
     bench_date_filter,
-    bench_ruby_filter_simple,
-    bench_ruby_filter_complex,
     bench_multi_filter_chain,
 );
+
+// The ruby benches only exist when the optional `ruby` feature is enabled.
+#[cfg(feature = "ruby")]
+criterion_group!(
+    ruby_benches,
+    bench_ruby_filter_simple,
+    bench_ruby_filter_complex,
+);
+
+#[cfg(feature = "ruby")]
+criterion_main!(benches, ruby_benches);
+#[cfg(not(feature = "ruby"))]
 criterion_main!(benches);

@@ -112,6 +112,7 @@ dependencies = [
 [[package]]
 name = "artichoke-backend"
 version = "0.26.0"
+source = "git+https://github.com/abyo-software/artichoke-extended?rev=245b89427ccbcf98b0c116dbfcf57a097c28b151#245b89427ccbcf98b0c116dbfcf57a097c28b151"
 dependencies = [
  "artichoke-core",
  "artichoke-load-path",
@@ -147,10 +148,12 @@ dependencies = [
 [[package]]
 name = "artichoke-core"
 version = "0.13.0"
+source = "git+https://github.com/abyo-software/artichoke-extended?rev=245b89427ccbcf98b0c116dbfcf57a097c28b151#245b89427ccbcf98b0c116dbfcf57a097c28b151"
 
 [[package]]
 name = "artichoke-load-path"
 version = "0.1.0"
+source = "git+https://github.com/abyo-software/artichoke-extended?rev=245b89427ccbcf98b0c116dbfcf57a097c28b151#245b89427ccbcf98b0c116dbfcf57a097c28b151"
 
 [[package]]
 name = "async-compression"
@@ -2873,6 +2876,7 @@ checksum = "88904434abc2901f197fe8cc55f0445e7ded921dba5911dad2e2b39b48e663c4"
 [[package]]
 name = "mezzaluna-conversion-methods"
 version = "1.0.0"
+source = "git+https://github.com/abyo-software/artichoke-extended?rev=245b89427ccbcf98b0c116dbfcf57a097c28b151#245b89427ccbcf98b0c116dbfcf57a097c28b151"
 dependencies = [
  "intaglio",
 ]
@@ -2880,6 +2884,7 @@ dependencies = [
 [[package]]
 name = "mezzaluna-type-registry"
 version = "2.0.0"
+source = "git+https://github.com/abyo-software/artichoke-extended?rev=245b89427ccbcf98b0c116dbfcf57a097c28b151#245b89427ccbcf98b0c116dbfcf57a097c28b151"
 
 [[package]]
 name = "mime"
@@ -3847,18 +3852,22 @@ dependencies = [
 [[package]]
 name = "scolapasta-aref"
 version = "0.1.0"
+source = "git+https://github.com/abyo-software/artichoke-extended?rev=245b89427ccbcf98b0c116dbfcf57a097c28b151#245b89427ccbcf98b0c116dbfcf57a097c28b151"
 
 [[package]]
 name = "scolapasta-fixable"
 version = "0.1.0"
+source = "git+https://github.com/abyo-software/artichoke-extended?rev=245b89427ccbcf98b0c116dbfcf57a097c28b151#245b89427ccbcf98b0c116dbfcf57a097c28b151"
 
 [[package]]
 name = "scolapasta-hex"
 version = "0.3.0"
+source = "git+https://github.com/abyo-software/artichoke-extended?rev=245b89427ccbcf98b0c116dbfcf57a097c28b151#245b89427ccbcf98b0c116dbfcf57a097c28b151"
 
 [[package]]
 name = "scolapasta-int-parse"
 version = "0.3.0"
+source = "git+https://github.com/abyo-software/artichoke-extended?rev=245b89427ccbcf98b0c116dbfcf57a097c28b151#245b89427ccbcf98b0c116dbfcf57a097c28b151"
 dependencies = [
  "posix-space",
  "scolapasta-string-escape",
@@ -3867,10 +3876,12 @@ dependencies = [
 [[package]]
 name = "scolapasta-path"
 version = "0.5.1"
+source = "git+https://github.com/abyo-software/artichoke-extended?rev=245b89427ccbcf98b0c116dbfcf57a097c28b151#245b89427ccbcf98b0c116dbfcf57a097c28b151"
 
 [[package]]
 name = "scolapasta-strbuf"
 version = "1.0.0"
+source = "git+https://github.com/abyo-software/artichoke-extended?rev=245b89427ccbcf98b0c116dbfcf57a097c28b151#245b89427ccbcf98b0c116dbfcf57a097c28b151"
 dependencies = [
  "raw-parts",
 ]
@@ -3878,6 +3889,7 @@ dependencies = [
 [[package]]
 name = "scolapasta-string-escape"
 version = "0.3.0"
+source = "git+https://github.com/abyo-software/artichoke-extended?rev=245b89427ccbcf98b0c116dbfcf57a097c28b151#245b89427ccbcf98b0c116dbfcf57a097c28b151"
 dependencies = [
  "bstr",
 ]
@@ -4174,6 +4186,7 @@ checksum = "d5fe4ccb98d9c292d56fec89a5e07da7fc4cf0dc11e156b41793132775d3e591"
 [[package]]
 name = "spinoso-array"
 version = "0.11.0"
+source = "git+https://github.com/abyo-software/artichoke-extended?rev=245b89427ccbcf98b0c116dbfcf57a097c28b151#245b89427ccbcf98b0c116dbfcf57a097c28b151"
 dependencies = [
  "raw-parts",
 ]
@@ -4181,6 +4194,7 @@ dependencies = [
 [[package]]
 name = "spinoso-env"
 version = "0.3.0"
+source = "git+https://github.com/abyo-software/artichoke-extended?rev=245b89427ccbcf98b0c116dbfcf57a097c28b151#245b89427ccbcf98b0c116dbfcf57a097c28b151"
 dependencies = [
  "bstr",
  "scolapasta-path",
@@ -4190,6 +4204,7 @@ dependencies = [
 [[package]]
 name = "spinoso-exception"
 version = "0.3.0"
+source = "git+https://github.com/abyo-software/artichoke-extended?rev=245b89427ccbcf98b0c116dbfcf57a097c28b151#245b89427ccbcf98b0c116dbfcf57a097c28b151"
 dependencies = [
  "bstr",
  "scolapasta-string-escape",
@@ -4198,6 +4213,7 @@ dependencies = [
 [[package]]
 name = "spinoso-math"
 version = "0.3.0"
+source = "git+https://github.com/abyo-software/artichoke-extended?rev=245b89427ccbcf98b0c116dbfcf57a097c28b151#245b89427ccbcf98b0c116dbfcf57a097c28b151"
 dependencies = [
  "libm",
 ]
@@ -4205,6 +4221,7 @@ dependencies = [
 [[package]]
 name = "spinoso-random"
 version = "0.5.0"
+source = "git+https://github.com/abyo-software/artichoke-extended?rev=245b89427ccbcf98b0c116dbfcf57a097c28b151#245b89427ccbcf98b0c116dbfcf57a097c28b151"
 dependencies = [
  "getrandom 0.3.4",
  "libm",
@@ -4216,6 +4233,7 @@ dependencies = [
 [[package]]
 name = "spinoso-regexp"
 version = "0.5.0"
+source = "git+https://github.com/abyo-software/artichoke-extended?rev=245b89427ccbcf98b0c116dbfcf57a097c28b151#245b89427ccbcf98b0c116dbfcf57a097c28b151"
 dependencies = [
  "bitflags 2.13.0",
  "bstr",
@@ -4229,6 +4247,7 @@ dependencies = [
 [[package]]
 name = "spinoso-securerandom"
 version = "0.3.0"
+source = "git+https://github.com/abyo-software/artichoke-extended?rev=245b89427ccbcf98b0c116dbfcf57a097c28b151#245b89427ccbcf98b0c116dbfcf57a097c28b151"
 dependencies = [
  "base64",
  "getrandom 0.3.4",
@@ -4239,6 +4258,7 @@ dependencies = [
 [[package]]
 name = "spinoso-string"
 version = "0.27.0"
+source = "git+https://github.com/abyo-software/artichoke-extended?rev=245b89427ccbcf98b0c116dbfcf57a097c28b151#245b89427ccbcf98b0c116dbfcf57a097c28b151"
 dependencies = [
  "bstr",
  "bytecount",
@@ -4251,6 +4271,7 @@ dependencies = [
 [[package]]
 name = "spinoso-symbol"
 version = "0.5.0"
+source = "git+https://github.com/abyo-software/artichoke-extended?rev=245b89427ccbcf98b0c116dbfcf57a097c28b151#245b89427ccbcf98b0c116dbfcf57a097c28b151"
 dependencies = [
  "artichoke-core",
  "bstr",
@@ -4262,6 +4283,7 @@ dependencies = [
 [[package]]
 name = "spinoso-time"
 version = "0.10.0"
+source = "git+https://github.com/abyo-software/artichoke-extended?rev=245b89427ccbcf98b0c116dbfcf57a097c28b151#245b89427ccbcf98b0c116dbfcf57a097c28b151"
 dependencies = [
  "iana-time-zone",
  "strftime-ruby",

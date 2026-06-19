@@ -4,13 +4,13 @@
 
 - **Rust stable** (`rust-version = 1.75` workspace-wide; `ferro-stash-ruby`
   raises its MSRV to 1.88 and uses edition 2024) — install via [rustup](https://rustup.rs/)
-- **C/C++ compiler** (clang recommended) -- required for artichoke/mruby FFI compilation
+- **cmake** — required for the vendored librdkafka (kafka plugins)
 - **pkg-config** (macOS: `brew install pkg-config`)
 - **Git**
-- **The `artichoke-extended` fork** checked out as a sibling directory.
-  `ferro-stash-ruby` consumes it through a filesystem **path** dependency
-  (`../../../../artichoke-extended/...`), so a clone of this repo alone
-  will not build without it. There is no submodule or vendored copy.
+- **C/C++ compiler** (clang recommended) — **only** for the optional `ruby`
+  feature (Artichoke/mruby FFI). The default build does not need it. Artichoke
+  is a rev-pinned git dependency (`abyo-software/artichoke-extended`), so a
+  fresh clone builds `--features ruby` with no sibling checkout or submodule.
 
 On macOS:
 
@@ -32,7 +32,8 @@ cd ferro-stash
 cargo build
 ```
 
-First build takes longer due to artichoke-backend (mruby) compilation.
+The default build is light (no Artichoke). Building `--features ruby` takes
+longer the first time due to artichoke-backend (mruby) compilation.
 
 Release build:
 

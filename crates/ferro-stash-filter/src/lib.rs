@@ -20,6 +20,7 @@ pub mod kv;
 pub mod metrics;
 pub mod mutate;
 pub mod prune;
+#[cfg(feature = "ruby")]
 pub mod ruby;
 pub mod script;
 pub mod sleep_filter;
@@ -50,7 +51,18 @@ pub fn create_filter(
         "kv" => Box::new(kv::KvFilter::from_config(settings, condition)?),
         "drop" => Box::new(drop::DropFilter::from_config(settings, condition)?),
         "clone" => Box::new(clone_filter::CloneFilter::from_config(settings, condition)?),
+        #[cfg(feature = "ruby")]
         "ruby" => Box::new(ruby::RubyFilter::from_config(settings, condition)?),
+        #[cfg(not(feature = "ruby"))]
+        "ruby" => {
+            return Err(FerroStashError::Filter {
+                plugin: name.to_string(),
+                message: "the `ruby` filter requires building with the `ruby` cargo \
+                          feature (it embeds the Artichoke mruby interpreter); rebuild \
+                          with `--features ruby`"
+                    .to_string(),
+            });
+        }
         "script" | "painless" => Box::new(script::ScriptFilter::from_config(settings, condition)?),
         "geoip" => Box::new(geoip::GeoipFilter::from_config(settings, condition)?),
         "sleep" => Box::new(sleep_filter::SleepFilter::from_config(settings, condition)?),
@@ -156,11 +168,20 @@ mod tests {
         assert!(filter.is_ok());
     }
 
+    #[cfg(feature = "ruby")]
     #[test]
     fn test_create_ruby_filter() {
         let settings = serde_json::json!({ "code": "" });
         let filter = create_filter("ruby", &settings, None);
         assert!(filter.is_ok());
+    }
+
+    #[cfg(not(feature = "ruby"))]
+    #[test]
+    fn test_ruby_filter_errors_without_feature() {
+        let settings = serde_json::json!({ "code": "" });
+        let err = create_filter("ruby", &settings, None);
+        assert!(err.is_err(), "ruby must error when built without the feature");
     }
 
     #[test]

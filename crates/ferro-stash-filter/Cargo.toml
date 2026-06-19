@@ -8,9 +8,16 @@ license.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+# The `ruby` filter embeds the Artichoke mruby interpreter (pulled as a git
+# dependency, requires clang/gcc + cmake). Off by default so the common build
+# stays light and a fresh clone builds without the heavy native toolchain.
+ruby = ["dep:ferro-stash-ruby"]
+
 [dependencies]
 ferro-stash-core = { workspace = true }
-ferro-stash-ruby = { workspace = true }
+ferro-stash-ruby = { workspace = true, optional = true }
 ferro-script = { path = "../ferro-script" }
 serde = { workspace = true }
 serde_json = { workspace = true }
