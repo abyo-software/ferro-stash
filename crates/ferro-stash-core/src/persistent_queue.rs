@@ -402,9 +402,14 @@ impl PersistentQueue {
                 .map_err(|e| FerroStashError::Pipeline(format!("PQ flush error: {e}")))?;
         }
 
-        // Find and read segment files
-        let mut segments = self.list_segments()?;
-        segments.sort();
+        // Find and read segment files. `list_segments` (via `segment_files`)
+        // already returns them ordered by NUMERIC index. Do NOT re-sort
+        // lexicographically: names use minimum-width `{:08}`, so once the index
+        // passes 8 digits `segment_100000000` would sort *before*
+        // `segment_99999999`, causing dequeue to read a higher-index segment
+        // first, advance `read_seq`, and silently skip unread entries in the
+        // lower-index one (data loss).
+        let segments = self.list_segments()?;
 
         for seg_path in segments {
             if results.len() >= batch_size {
