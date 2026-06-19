@@ -300,13 +300,31 @@ impl Pipeline {
         // Logstash-compatible: pipeline stays alive until explicit shutdown,
         // even after all inputs finish (e.g., stdin EOF).
 
-        // Spawn filter workers (multiple, based on `workers` config)
+        // Spawn filter workers (multiple, based on `workers` config).
+        //
+        // `tokio::sync::mpsc` is single-consumer, so the workers cannot share the
+        // input receiver directly. Wrapping it in a `Mutex` (the previous design)
+        // serialized every event through one lock — throughput then peaked at a
+        // handful of workers and DEGRADED as more contended for it. Instead, a
+        // single distributor task drains `input_rx` and forwards into an
+        // `async-channel` MPMC queue that every worker receives from
+        // independently (no shared lock).
         let filters: Arc<Vec<Box<dyn FilterPlugin>>> = Arc::new(self.filters);
         let num_workers = self.config.workers.max(1);
-        let input_rx = Arc::new(tokio::sync::Mutex::new(input_rx));
+        let (work_tx, work_rx) = async_channel::bounded::<Event>(cap);
+        let distributor_handle = tokio::spawn(async move {
+            let mut input_rx = input_rx;
+            while let Some(ev) = input_rx.recv().await {
+                if work_tx.send(ev).await.is_err() {
+                    break; // every worker is gone
+                }
+            }
+            // `input_rx` is closed (all senders dropped); dropping `work_tx` here
+            // lets the workers observe the MPMC queue closed once it is drained.
+        });
         let mut filter_handles = Vec::new();
         for worker_id in 0..num_workers {
-            let rx = Arc::clone(&input_rx);
+            let rx = work_rx.clone();
             let tx = output_tx.clone();
             let f = Arc::clone(&filters);
             let ctx = WorkerCtx {
@@ -320,6 +338,9 @@ impl Pipeline {
             });
             filter_handles.push(handle);
         }
+        // Drop the original MPMC receiver so the queue closes once every worker
+        // (each holding its own clone) has exited.
+        drop(work_rx);
         // Drop original output_tx so outputs know when all filter workers are done
         drop(output_tx);
         info!(workers = num_workers, "filter workers started");
@@ -393,6 +414,12 @@ impl Pipeline {
         if let Some(handle) = drainer_handle {
             let _ = handle.await;
         }
+
+        // All `input_tx` senders are now dropped, so `input_rx` is closed. Await
+        // the distributor so it forwards the last events and drops `work_tx`
+        // before we wait on the workers (otherwise they would block on a queue
+        // that never closes).
+        let _ = distributor_handle.await;
 
         // Wait for filter and output workers to drain
         for handle in filter_handles {
@@ -654,7 +681,7 @@ async fn run_pq_drainer(
 
 async fn run_filter_worker(
     _worker_id: usize,
-    rx: Arc<tokio::sync::Mutex<mpsc::Receiver<Event>>>,
+    rx: async_channel::Receiver<Event>,
     tx: mpsc::Sender<Event>,
     filters: Arc<Vec<Box<dyn FilterPlugin>>>,
     ctx: WorkerCtx,
@@ -674,25 +701,20 @@ async fn run_filter_worker(
     loop {
         batch.clear();
 
-        // Drain up to FILTER_BATCH events under a single lock acquisition.
-        {
-            let mut guard = rx.lock().await;
-            for _ in 0..FILTER_BATCH {
-                match guard.try_recv() {
-                    Ok(event) => batch.push(event),
-                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                        // Channel closed — process remaining batch then exit
-                        break;
-                    }
-                }
+        // Drain up to FILTER_BATCH events from the MPMC queue — no shared lock,
+        // so workers pull in parallel.
+        for _ in 0..FILTER_BATCH {
+            match rx.try_recv() {
+                Ok(event) => batch.push(event),
+                Err(async_channel::TryRecvError::Empty) => break,
+                Err(async_channel::TryRecvError::Closed) => break,
             }
-            // If batch is empty, do a blocking recv to avoid busy-spin
-            if batch.is_empty() {
-                match guard.recv().await {
-                    Some(event) => batch.push(event),
-                    None => break, // channel fully closed
-                }
+        }
+        // If the batch is empty, block for the next event to avoid busy-spin.
+        if batch.is_empty() {
+            match rx.recv().await {
+                Ok(event) => batch.push(event),
+                Err(_) => break, // channel closed and fully drained
             }
         }
 

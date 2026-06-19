@@ -24,6 +24,7 @@ indexmap = { workspace = true }
 crossbeam-channel = { workspace = true }
 hostname = { workspace = true }
 async-trait = "0.1"
+async-channel = { workspace = true }
 regex = { workspace = true }
 num_cpus = { workspace = true }
 zstd = { workspace = true }
