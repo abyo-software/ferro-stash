@@ -37,6 +37,7 @@ redis = { version = "0.32.2", features = ["tokio-comp", "connection-manager"] }
 aws-config = { version = "1.8.11", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1.29.0"
 aws-sdk-sqs = "1.40"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "any", "postgres", "mysql", "sqlite"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

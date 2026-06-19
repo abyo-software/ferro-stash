@@ -5,6 +5,7 @@ pub mod datadog;
 pub mod elasticsearch;
 pub mod file;
 pub mod http;
+pub mod jdbc;
 pub mod kafka;
 pub mod null;
 pub mod pipeline;
@@ -61,6 +62,7 @@ pub fn create_output_with_bus(
             settings, condition,
         )?)),
         "tcp" => Ok(Box::new(tcp::TcpOutput::from_config(settings, condition)?)),
+        "jdbc" => Ok(Box::new(jdbc::JdbcOutput::from_config(settings, condition)?)),
         "null" => Ok(Box::new(null::NullOutput::from_config(
             settings, condition,
         )?)),

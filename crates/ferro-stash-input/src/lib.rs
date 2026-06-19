@@ -9,6 +9,7 @@ pub mod generator;
 pub mod heartbeat;
 pub mod http;
 pub mod http_poller;
+pub mod jdbc;
 pub mod kafka;
 pub mod pipeline;
 pub mod redis;
@@ -44,6 +45,7 @@ pub fn create_input_with_bus(
         "udp" => Ok(Box::new(udp::UdpInput::from_config(settings)?)),
         "http" => Ok(Box::new(http::HttpInput::from_config(settings)?)),
         "http_poller" => Ok(Box::new(http_poller::HttpPollerInput::from_config(settings)?)),
+        "jdbc" => Ok(Box::new(jdbc::JdbcInput::from_config(settings)?)),
         "syslog" => Ok(Box::new(syslog::SyslogInput::from_config(settings)?)),
         "generator" => Ok(Box::new(generator::GeneratorInput::from_config(settings)?)),
         "heartbeat" => Ok(Box::new(heartbeat::HeartbeatInput::from_config(settings)?)),

@@ -2,9 +2,9 @@
 # Logstash 9.4.2 compatibility matrix
 
 **Short answer: FerroStash is not feature-complete with Logstash.** It
-implements the production-common subset — **~67% of the plugins bundled with
-Logstash 9.4.2** (74 of 111), heavily weighted toward the parsing/filtering hot
-path. Connector breadth (AWS, JDBC, enterprise messaging) is the main gap.
+implements the production-common subset — **~68% of the plugins bundled with
+Logstash 9.4.2** (76 of 111), heavily weighted toward the parsing/filtering hot
+path. Connector breadth (AWS, enterprise messaging) is the main gap.
 
 Two distinct claims, don't conflate them:
 
@@ -27,9 +27,9 @@ to the standalone plugins they provide); FerroStash side = the
 |----------|---------------:|-----------:|:--------:|
 | Codecs   | 19  | 19 | **100%** |
 | Filters  | 35  | 26 | **74%**  |
-| Inputs   | 34  | 17 | **50%**  |
-| Outputs  | 23  | 12 | **52%**  |
-| **Total**| **111** | **74** | **~67%** |
+| Inputs   | 34  | 18 | **53%**  |
+| Outputs  | 23  | 13 | **57%**  |
+| **Total**| **111** | **76** | **~68%** |
 
 The hot path most pipelines actually use — `grok` / `dissect` / `kv` / `json` /
 `mutate` / `date` / parse-and-route — is well covered. What's thin is the long
@@ -48,31 +48,34 @@ sleep, split, throttle, translate, truncate, urldecode, useragent, xml
 Painless-subset scripting — the fast alternative to `ruby`), `bytes`,
 `json_encode`
 
-## Inputs — 17/34
+## Inputs — 18/34
 
 **Covered:** beats (also serves `elastic_agent`), dead_letter_queue,
-elasticsearch, file, generator, heartbeat, http, **http_poller**, kafka, pipeline
-(Logstash's `logstash` integration input), redis, s3, **sqs**, stdin, syslog, tcp, udp
+elasticsearch, file, generator, heartbeat, http, **http_poller**, **jdbc**, kafka,
+pipeline (Logstash's `logstash` integration input), redis, s3, **sqs**, stdin,
+syslog, tcp, udp
 
 **Missing:** `azure_event_hubs`, `cloudwatch`, `couchdb_changes`,
 `elastic_serverless_forwarder`, `exec`, `ganglia`, `gelf`, `graphite`,
-**`jdbc`**, `jms`, `pipe`, `rabbitmq`, `snmp`, `snmptrap`, `twitter`, `unix`
+`jms`, `pipe`, `rabbitmq`, `snmp`, `snmptrap`, `twitter`, `unix`
 
-The notable absences for migrations are **`jdbc`** (database ingestion) and the
-AWS pull inputs (`cloudwatch`). _(`http_poller`, `sqs`: added — Wave 1.)_
+The notable absences for migrations are now the AWS pull inputs (`cloudwatch`).
+_(`http_poller`, `sqs`, `jdbc`: added — Wave 1.)_ Note the `jdbc_static` /
+`jdbc_streaming` *filters* remain missing — those are separate plugins.
 
-## Outputs — 12/23
+## Outputs — 13/23
 
-**Covered:** elasticsearch (alias: opensearch / ferrosearch), file, http, kafka,
-null, pipeline (Logstash `logstash` integration output), redis, s3, **sqs**, **sns**, stdout, tcp
+**Covered:** elasticsearch (alias: opensearch / ferrosearch), file, http, **jdbc**,
+kafka, null, pipeline (Logstash `logstash` integration output), redis, s3,
+**sqs**, **sns**, stdout, tcp
 
-**Missing:** `cloudwatch`, `csv`, `email`, `graphite`, **`jdbc`**, `lumberjack`,
+**Missing:** `cloudwatch`, `csv`, `email`, `graphite`, `lumberjack`,
 `nagios`, `pipe`, `rabbitmq`, `udp`, `webhdfs`
 
 **Beyond Logstash (FerroStash extras):** `datadog`
 
 The notable absences are `cloudwatch`, `email`, `rabbitmq`, and — minor but easy
-to hit — `udp` and `csv` outputs. _(`sqs`, `sns`: added — Wave 1.)_
+to hit — `udp` and `csv` outputs. _(`sqs`, `sns`, `jdbc`: added — Wave 1.)_
 
 ## Codecs — 19/19
 
@@ -110,5 +113,5 @@ JDBC, etc.), matching the existing connector discipline.
 | **3 — messaging & web** | `rabbitmq` in/out · `gelf` input · `graphite` in/out · `email` output · `http` filter · `memcached` filter · `cloudwatch` in/out | Each needs its client lib + a local service for the live smoke |
 | **4 — heavy / niche** | `snmp`/`snmptrap` · `jms` · `azure_event_hubs` · `webhdfs` · `lumberjack` · `nagios` · `twitter` · … | Case-by-case as demand warrants |
 
-Status (this branch): **Wave 1 in progress** — `http_poller`, `sqs` in/out, `sns` out done; `jdbc` next. File an issue to bump a plugin's
+Status (this branch): **Wave 1 complete** — `http_poller`, `sqs` in/out, `sns` out, `jdbc` in/out done. (`jdbc_static` / `jdbc_streaming` *filters* are a separate, still-missing pair.) Next up: Wave 2. File an issue to bump a plugin's
 priority.
