@@ -10,7 +10,9 @@
 //! - `new_event_block` for creating additional events
 //! - Ruby stdlib (JSON, Time, Regexp, etc.)
 
-use std::sync::Mutex;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use ferro_stash_core::condition::Condition;
@@ -20,16 +22,30 @@ use ferro_stash_core::plugin::FilterPlugin;
 use ferro_stash_ruby::RubyRuntime;
 use tracing::warn;
 
+/// Unique id per `RubyFilter` instance, used to key the per-thread runtime cache.
+static RUBY_FILTER_ID: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    /// Per-worker-thread Artichoke interpreters, keyed by filter id. Artichoke
+    /// is not `Send`/`Sync`, so each worker thread builds and reuses its own
+    /// interpreter — letting the ruby filter run in parallel across the
+    /// pipeline's filter workers. The previous design shared a single
+    /// `Mutex<RubyRuntime>`, which serialized every event through one
+    /// interpreter, so adding workers gave no speedup at all.
+    static RUBY_RUNTIMES: RefCell<HashMap<u64, RubyRuntime>> = RefCell::new(HashMap::new());
+}
+
 #[derive(Debug)]
 pub struct RubyFilter {
+    id: u64,
+    /// Init code (event-bridge setup + user `init` + script `load`) used to
+    /// lazily build one interpreter per worker thread.
+    init_code: Option<String>,
     code: Option<String>,
     script_path: Option<String>,
     tag_on_exception: Vec<String>,
     tag_with_exception_message: bool,
     condition: Option<Condition>,
-    /// The Artichoke interpreter. Wrapped in Mutex because FilterPlugin::filter
-    /// takes &self but RubyRuntime::execute needs &mut self.
-    runtime: Mutex<RubyRuntime>,
 }
 
 impl RubyFilter {
@@ -78,19 +94,23 @@ impl RubyFilter {
             Some(full_init)
         };
 
-        let runtime = RubyRuntime::new(init_code).map_err(|e| {
+        // Validate the runtime builds (fail fast on bad init/script at config
+        // load). The validated runtime is dropped; each worker thread builds its
+        // own lazily in `filter`.
+        RubyRuntime::new(init_code.clone()).map_err(|e| {
             ferro_stash_core::error::FerroStashError::Config(format!(
                 "failed to initialize Ruby runtime: {e}"
             ))
         })?;
 
         Ok(Self {
+            id: RUBY_FILTER_ID.fetch_add(1, Ordering::Relaxed),
+            init_code,
             code,
             script_path,
             tag_on_exception,
             tag_with_exception_message,
             condition,
-            runtime: Mutex::new(runtime),
         })
     }
 }
@@ -102,16 +122,26 @@ impl FilterPlugin for RubyFilter {
     }
 
     async fn filter(&self, mut event: Event) -> Result<Vec<Event>> {
-        let mut runtime = self.runtime.lock().expect("ruby runtime lock poisoned");
+        if self.code.is_none() && self.script_path.is_none() {
+            return Ok(vec![event]); // no code or script — pass through
+        }
 
-        let result = if let Some(ref code) = self.code {
-            runtime.execute(code, &mut event)
-        } else if self.script_path.is_some() {
-            runtime.execute_script(&mut event)
-        } else {
-            // No code or script — pass through
-            return Ok(vec![event]);
-        };
+        // Execute on this worker thread's own interpreter (built once per thread,
+        // keyed by filter id), so filter workers run Ruby in parallel.
+        let result = RUBY_RUNTIMES.with(|cell| {
+            let mut map = cell.borrow_mut();
+            let runtime = match map.entry(self.id) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(RubyRuntime::new(self.init_code.clone())?)
+                }
+            };
+            if let Some(ref code) = self.code {
+                runtime.execute(code, &mut event)
+            } else {
+                runtime.execute_script(&mut event)
+            }
+        });
 
         match result {
             Ok(events) => Ok(events),

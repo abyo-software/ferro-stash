@@ -69,6 +69,15 @@ pub fn evaluate(script: &str, ctx: &mut ScriptContext) -> FerroResult<serde_json
     Ok(result.into())
 }
 
+/// Evaluate a **pre-parsed** program. Callers that run the same script against
+/// many inputs (e.g. the `script` filter, once per event) should `parse` once
+/// and reuse the cached AST here, instead of calling [`evaluate`] which
+/// re-parses the source on every call.
+pub fn evaluate_parsed(stmts: &[Stmt], ctx: &mut ScriptContext) -> FerroResult<serde_json::Value> {
+    let result = eval_stmts(stmts, ctx)?;
+    Ok(result.into())
+}
+
 /// Sentinel value to signal an early return from a loop or block.
 #[derive(Debug)]
 enum StmtResult {

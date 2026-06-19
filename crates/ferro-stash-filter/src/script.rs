@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Script filter — Painless-compatible native scripting.
 //!
-//! Provides a high-performance alternative to the Ruby filter. Scripts are
-//! written in a subset of Elasticsearch's Painless language and executed
-//! natively in Rust (no interpreter overhead).
+//! A native-Rust alternative to the Ruby filter, written in a subset of
+//! Elasticsearch's Painless language. The script is parsed once at config time
+//! and the cached AST is evaluated per event by `ferro-script`'s tree-walking
+//! interpreter (no JVM, no per-event parse).
 //!
 //! ```logstash
 //! filter {
@@ -22,7 +23,10 @@ use tracing::warn;
 
 #[derive(Debug)]
 pub struct ScriptFilter {
-    code: String,
+    /// The script parsed **once** at config time and reused for every event, so
+    /// the hot path never re-parses the source (it previously parsed per event).
+    /// `None` when the configured `code` is empty.
+    program: Option<Vec<ferro_script::Stmt>>,
     condition: Option<Condition>,
 }
 
@@ -35,7 +39,19 @@ impl ScriptFilter {
             .unwrap_or("")
             .to_string();
 
-        Ok(Self { code, condition })
+        // Parse once up front: a malformed script now fails fast at config load
+        // instead of tagging every event with `_scripterror` at runtime.
+        let program = if code.trim().is_empty() {
+            None
+        } else {
+            Some(ferro_script::parse(&code).map_err(|e| {
+                ferro_stash_core::error::FerroStashError::Config(format!(
+                    "script filter: invalid Painless source: {e}"
+                ))
+            })?)
+        };
+
+        Ok(Self { program, condition })
     }
 }
 
@@ -46,9 +62,9 @@ impl FilterPlugin for ScriptFilter {
     }
 
     async fn filter(&self, mut event: Event) -> Result<Vec<Event>> {
-        if self.code.is_empty() {
+        let Some(program) = self.program.as_ref() else {
             return Ok(vec![event]);
-        }
+        };
 
         // Build script context from event
         let mut ctx = ferro_script::ScriptContext::new();
@@ -72,8 +88,8 @@ impl FilterPlugin for ScriptFilter {
                 .insert(k.clone(), serde_json::Value::from(v.clone()));
         }
 
-        // Execute script
-        match ferro_script::evaluate(&self.code, &mut ctx) {
+        // Execute the pre-parsed script (no per-event re-parse).
+        match ferro_script::evaluate_parsed(program, &mut ctx) {
             Ok(_result) => {
                 // Apply changes from ctx._source back to event
                 if let serde_json::Value::Object(src) = &ctx.source {

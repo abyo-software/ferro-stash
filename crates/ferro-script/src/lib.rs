@@ -21,4 +21,5 @@ pub mod parser;
 pub mod types;
 
 pub use error::{FerroError, FerroResult};
-pub use evaluator::{ScriptContext, evaluate, set_nested_value};
+pub use evaluator::{ScriptContext, evaluate, evaluate_parsed, set_nested_value};
+pub use parser::{Stmt, parse};
