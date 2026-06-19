@@ -1,11 +1,11 @@
 [
   {
-    "level": "INFO",
-    "msg": "user logged in"
-  },
-  {
     "level": "ERROR",
     "msg": "payment failed"
+  },
+  {
+    "level": "INFO",
+    "msg": "user logged in"
   },
   {
     "level": "WARN",

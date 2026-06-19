@@ -1,16 +1,16 @@
 [
   {
-    "service": "auth",
-    "level": "INFO",
-    "ts": "2024-01-15T10:30:00Z",
-    "detail": "login successful",
-    "message": "2024-01-15T10:30:00Z,INFO,auth,login successful"
+    "detail": "charge declined",
+    "level": "ERROR",
+    "message": "2024-01-15T10:30:01Z,ERROR,payment,charge declined",
+    "service": "payment",
+    "ts": "2024-01-15T10:30:01Z"
   },
   {
-    "service": "payment",
-    "level": "ERROR",
-    "ts": "2024-01-15T10:30:01Z",
-    "detail": "charge declined",
-    "message": "2024-01-15T10:30:01Z,ERROR,payment,charge declined"
+    "detail": "login successful",
+    "level": "INFO",
+    "message": "2024-01-15T10:30:00Z,INFO,auth,login successful",
+    "service": "auth",
+    "ts": "2024-01-15T10:30:00Z"
   }
 ]

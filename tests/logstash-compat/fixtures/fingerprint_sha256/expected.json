@@ -1,14 +1,14 @@
 [
   {
-    "message": "hello world",
-    "fp": "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+    "fp": "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",
+    "message": "hello world"
   },
   {
-    "message": "the quick brown fox",
-    "fp": "9ecb36561341d18eb65484e833efea61edc74b84cf5e6ae1b81c63533e25fc8f"
+    "fp": "9ecb36561341d18eb65484e833efea61edc74b84cf5e6ae1b81c63533e25fc8f",
+    "message": "the quick brown fox"
   },
   {
-    "message": "ferro-stash",
-    "fp": "1928230e1fc6db02a00568d2d63bee1985082ebf5a3811192604ba1c7e14ee6e"
+    "fp": "1928230e1fc6db02a00568d2d63bee1985082ebf5a3811192604ba1c7e14ee6e",
+    "message": "ferro-stash"
   }
 ]

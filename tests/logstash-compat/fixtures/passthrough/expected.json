@@ -1,5 +1,11 @@
 [
-  { "message": "hello world" },
-  { "message": "second event" },
-  { "message": "third event" }
+  {
+    "message": "hello world"
+  },
+  {
+    "message": "third event"
+  },
+  {
+    "message": "second event"
+  }
 ]

@@ -102,9 +102,10 @@ full plugin catalogue (200+ community plugins are out of scope). The
 default event shape (`@timestamp`, tags, bracket-notation field
 references `[a][b]`, `%{field}` interpolation) and the `.conf` DSL follow
 Logstash semantics; the docker-driven regression harness asserts
-field-by-field equality against **Logstash 8.15.3** for a curated fixture
-set (see below). Benchmark comparisons were run against
-**Logstash 9.3.3**. There is no single pinned "target Logstash version" —
+field-by-field equality against **Logstash 9.4.2** for a curated fixture
+set (see below). Throughput/memory benchmarks (see
+[Performance](#performance)) were also run against **Logstash 9.4.2**.
+There is no single pinned "target Logstash version" —
 the config language and event model are broadly stable across Logstash
 5.x–9.x, and compatibility is asserted per-fixture rather than claimed
 wholesale.
@@ -113,16 +114,18 @@ wholesale.
 
 `tests/e2e/logstash_docker_compat_test.rs` pipes the same `pipeline.conf`
 + input through both `target/debug/ferro-stash` and
-`docker.elastic.co/logstash/logstash:8.15.3`, then asserts every event
+`docker.elastic.co/logstash/logstash:9.4.2`, then asserts every event
 payload equal field-by-field after stripping only runtime-only fields
-(`@timestamp`, `@version`, `host`, `event.original`). **13/13 fixtures
-pass byte-equal**, covering `stdin → stdout(json)`, grok, mutate, json,
-kv, dissect, fingerprint, conditional `if/else if/else`, and unicode
-inputs. These tests are `#[ignore]` (they require Docker); run them with:
+(`@timestamp`, `@version`, `host`, `event.original`). **24/24 fixtures
+pass byte-equal**, covering `stdin → stdout(json)`, grok, mutate
+(rename/case/gsub/convert/copy/strip), json, kv, dissect, fingerprint,
+date, clone, csv, truncate, translate, split, urldecode, drop, conditional
+`if/else if/else`, and unicode inputs. These tests are `#[ignore]` (they
+require Docker); run them with:
 
 ```bash
 cargo build --bin ferro-stash
-docker pull docker.elastic.co/logstash/logstash:8.15.3
+docker pull docker.elastic.co/logstash/logstash:9.4.2
 cargo test -p ferro-stash-e2e --test logstash_docker_compat_test \
     -- --ignored --nocapture --test-threads=1
 ```
@@ -523,7 +526,7 @@ Data sources → FerroStash → FerroSearch → Applications
   environment.
 - **Parity evidence is per-fixture.** The 24 byte-equal fixtures (run
   in-process by `logstash_compat_test` and end-to-end by `runner.py`)
-  cover ~17 filters and the stdin/stdout path against Logstash 8.15.3;
+  cover ~17 filters and the stdin/stdout path against Logstash 9.4.2;
   they do not cover every implemented plugin, codec, or edge case. Each
   golden file is generated from the real Logstash oracle via
   `tests/logstash-compat/gen_expected.py`. See the compatibility matrix

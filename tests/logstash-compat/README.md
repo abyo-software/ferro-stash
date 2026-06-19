@@ -60,7 +60,7 @@ are two supported ways, depending on which harness you run:
 No local install needed — the harness shells out to a pinned image:
 
 ```bash
-docker pull docker.elastic.co/logstash/logstash:8.15.3
+docker pull docker.elastic.co/logstash/logstash:9.4.2
 # or: docker compose -f tests/logstash-compat/docker-compose.yml pull
 ```
 
@@ -138,16 +138,30 @@ After that, `cargo test --workspace` will exercise every fixture under
 
 ## Current coverage
 
-| fixture        | filters exercised               | runner.py vs golden | docker harness vs Logstash 8.15.3 |
-|----------------|----------------------------------|---------------------|-----------------------------------|
-| passthrough    | (none)                           | PASS                | PASS                              |
-| grok_syslog    | grok                             | PASS                | PASS                              |
-| json_parse     | json + mutate (remove_field)     | PASS                | PASS                              |
-| mutate_basic   | json + mutate (rename / case / add_field / add_tag / remove_field) | PASS | PASS  |
-| kv_extract     | kv                               | PASS                | PASS                              |
-| dissect_pipe   | dissect                          | PASS                | PASS                              |
+**24 fixtures**, all golden files generated from the real **Logstash 9.4.2**
+oracle (`gen_expected.py`) and green on both runners (in-process
+`logstash_compat_test` + Python `runner.py`):
 
-Last verified: 2026-05-07. All six fixtures green on both runners.
+| fixture | filters exercised |
+|---------|-------------------|
+| passthrough | (none) |
+| grok_syslog / unicode_grok | grok |
+| dissect_pipe / dissect_skip | dissect |
+| json_parse / malformed_json | json (+ `_jsonparsefailure` path) |
+| kv_extract / kv_custom_split | kv (default + custom split/target) |
+| mutate_basic / mutate_gsub / mutate_convert / mutate_copy_strip | mutate (rename/case/add/remove/gsub/convert/copy/strip) |
+| date_iso8601 / date_target | date (ISO8601 + Joda → named target) |
+| translate_lookup | translate (source/target dictionary) |
+| csv_columns | csv |
+| truncate_bytes | truncate |
+| split_array | split (array fan-out) |
+| clone_fanout | clone (event fan-out + name tags) |
+| urldecode_field | urldecode |
+| fingerprint_sha256 | fingerprint |
+| drop_conditional / conditional_branch | conditional `if/else if/else` (+ drop) |
+
+Last verified: 2026-06-20 against **Logstash 9.4.2** — all 24 fixtures green on
+both runners.
 
 ## Docker side-by-side regression harness
 
@@ -155,7 +169,7 @@ Last verified: 2026-05-07. All six fixtures green on both runners.
 suite. It runs the **same** `pipeline.conf` and `input.txt` through:
 
   * the local `target/debug/ferro-stash` binary, AND
-  * `docker.elastic.co/logstash/logstash:8.15.3` (pinned)
+  * `docker.elastic.co/logstash/logstash:9.4.2` (pinned)
 
 …then field-by-field diffs the JSON event output, ignoring only the
 runtime-only fields `@timestamp`, `@version`, `host`, `event.original`.
@@ -170,7 +184,7 @@ ferro-stash against upstream Logstash itself).
 cargo build --bin ferro-stash
 
 # 2. Pre-pull the reference image (~525 MB, one-time)
-docker pull docker.elastic.co/logstash/logstash:8.15.3
+docker pull docker.elastic.co/logstash/logstash:9.4.2
 # or:
 docker compose -f tests/logstash-compat/docker-compose.yml pull
 
@@ -181,8 +195,9 @@ cargo test -p ferro-stash-e2e --test logstash_docker_compat_test \
 
 `--test-threads=1` is recommended: each fixture spawns a fresh JVM via
 `docker run --rm -i`, and serialising avoids the ~3 GB peak RSS spikes
-otherwise. Wall-clock for the 6-fixture suite is ~70 s on a typical
-workstation (~10–12 s per Logstash cold-start).
+otherwise. Each fixture pays a Logstash cold-start (~7–12 s), so the full
+24-fixture docker suite takes several minutes; the in-process
+`logstash_compat_test` (no Docker) runs the same fixtures in milliseconds.
 
 ### Comparison policy (docker harness)
 
@@ -197,11 +212,11 @@ workstation (~10–12 s per Logstash cold-start).
 
 ### Known divergences
 
-None as of 2026-05-07. The six bundled fixtures cover stdin input,
-six filter plugins (grok / mutate / json / kv / dissect / pipeline
-pass-through), and stdout JSON output. They produce **byte-identical
-event payloads** between Logstash 8.15.3 and ferro-stash 0.1.0,
-modulo the four runtime-only fields above.
+None as of 2026-06-20. The 24 bundled fixtures cover stdin input, ~17 filter
+plugins (grok, dissect, json, kv, mutate, date, translate, csv, truncate,
+split, clone, urldecode, fingerprint, drop, conditionals), and stdout JSON
+output. They produce **byte-identical event payloads** between Logstash 9.4.2
+and ferro-stash 0.1.0, modulo the runtime-only fields above.
 
 This does *not* substantiate full Logstash compat — it substantiates
 the surface tested (43 of 165+ Logstash plugins implemented; the

@@ -16,14 +16,14 @@
 //!
 //! All tests are `#[ignore]` because they require:
 //!   1. `docker` available + the Logstash 8.x image pulled
-//!      (`docker pull docker.elastic.co/logstash/logstash:8.15.3`)
+//!      (`docker pull docker.elastic.co/logstash/logstash:9.4.2`)
 //!   2. The `ferro-stash` binary built (`cargo build --bin ferro-stash`)
 //!
 //! Running:
 //!
 //! ```bash
 //! cargo build --bin ferro-stash
-//! docker pull docker.elastic.co/logstash/logstash:8.15.3
+//! docker pull docker.elastic.co/logstash/logstash:9.4.2
 //! cargo test --workspace --test logstash_docker_compat_test \
 //!     -- --ignored --nocapture
 //! ```
@@ -58,7 +58,7 @@ use std::time::Duration;
 
 use serde_json::{Map, Value};
 
-const LOGSTASH_IMAGE: &str = "docker.elastic.co/logstash/logstash:8.15.3";
+const LOGSTASH_IMAGE: &str = "docker.elastic.co/logstash/logstash:9.4.2";
 
 /// Fields we never compare — they're populated by the runtime, not the
 /// pipeline under test, and necessarily differ between two engines.

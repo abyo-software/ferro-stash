@@ -1,20 +1,20 @@
 [
   {
-    "path": "/home",
-    "status": "OK",
-    "code": "200",
-    "message": "{\"code\": \"200\", \"path\": \"/home\"}"
-  },
-  {
-    "path": "/tea",
-    "status": "Unknown",
-    "code": "418",
-    "message": "{\"code\": \"418\", \"path\": \"/tea\"}"
-  },
-  {
-    "path": "/login",
-    "status": "NotFound",
     "code": "404",
-    "message": "{\"code\": \"404\", \"path\": \"/login\"}"
+    "message": "{\"code\": \"404\", \"path\": \"/login\"}",
+    "path": "/login",
+    "status": "NotFound"
+  },
+  {
+    "code": "418",
+    "message": "{\"code\": \"418\", \"path\": \"/tea\"}",
+    "path": "/tea",
+    "status": "Unknown"
+  },
+  {
+    "code": "200",
+    "message": "{\"code\": \"200\", \"path\": \"/home\"}",
+    "path": "/home",
+    "status": "OK"
   }
 ]

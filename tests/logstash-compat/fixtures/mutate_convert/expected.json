@@ -1,14 +1,14 @@
 [
   {
-    "count": 0,
-    "ratio": 10.0,
-    "active": false,
-    "message": "{\"count\": \"0\", \"ratio\": \"10\", \"active\": \"false\"}"
+    "active": true,
+    "count": 42,
+    "message": "{\"count\": \"42\", \"ratio\": \"3.5\", \"active\": \"true\"}",
+    "ratio": 3.5
   },
   {
-    "count": 42,
-    "ratio": 3.5,
-    "active": true,
-    "message": "{\"count\": \"42\", \"ratio\": \"3.5\", \"active\": \"true\"}"
+    "active": false,
+    "count": 0,
+    "message": "{\"count\": \"0\", \"ratio\": \"10\", \"active\": \"false\"}",
+    "ratio": 10.0
   }
 ]

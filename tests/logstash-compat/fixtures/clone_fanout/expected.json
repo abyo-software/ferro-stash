@@ -1,23 +1,5 @@
 [
   {
-    "amount": 100,
-    "order": "A1"
-  },
-  {
-    "amount": 100,
-    "order": "A1",
-    "tags": [
-      "audit"
-    ]
-  },
-  {
-    "amount": 100,
-    "order": "A1",
-    "tags": [
-      "metrics"
-    ]
-  },
-  {
     "amount": 250,
     "order": "B2"
   },
@@ -31,6 +13,24 @@
   {
     "amount": 250,
     "order": "B2",
+    "tags": [
+      "metrics"
+    ]
+  },
+  {
+    "amount": 100,
+    "order": "A1"
+  },
+  {
+    "amount": 100,
+    "order": "A1",
+    "tags": [
+      "audit"
+    ]
+  },
+  {
+    "amount": 100,
+    "order": "A1",
     "tags": [
       "metrics"
     ]

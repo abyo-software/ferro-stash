@@ -1,24 +1,30 @@
 [
   {
-    "message": "{\"valid\": \"yes\", \"n\": 1}",
-    "valid": "yes",
-    "n": 1
-  },
-  {
-    "message": "this is not json at all",
-    "tags": ["_jsonparsefailure"]
-  },
-  {
-    "message": "{\"unterminated\": \"string",
-    "tags": ["_jsonparsefailure"]
+    "message": "{\"valid\": \"again\", \"n\": 2}",
+    "n": 2,
+    "valid": "again"
   },
   {
     "message": "{\"trailing_comma\": 1,}",
-    "tags": ["_jsonparsefailure"]
+    "tags": [
+      "_jsonparsefailure"
+    ]
   },
   {
-    "message": "{\"valid\": \"again\", \"n\": 2}",
-    "valid": "again",
-    "n": 2
+    "message": "this is not json at all",
+    "tags": [
+      "_jsonparsefailure"
+    ]
+  },
+  {
+    "message": "{\"unterminated\": \"string",
+    "tags": [
+      "_jsonparsefailure"
+    ]
+  },
+  {
+    "message": "{\"valid\": \"yes\", \"n\": 1}",
+    "n": 1,
+    "valid": "yes"
   }
 ]

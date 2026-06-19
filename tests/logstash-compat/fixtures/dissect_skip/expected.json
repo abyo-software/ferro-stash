@@ -1,29 +1,29 @@
 [
   {
-    "message": "srv1 192.168.1.10 - alice [15/Jan/2024:10:30:00] GET /api/v1/users 200 1234",
+    "bytes": "1234",
     "client_ip": "192.168.1.10",
-    "user": "alice",
+    "message": "srv1 192.168.1.10 - alice [15/Jan/2024:10:30:00] GET /api/v1/users 200 1234",
     "method": "GET",
     "path": "/api/v1/users",
     "status": "200",
-    "bytes": "1234"
+    "user": "alice"
   },
   {
-    "message": "srv2 10.0.0.5 - bob [15/Jan/2024:10:30:01] POST /api/v1/login 401 89",
+    "bytes": "89",
     "client_ip": "10.0.0.5",
-    "user": "bob",
+    "message": "srv2 10.0.0.5 - bob [15/Jan/2024:10:30:01] POST /api/v1/login 401 89",
     "method": "POST",
     "path": "/api/v1/login",
     "status": "401",
-    "bytes": "89"
+    "user": "bob"
   },
   {
-    "message": "srv1 172.16.0.99 - charlie [15/Jan/2024:10:30:02] DELETE /api/v1/items/42 204 0",
+    "bytes": "0",
     "client_ip": "172.16.0.99",
-    "user": "charlie",
+    "message": "srv1 172.16.0.99 - charlie [15/Jan/2024:10:30:02] DELETE /api/v1/items/42 204 0",
     "method": "DELETE",
     "path": "/api/v1/items/42",
     "status": "204",
-    "bytes": "0"
+    "user": "charlie"
   }
 ]

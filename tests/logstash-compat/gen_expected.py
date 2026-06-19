@@ -23,7 +23,7 @@ Usage:
     # Regenerate every fixture (slow — one JVM boot each)
     python3 tests/logstash-compat/gen_expected.py --all
 
-Requires Docker and pulls ``docker.elastic.co/logstash/logstash:8.15.3`` on
+Requires Docker and pulls ``docker.elastic.co/logstash/logstash:9.4.2`` on
 first use. Logstash's JVM boot is slow (~60-90s); the default per-fixture
 timeout is 300s.
 """
@@ -39,7 +39,7 @@ from typing import Any
 
 HERE = Path(__file__).resolve().parent
 FIXTURES_DIR = HERE / "fixtures"
-LOGSTASH_IMAGE = "docker.elastic.co/logstash/logstash:8.15.3"
+LOGSTASH_IMAGE = "docker.elastic.co/logstash/logstash:9.4.2"
 
 # Keys that real Logstash adds at runtime which the parity runner ignores and
 # which must not be baked into the expected baseline.
@@ -120,7 +120,10 @@ def gen_fixture(name: str, timeout: float) -> bool:
         print(f"        raw stdout head: {raw[:400]!r}")
         return False
     out = fixture / "expected.json"
-    out.write_text(json.dumps(events, indent=2, ensure_ascii=False) + "\n")
+    # sort_keys: the parity matcher is order-insensitive, so emit a canonical
+    # key order — keeps regeneration diffs to *real* value changes, not Logstash
+    # output-order churn.
+    out.write_text(json.dumps(events, indent=2, ensure_ascii=False, sort_keys=True) + "\n")
     print(f"  OK    {name}: {len(events)} event(s) -> {out.relative_to(HERE.parent.parent)}")
     return True
 

@@ -1,18 +1,24 @@
 [
   {
     "level": "info",
-    "service": "AUTH",
-    "username": "alice",
-    "status": 200,
     "pipeline": "ferro-stash",
-    "tags": ["processed", "mutated"]
+    "service": "AUTH",
+    "status": 200,
+    "tags": [
+      "processed",
+      "mutated"
+    ],
+    "username": "alice"
   },
   {
     "level": "error",
-    "service": "PAYMENT",
-    "username": "bob",
-    "status": 500,
     "pipeline": "ferro-stash",
-    "tags": ["processed", "mutated"]
+    "service": "PAYMENT",
+    "status": 500,
+    "tags": [
+      "processed",
+      "mutated"
+    ],
+    "username": "bob"
   }
 ]

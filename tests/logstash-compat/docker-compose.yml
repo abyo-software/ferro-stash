@@ -16,7 +16,7 @@
 
 services:
   logstash:
-    image: docker.elastic.co/logstash/logstash:8.15.3
+    image: docker.elastic.co/logstash/logstash:9.4.2
     profiles: ["pull-only"]
     # No command, no ports, no volumes — this entry exists for image
     # caching only. The Rust harness invokes the image directly via

@@ -1,20 +1,20 @@
 [
   {
+    "level": "WARN",
+    "service": "inventory",
+    "status": 429,
+    "user": "charlie"
+  },
+  {
     "level": "INFO",
     "service": "auth",
-    "user": "alice",
-    "status": 200
+    "status": 200,
+    "user": "alice"
   },
   {
     "level": "ERROR",
     "service": "payment",
-    "user": "bob",
-    "status": 500
-  },
-  {
-    "level": "WARN",
-    "service": "inventory",
-    "user": "charlie",
-    "status": 429
+    "status": 500,
+    "user": "bob"
   }
 ]

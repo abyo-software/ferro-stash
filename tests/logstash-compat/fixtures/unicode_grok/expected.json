@@ -1,38 +1,38 @@
 [
   {
-    "message": "alice|hello",
-    "user": "alice",
-    "body": "hello",
-    "decoded": "hello"
-  },
-  {
-    "message": "bob|safe",
-    "user": "bob",
-    "body": "safe",
-    "decoded": "safe"
-  },
-  {
-    "message": "charlie|🚀🎉 emoji line",
-    "user": "charlie",
-    "body": "🚀🎉 emoji line",
-    "decoded": "🚀🎉 emoji line"
-  },
-  {
-    "message": "diana|café résumé naïve façade",
-    "user": "diana",
     "body": "café résumé naïve façade",
-    "decoded": "café résumé naïve façade"
+    "decoded": "café résumé naïve façade",
+    "message": "diana|café résumé naïve façade",
+    "user": "diana"
   },
   {
-    "message": "eve|こんにちは世界 hello world",
-    "user": "eve",
+    "body": "🚀🎉 emoji line",
+    "decoded": "🚀🎉 emoji line",
+    "message": "charlie|🚀🎉 emoji line",
+    "user": "charlie"
+  },
+  {
     "body": "こんにちは世界 hello world",
-    "decoded": "こんにちは世界 hello world"
+    "decoded": "こんにちは世界 hello world",
+    "message": "eve|こんにちは世界 hello world",
+    "user": "eve"
   },
   {
-    "message": "frank|مرحبا بالعالم arabic rtl",
-    "user": "frank",
+    "body": "safe",
+    "decoded": "safe",
+    "message": "bob|safe",
+    "user": "bob"
+  },
+  {
     "body": "مرحبا بالعالم arabic rtl",
-    "decoded": "مرحبا بالعالم arabic rtl"
+    "decoded": "مرحبا بالعالم arabic rtl",
+    "message": "frank|مرحبا بالعالم arabic rtl",
+    "user": "frank"
+  },
+  {
+    "body": "hello",
+    "decoded": "hello",
+    "message": "alice|hello",
+    "user": "alice"
   }
 ]

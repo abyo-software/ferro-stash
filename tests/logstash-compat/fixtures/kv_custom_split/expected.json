@@ -2,9 +2,9 @@
   {
     "message": "user=alice&city=tokyo&role=admin",
     "params": {
-      "user": "alice",
+      "city": "tokyo",
       "role": "admin",
-      "city": "tokyo"
+      "user": "alice"
     }
   }
 ]

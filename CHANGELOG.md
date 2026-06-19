@@ -129,9 +129,35 @@ is cut. Pre-1.0 releases may introduce breaking changes between minor tags.
   previously emitted untagged. Integer-count form still yields untagged
   clones. Found via parity testing.
 - **Logstash byte-eq parity fixtures expanded 13 → 24** (~17 filters),
-  each generated from the real Logstash 8.15.3 oracle via the new
+  each generated from the real Logstash 9.4.2 oracle via the new
   `tests/logstash-compat/gen_expected.py`, and run automatically in CI by
   the in-process `logstash_compat_test`.
+- **`script` (Painless) filter no longer re-parses per event.** It used to
+  re-parse the source on every event (discarding the parse); it now parses
+  once at config load and reuses the cached AST. ~2–4× faster; a malformed
+  script now fails fast at config load. The module's "Cranelift-JIT" claim
+  was also corrected — the general path is a native tree-walking interpreter
+  (the Cranelift JIT only covers numeric scoring).
+- **`ruby` (Artichoke/mruby) filter now runs in parallel.** It shared a
+  single `Mutex<RubyRuntime>`, so every event serialized through one
+  interpreter and extra pipeline workers gave no speedup. Each worker thread
+  now builds and reuses its own interpreter (thread-local). Still slower than
+  JRuby per-op (interpreter + per-event marshalling) — migration path, not a
+  speed path; use `script` for hot logic.
+- **Filter dispatch is now lock-free (MPMC).** Filter workers shared one
+  input receiver behind a mutex, which capped throughput at a few workers and
+  degraded beyond that. Replaced with an `async-channel` MPMC queue (single
+  distributor → independent worker receives). The at-least-once PQ soak still
+  shows zero loss.
+
+### Performance
+
+- **Benchmark vs Logstash 9.4.2** (single host, `c7i.2xlarge`, reproducible via
+  [`bench/`](bench/)): native filters ~1.4–1.7× throughput (csv ~3.2×) at
+  ~8–13× lower RSS and ~700× faster cold start; custom logic via the native
+  `script` filter ~3.6× faster than Logstash's JRuby (and ~48× the mruby
+  filter). See [README "Performance"](README.md#performance). One-environment
+  numbers, not a universal guarantee.
 
 ### Honest residual limitations
 
