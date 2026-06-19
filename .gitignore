@@ -9,3 +9,6 @@
 # Runtime byproducts of running the ferro-stash binary (path.data default)
 /data/
 /crates/*/data/
+
+# bench runtime state (path.data)
+bench/data/
