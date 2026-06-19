@@ -13,6 +13,7 @@ pub mod kafka;
 pub mod pipeline;
 pub mod redis;
 pub mod s3;
+pub mod sqs;
 pub mod stdin;
 pub mod syslog;
 pub mod tcp;
@@ -53,6 +54,7 @@ pub fn create_input_with_bus(
         "kafka" => Ok(Box::new(kafka::KafkaInput::from_config(settings)?)),
         "redis" => Ok(Box::new(redis::RedisInput::from_config(settings)?)),
         "s3" => Ok(Box::new(s3::S3Input::from_config(settings)?)),
+        "sqs" => Ok(Box::new(sqs::SqsInput::from_config(settings)?)),
         "dead_letter_queue" => Ok(Box::new(dead_letter_queue::DlqInput::from_config(
             settings,
         )?)),

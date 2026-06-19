@@ -129,10 +129,9 @@ The JRuby custom-logic figure is corroborated across runs (~143–147k); see
 ## Logstash compatibility scope
 
 FerroStash targets the **production-common subset** of Logstash, not its
-full plugin catalogue. It implements **~64% of the plugins bundled with
-Logstash 9.4.2** (71 / 111) — **codecs 100%, filters 74%, inputs 47%, outputs
-43%** — weighted toward the parse/filter hot path; the long tail of connectors
-(JDBC, AWS SQS/SNS/CloudWatch, RabbitMQ, …) is the main gap. A
+full plugin catalogue. It implements **~67% of the plugins bundled with
+Logstash 9.4.2** (74 / 111) — **codecs 100%, filters 74%, inputs 50%, outputs 52%** — weighted toward the parse/filter hot path; the long tail of connectors
+(JDBC, AWS CloudWatch, RabbitMQ, …) is the main gap. A
 config that uses a missing plugin **fails fast** at load, so check the full
 **[compatibility matrix](docs/COMPATIBILITY.md)** before migrating. The
 default event shape (`@timestamp`, tags, bracket-notation field
@@ -205,7 +204,7 @@ available, not in CI. See the Notes column and
 [Honest limitations](#honest-limitations) for exactly what each smoke
 test exercises and the per-plugin feature residuals.
 
-### Input plugins (16 registered)
+### Input plugins (17 registered)
 
 | Plugin | Status | Notes |
 |--------|--------|-------|
@@ -259,7 +258,7 @@ test exercises and the per-plugin feature residuals.
 | `dns` | real (live-validated) | `hickory-resolver` forward (A/AAAA) and reverse (PTR) lookups, custom `nameserver`, `Replace`/`Append` action. Validated against `8.8.8.8` |
 | `elasticsearch` | real (live-validated) | `reqwest` `_search` with host failover, query-template `%{field}` sprintf, hits→field mapping. Live-validated against real Elasticsearch 8.15.3 (a seeded hit is mapped into the target field) via an `#[ignore]` smoke test (`ES_URL`); not run in CI |
 
-### Output plugins (11 registered)
+### Output plugins (13 registered)
 
 | Plugin | Status | Notes |
 |--------|--------|-------|

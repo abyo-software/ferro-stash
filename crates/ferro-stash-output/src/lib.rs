@@ -10,6 +10,8 @@ pub mod null;
 pub mod pipeline;
 pub mod redis;
 pub mod s3;
+pub mod sns;
+pub mod sqs;
 pub mod stdout;
 pub mod tcp;
 
@@ -69,6 +71,8 @@ pub fn create_output_with_bus(
             settings, condition,
         )?)),
         "s3" => Ok(Box::new(s3::S3Output::from_config(settings, condition)?)),
+        "sqs" => Ok(Box::new(sqs::SqsOutput::from_config(settings, condition)?)),
+        "sns" => Ok(Box::new(sns::SnsOutput::from_config(settings, condition)?)),
         "datadog" => Ok(Box::new(datadog::DatadogOutput::from_config(
             settings, condition,
         )?)),
