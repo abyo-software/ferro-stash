@@ -301,17 +301,23 @@ impl PersistentQueue {
     }
 
     fn read_segment_to_string(path: &Path) -> String {
+        Self::try_read_segment_to_string(path).unwrap_or_default()
+    }
+
+    /// Read a segment's text, distinguishing a read/decode **failure** (`None`)
+    /// from a legitimately **empty** file (`Some("")`). `read_segment_to_string`
+    /// is the infallible wrapper (`unwrap_or_default`); gc needs this distinction
+    /// so it never mistakes an *unreadable* segment for an empty-and-reclaimable
+    /// one (which would silently delete unacked data).
+    fn try_read_segment_to_string(path: &Path) -> Option<String> {
         if path.extension().is_some_and(|e| e == "zst") {
-            File::open(path)
-                .ok()
-                .and_then(|f| zstd::Decoder::new(f).ok())
-                .and_then(|mut d| {
-                    let mut s = String::new();
-                    d.read_to_string(&mut s).ok().map(|_| s)
-                })
-                .unwrap_or_default()
+            let file = File::open(path).ok()?;
+            let mut decoder = zstd::Decoder::new(file).ok()?;
+            let mut s = String::new();
+            decoder.read_to_string(&mut s).ok()?;
+            Some(s)
         } else {
-            fs::read_to_string(path).unwrap_or_default()
+            fs::read_to_string(path).ok()
         }
     }
 
@@ -680,7 +686,15 @@ impl PersistentQueue {
     ///   reclaimed (max over zero parsed entries is 0, which is `< ack_seq`
     ///   once `ack_seq > 0`, matching the pre-existing empty-segment behavior).
     fn segment_fully_consumed(&self, path: &Path) -> bool {
-        let content = Self::read_segment_to_string(path);
+        // An unreadable / decode-failing segment is conservatively KEPT (returns
+        // false = not consumed): treating it as empty would let gc reclaim a lone
+        // corrupt or transiently-unreadable segment whose unacked entries are not
+        // visible (`max_seq` would stay 0 < ack_seq), silently deleting data the
+        // PQ claims at-least-once for. This mirrors the dequeue wedge-and-retry:
+        // a bad segment is preserved for retry/salvage, never silently dropped.
+        let Some(content) = Self::try_read_segment_to_string(path) else {
+            return false;
+        };
         let mut max_seq = 0_u64;
         for line in content.lines() {
             if line.trim().is_empty() {
