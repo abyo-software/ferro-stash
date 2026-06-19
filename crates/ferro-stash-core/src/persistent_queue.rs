@@ -653,6 +653,23 @@ impl PersistentQueue {
             // never deleted, so it can replay after a crash/restart.
             if self.segment_fully_consumed(&seg_path) {
                 let _ = fs::remove_file(&seg_path);
+                // Also remove the same-index duplicate sibling (the other form),
+                // if any. A crash mid-compression-rotation can leave both
+                // `segment_N.seg` and a (possibly corrupt) `segment_N.seg.zst`;
+                // `segment_files` dedups to the `.seg`, so this loop only sees and
+                // removes the `.seg` — leaving the `.zst` as a now-lone orphan that
+                // would re-wedge dequeue on the next pass (DD r4). Removing the
+                // sibling here is loss-safe: the (readable) twin was just confirmed
+                // fully-acked, and both forms hold identical data, so the sibling's
+                // data is provably acked too.
+                let sibling = if seg_path.extension().is_some_and(|e| e == "zst") {
+                    seg_path.with_extension("") // strip `.zst` -> `…segment_N.seg`
+                } else {
+                    let mut s = seg_path.clone().into_os_string();
+                    s.push(".zst"); // `…segment_N.seg` -> `…segment_N.seg.zst`
+                    PathBuf::from(s)
+                };
+                let _ = fs::remove_file(&sibling);
                 debug!(path = %seg_path.display(), "consumed segment removed");
             }
         }
@@ -2452,5 +2469,25 @@ mod tests {
             "must recover all 3 entries from the intact .seg, ignoring the corrupt .zst"
         );
         assert!(batch[0].contains("e0") && batch[2].contains("e2"));
+
+        // Ack + gc must reclaim BOTH the `.seg` AND its corrupt `.zst` sibling, so
+        // the `.zst` is not left as a lone orphan that would re-wedge dequeue on
+        // the next pass (DD r4).
+        pq.ack(3).expect("ack");
+        pq.gc().expect("gc");
+        assert!(
+            !Path::new(&path).join("segment_00000001.seg").exists(),
+            "the fully-acked .seg must be reclaimed"
+        );
+        assert!(
+            !zst.exists(),
+            "gc must also remove the corrupt duplicate .zst sibling (no lone orphan)"
+        );
+
+        // Reopen and dequeue: with the orphan gone, the queue is cleanly empty —
+        // no wedge on a leftover corrupt `.zst`.
+        let mut pq = PersistentQueue::open(config).expect("reopen after gc");
+        let after = pq.dequeue(100).expect("dequeue after gc must not wedge");
+        assert!(after.is_empty(), "queue must be cleanly empty after gc");
     }
 }
