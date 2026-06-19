@@ -424,14 +424,21 @@ Data sources → FerroStash → FerroSearch → Applications
     outputs, replaying an entry that one output already took re-delivers to
     that output. Make outputs idempotent (e.g. document IDs) where it
     matters — exactly-once is **not** provided.
-  - **The delivery point is `output()` returning `Ok`.** Outputs that buffer
-    internally and upload later (only **s3**, which uploads on size/time
-    rotation) return `Ok` before the object is durable, so a crash between
-    that `Ok` and the next rotation can lose those buffered events even
-    though the entry was acked. A clean shutdown flushes outputs *before* the
-    final ack, so it is lossless; for crash-durability with s3, tune its
-    rotation small or rely on replay. All other outputs deliver synchronously
-    within `output()`.
+  - **Buffering outputs are flushed before their entries are acked.** Most
+    outputs deliver synchronously within `output()`; **s3** buffers and
+    uploads on rotation. To keep the guarantee for s3, the pipeline flushes
+    *every* output to durability before each durable ack (periodic and at
+    shutdown) and only advances the cursor when the flush succeeds — so an
+    entry is acked only after the output it was delivered to has durably
+    persisted it. The cost: with a persistent queue, s3 uploads on the ack
+    cadence (`pipeline.batch.delay`) rather than only on its own rotation, so
+    set `pipeline.batch.delay` high enough to keep object sizes reasonable. A
+    crash between a successful flush and the checkpoint just re-delivers
+    (duplicate), never loses.
+  - **Durability scope: process crash, not power loss.** The PQ checkpoint/
+    segments and the DLQ are flushed to the OS (page cache), not `fsync`'d, so
+    the at-least-once guarantee covers a process crash/restart, not a power
+    loss or kernel panic.
   - **Failure handling.** A failed delivery (or filter error) is acked only
     if it is durably captured in the DLQ; if there is no DLQ, the DLQ is full,
     or the DLQ write fails, the entry is left un-acked and replays. A

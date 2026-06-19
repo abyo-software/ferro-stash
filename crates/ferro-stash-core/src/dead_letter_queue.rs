@@ -138,7 +138,8 @@ impl DeadLetterQueue {
 
     /// Write a dead letter event, returning whether it was **durably captured**.
     ///
-    /// - `Ok(true)`  — the record was written AND flushed to disk (durable).
+    /// - `Ok(true)`  — the record was written AND flushed (durable to a *process*
+    ///   crash; see the durability note below).
     /// - `Ok(false)` — the DLQ is full, so the record was dropped (a warning is
     ///   logged). The event is NOT captured.
     /// - `Err(..)`   — serialization or I/O error; the record was NOT captured.
@@ -150,6 +151,12 @@ impl DeadLetterQueue {
     /// For that reason the record is flushed immediately rather than batched: a
     /// record buffered-but-not-flushed would be lost by a crash even though the
     /// source PQ entry was already acked.
+    ///
+    /// Durability scope: `flush()` pushes the record to the OS (page cache), which
+    /// survives a *process* crash but not a power loss / kernel panic (there is no
+    /// `fsync`). This matches the persistent queue's own checkpoint/segment
+    /// durability — the whole at-least-once guarantee is process-crash-scoped, not
+    /// power-loss-scoped.
     pub fn write(
         &mut self,
         plugin_type: &str,

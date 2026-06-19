@@ -444,13 +444,15 @@ impl Pipeline {
 struct AckState {
     /// `seq` -> number of derived events not yet terminal.
     outstanding: BTreeMap<u64, u64>,
-    /// Sequences that must NEVER be acknowledged in this run: an event derived
-    /// from them was neither delivered nor durably captured (output failure with
-    /// no/failed DLQ, filter error with no/failed DLQ). Keeping them here pins the
-    /// ack cursor at or below them so they replay on restart (at-least-once) — the
+    /// The smallest sequence that must NEVER be acknowledged in this run: an event
+    /// derived from it was neither delivered nor durably captured (output failure
+    /// with no/failed DLQ, filter error with no/failed DLQ). Pinning the ack cursor
+    /// at or below it makes it (and everything after) replay on restart — the
     /// pipeline has no in-run retry, so a genuinely-undelivered entry stays
-    /// un-acked until a restart re-reads it. Never cleared within a run.
-    blocked: std::collections::BTreeSet<u64>,
+    /// un-acked until a restart re-reads it. Only the minimum is load-bearing
+    /// (it caps `ack_point`), so a single `min`-folded value suffices; never
+    /// cleared within a run.
+    min_blocked: Option<u64>,
     /// Highest sequence ever registered, so the ack can advance past the final
     /// entry once nothing is outstanding.
     highest_registered: Option<u64>,
@@ -465,7 +467,7 @@ impl AckTracker {
         Self {
             state: Mutex::new(AckState {
                 outstanding: BTreeMap::new(),
-                blocked: std::collections::BTreeSet::new(),
+                min_blocked: None,
                 highest_registered: None,
             }),
         }
@@ -511,11 +513,13 @@ impl AckTracker {
         }
     }
 
-    /// Permanently prevent `seq` from being acknowledged in this run: an event
-    /// derived from it was lost (delivery failed AND it was not durably captured
-    /// in the DLQ). The entry replays on the next start. See [`AckState::blocked`].
+    /// Permanently prevent `seq` (and everything after it) from being
+    /// acknowledged in this run: an event derived from it was lost (delivery
+    /// failed AND it was not durably captured in the DLQ). The entry replays on
+    /// the next start. See [`AckState::min_blocked`].
     fn block(&self, seq: u64) {
-        self.lock().blocked.insert(seq);
+        let mut s = self.lock();
+        s.min_blocked = Some(s.min_blocked.map_or(seq, |m| m.min(seq)));
     }
 
     /// The exclusive ack high-water mark, or `None` if nothing has been
@@ -524,8 +528,7 @@ impl AckTracker {
     fn ack_point(&self) -> Option<u64> {
         let s = self.lock();
         let min_outstanding = s.outstanding.keys().next().copied();
-        let min_blocked = s.blocked.iter().next().copied();
-        match (min_outstanding, min_blocked) {
+        match (min_outstanding, s.min_blocked) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (Some(a), None) => Some(a),
             (None, Some(b)) => Some(b),
@@ -841,6 +844,45 @@ fn advance_durable_ack(
     }
 }
 
+/// Flush every output to make completed-but-buffered deliveries durable, then
+/// advance the durable PQ ack — but only when the ack point actually moved (skips
+/// the flush + checkpoint + gc otherwise) and only if every flush succeeded.
+///
+/// Flushing first is what closes the durability gap for outputs that buffer
+/// internally and upload on flush/rotation (only **s3**): `output()` returning
+/// `Ok` merely buffers the event, so without this the periodic ack could mark an
+/// entry durable while it still sits in the output's RAM buffer, and a crash
+/// would lose it. A flush failure leaves the entries un-acked so they replay
+/// rather than being lost. For the common synchronous outputs `flush()` is a
+/// cheap no-op, so the cost falls on the buffering output that actually needs it.
+async fn flush_and_ack(
+    outputs: &[Box<dyn OutputPlugin>],
+    pq: Option<&SharedPersistentQueue>,
+    ack_tracker: Option<&Arc<AckTracker>>,
+    last_acked: &mut u64,
+) {
+    let (Some(pq), Some(tracker)) = (pq, ack_tracker) else {
+        return;
+    };
+    let Some(point) = tracker.ack_point() else {
+        return;
+    };
+    if point <= *last_acked {
+        return;
+    }
+    // Make every output's accepted-but-buffered events durable before acking.
+    for output in outputs {
+        if let Err(e) = output.flush().await {
+            warn!(output = output.name(), error = %e, "output flush failed; deferring PQ ack");
+            return;
+        }
+    }
+    match pq.ack(point) {
+        Ok(()) => *last_acked = point,
+        Err(e) => warn!(error = %e, "PQ ack error"),
+    }
+}
+
 async fn run_outputs(
     mut rx: mpsc::Receiver<Event>,
     outputs: Arc<Vec<Box<dyn OutputPlugin>>>,
@@ -887,31 +929,43 @@ async fn run_outputs(
                     let batch = collector.flush();
                     send_batch(&outputs, batch, &ctx).await;
                 }
-                // Periodically advance the durable ack cursor for everything
-                // delivered so far, bounding the crash-replay window to ~one flush
-                // interval of in-flight events. Also covers the all-dropped case
-                // (events completed in the filter stage never reach this task, so
-                // only the timer advances their ack).
-                advance_durable_ack(pq.as_ref(), ctx.ack_tracker.as_ref(), &mut last_acked);
+                // Periodically flush outputs to durability, then advance the
+                // durable ack cursor for everything delivered so far. Flushing
+                // first ensures a buffering output (s3) has uploaded the events
+                // before their entries are acked, bounding the crash-replay window
+                // to ~one flush interval of in-flight events. Also covers the
+                // all-dropped case (events completed in the filter stage never
+                // reach this task, so only the timer advances their ack).
+                flush_and_ack(&outputs, pq.as_ref(), ctx.ack_tracker.as_ref(), &mut last_acked).await;
             }
         }
     }
 
     // Close all outputs (flush buffering outputs to their durable store first).
+    // Track whether every flush/close succeeded: if a buffering output's final
+    // upload fails, its delivered-but-unflushed events are NOT durable, so the
+    // final ack below must be skipped (those entries replay rather than being
+    // acked-and-lost).
+    let mut all_durable = true;
     for output in outputs.iter() {
         if let Err(e) = output.flush().await {
             warn!(output = output.name(), error = %e, "output flush error");
+            all_durable = false;
         }
         if let Err(e) = output.close().await {
             warn!(output = output.name(), error = %e, "output close error");
+            all_durable = false;
         }
     }
 
-    // Final durable ack AFTER outputs are flushed/closed: on a clean shutdown
-    // every delivered event is now durable in its output, so acking here will not
-    // strand a buffering output's not-yet-uploaded events. Entries still un-acked
-    // (undelivered, lost, or blocked) are intentionally left to replay.
-    advance_durable_ack(pq.as_ref(), ctx.ack_tracker.as_ref(), &mut last_acked);
+    // Final durable ack AFTER outputs are flushed/closed, and ONLY if every flush
+    // and close succeeded. On a clean shutdown with healthy outputs every
+    // delivered event is now durable, so acking here strands nothing; if any flush
+    // failed, the not-yet-acked entries are left to replay (at-least-once) instead
+    // of being acked while their events sit lost in a failed output's buffer.
+    if all_durable {
+        advance_durable_ack(pq.as_ref(), ctx.ack_tracker.as_ref(), &mut last_acked);
+    }
 }
 
 async fn send_batch(outputs: &[Box<dyn OutputPlugin>], batch: Vec<Event>, ctx: &WorkerCtx) {
@@ -1417,6 +1471,35 @@ mod tests {
         }
     }
 
+    /// An output that ACCEPTS events in `output()` (as a buffering output like s3
+    /// does) but always FAILS to make them durable in `flush()`/`close()`.
+    #[derive(Debug)]
+    struct FlushFailingOutput {
+        seen: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl OutputPlugin for FlushFailingOutput {
+        fn name(&self) -> &str {
+            "flush-failing"
+        }
+        async fn output(&self, events: Vec<Event>) -> Result<()> {
+            // Accept (buffer) the events — like s3 returning Ok before upload.
+            self.seen.fetch_add(events.len(), Ordering::SeqCst);
+            Ok(())
+        }
+        async fn flush(&self) -> Result<()> {
+            Err(crate::error::FerroStashError::Pipeline(
+                "simulated flush/upload failure".to_string(),
+            ))
+        }
+        async fn close(&self) -> Result<()> {
+            Err(crate::error::FerroStashError::Pipeline(
+                "simulated close/upload failure".to_string(),
+            ))
+        }
+    }
+
     /// A filter that always errors.
     #[derive(Debug)]
     struct FailingFilter;
@@ -1588,6 +1671,36 @@ mod tests {
         assert!(
             has_real_payload,
             "DLQ must store the real event payload, not just a marker"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_buffering_output_flush_failure_replays() {
+        // DD round-2 (Critical): an output that ACCEPTS events in output() but
+        // FAILS to make them durable in flush()/close() must NOT have its entries
+        // acked — output() returning Ok is not durability. Every event must
+        // replay because no flush ever succeeded.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pq_path = dir.path().to_string_lossy().to_string();
+        let seen = Arc::new(AtomicUsize::new(0));
+        let replayable = run_and_count_replayable(
+            &pq_path,
+            DlqSettings::default(), // no DLQ
+            10,
+            vec![],
+            vec![Box::new(FlushFailingOutput {
+                seen: Arc::clone(&seen),
+            })],
+        )
+        .await;
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            10,
+            "the output accepted (buffered) every event"
+        );
+        assert_eq!(
+            replayable, 10,
+            "buffered events whose flush never succeeded must replay, not be acked"
         );
     }
 
