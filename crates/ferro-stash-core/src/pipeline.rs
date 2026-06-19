@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Pipeline engine — orchestrates input → filter → output flow.
 
-use std::sync::Arc;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
@@ -211,6 +212,13 @@ impl Pipeline {
         let pq = self.persistent_queue;
         let dlq = self.dead_letter_queue.clone();
 
+        // At-least-once delivery tracker: present only when a persistent queue is
+        // configured. The drainer registers popped entries, filter workers record
+        // fan-out, and the output task acknowledges (durably checkpoints) each
+        // entry only after delivery. Memory-queue pipelines carry no tracker, so
+        // the whole accounting path compiles to None-checks with zero overhead.
+        let ack_tracker: Option<Arc<AckTracker>> = pq.as_ref().map(|_| Arc::new(AckTracker::new()));
+
         // Channel capacity is derived from the unvalidated `max_events` config
         // (`pipeline.buffer_size`, a `usize`). `tokio::sync::mpsc::channel` asserts
         // `buffer > 0` and PANICS on a zero capacity, so a `buffer_size: 0` config
@@ -282,8 +290,9 @@ impl Pipeline {
             let tx = input_tx.clone();
             let sig = shutdown.clone();
             let done_flag = Arc::clone(&inputs_done);
+            let tracker = ack_tracker.clone();
             drainer_handle = Some(tokio::spawn(async move {
-                run_pq_drainer(pq_drain, tx, sig, done_flag).await;
+                run_pq_drainer(pq_drain, tx, sig, done_flag, tracker).await;
             }));
         }
 
@@ -300,11 +309,14 @@ impl Pipeline {
             let rx = Arc::clone(&input_rx);
             let tx = output_tx.clone();
             let f = Arc::clone(&filters);
-            let m = Arc::clone(&metrics);
-            let im = instance_metrics.clone();
-            let dlq_ref = dlq.clone();
+            let ctx = WorkerCtx {
+                metrics: Arc::clone(&metrics),
+                instance_metrics: instance_metrics.clone(),
+                dlq: dlq.clone(),
+                ack_tracker: ack_tracker.clone(),
+            };
             let handle = tokio::spawn(async move {
-                run_filter_worker(worker_id, rx, tx, f, m, im, dlq_ref).await;
+                run_filter_worker(worker_id, rx, tx, f, ctx).await;
             });
             filter_handles.push(handle);
         }
@@ -314,20 +326,16 @@ impl Pipeline {
 
         // Spawn output worker
         let outputs: Arc<Vec<Box<dyn OutputPlugin>>> = Arc::new(self.outputs);
-        let output_metrics = Arc::clone(&metrics);
-        let output_instance_metrics = instance_metrics.clone();
         let output_config = buffer_config.clone();
-        let output_dlq = self.dead_letter_queue.clone();
+        let output_pq = pq.clone();
+        let output_ctx = WorkerCtx {
+            metrics: Arc::clone(&metrics),
+            instance_metrics: instance_metrics.clone(),
+            dlq: self.dead_letter_queue.clone(),
+            ack_tracker: ack_tracker.clone(),
+        };
         let output_handle = tokio::spawn(async move {
-            run_outputs(
-                output_rx,
-                outputs,
-                output_metrics,
-                output_instance_metrics,
-                output_config,
-                output_dlq,
-            )
-            .await;
+            run_outputs(output_rx, outputs, output_config, output_pq, output_ctx).await;
         });
 
         // Wait for all inputs to finish, but DON'T close the pipeline yet.
@@ -406,6 +414,122 @@ impl Pipeline {
     }
 }
 
+/// In-flight accounting for at-least-once persistent-queue delivery.
+///
+/// This is the pipeline-engine half of the guarantee; the storage half is
+/// [`PersistentQueue`](crate::persistent_queue::PersistentQueue)'s split
+/// `read_seq` (pop cursor) / `ack_seq` (durable cursor). The tracker decides WHEN
+/// it is safe to advance the durable cursor: only after every event derived from
+/// a popped queue entry has reached a terminal state downstream.
+///
+/// Lifecycle of one popped entry with sequence `seq`:
+/// 1. The drainer pops `(seq, event)`, stamps `event`, and calls
+///    [`register`](Self::register) — outstanding count 1 (the single event
+///    entering the filter stage).
+/// 2. A filter worker runs the chain, yielding `k` derived events (0 = dropped,
+///    1 = transformed, N = cloned/split), and calls
+///    [`set_fanout`](Self::set_fanout)`(seq, k)`. `k == 0` completes the entry at
+///    once (every derivation was dropped — still "handled", so it is acked and
+///    does not replay).
+/// 3. The output path calls [`complete`](Self::complete)`(seq)` once per derived
+///    event that reaches a terminal state (delivered, or written to the DLQ).
+///    The entry is done when its count returns to 0.
+///
+/// [`ack_point`](Self::ack_point) returns the exclusive high-water mark for
+/// `PersistentQueue::ack`: the smallest still-outstanding sequence (everything
+/// below it is durably done) or `highest_registered + 1` when nothing is in
+/// flight. Because it is the *minimum* outstanding sequence, an interleaved
+/// fan-out/complete can never advance the ack past an entry still in flight, so
+/// acking is always a safe lower bound (at-least-once, never at-most-once).
+struct AckState {
+    /// `seq` -> number of derived events not yet terminal.
+    outstanding: BTreeMap<u64, u64>,
+    /// Highest sequence ever registered, so the ack can advance past the final
+    /// entry once nothing is outstanding.
+    highest_registered: Option<u64>,
+}
+
+struct AckTracker {
+    state: Mutex<AckState>,
+}
+
+impl AckTracker {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(AckState {
+                outstanding: BTreeMap::new(),
+                highest_registered: None,
+            }),
+        }
+    }
+
+    /// Lock the state, recovering a poisoned mutex (panic in another holder)
+    /// instead of propagating: losing some ack precision (at worst a few
+    /// duplicate replays) is far preferable to wedging delivery.
+    fn lock(&self) -> std::sync::MutexGuard<'_, AckState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Record a freshly-popped entry as one in-flight event.
+    fn register(&self, seq: u64) {
+        let mut s = self.lock();
+        s.outstanding.insert(seq, 1);
+        s.highest_registered = Some(s.highest_registered.map_or(seq, |h| h.max(seq)));
+    }
+
+    /// Set how many derived events remain in flight for `seq` after the filter
+    /// chain. `0` completes the entry immediately.
+    fn set_fanout(&self, seq: u64, derived: usize) {
+        let mut s = self.lock();
+        if derived == 0 {
+            s.outstanding.remove(&seq);
+        } else {
+            s.outstanding.insert(seq, derived as u64);
+        }
+    }
+
+    /// Mark one derived event of `seq` terminal (delivered or DLQ'd). Removes the
+    /// entry once the last completes. A no-op for an unknown/already-done seq.
+    fn complete(&self, seq: u64) {
+        let mut s = self.lock();
+        if let Some(remaining) = s.outstanding.get_mut(&seq) {
+            *remaining = remaining.saturating_sub(1);
+            if *remaining == 0 {
+                s.outstanding.remove(&seq);
+            }
+        }
+    }
+
+    /// The exclusive ack high-water mark, or `None` if nothing has been
+    /// registered yet.
+    fn ack_point(&self) -> Option<u64> {
+        let s = self.lock();
+        match s.outstanding.keys().next() {
+            // Everything below the smallest in-flight seq is durably done.
+            Some(&min) => Some(min),
+            // Nothing in flight: everything registered is done.
+            None => s.highest_registered.map(|h| h + 1),
+        }
+    }
+}
+
+/// Cross-cutting context shared by the filter and output workers: metrics sinks,
+/// the optional DLQ, and the at-least-once ack tracker.
+///
+/// Bundled into one value so the worker entry points stay within the
+/// argument-count budget and so adding another cross-cutting concern does not
+/// ripple through every call site. Cheap to `clone` (all fields are `Arc`s or
+/// `Option<Arc>`s), so each spawned task gets its own owned copy.
+#[derive(Clone)]
+struct WorkerCtx {
+    metrics: Arc<PipelineMetrics>,
+    instance_metrics: Option<Arc<PipelineMetrics>>,
+    dlq: Option<SharedDeadLetterQueue>,
+    ack_tracker: Option<Arc<AckTracker>>,
+}
+
 /// Drains a persistent queue into the filter channel until shutdown or, in
 /// auto-exit mode, until inputs are done and the PQ is fully drained.
 ///
@@ -425,6 +549,7 @@ async fn run_pq_drainer(
     tx: mpsc::Sender<Event>,
     sig: ShutdownSignal,
     inputs_done: Arc<AtomicBool>,
+    ack_tracker: Option<Arc<AckTracker>>,
 ) {
     // Reclaim fully-consumed segments on a small cadence rather than after
     // every single pop: `gc` re-lists/re-reads segment files, so running it
@@ -438,9 +563,11 @@ async fn run_pq_drainer(
     // are deleted instead of re-read/re-decompressed every call).
     const GC_EVERY: u32 = 256;
     let mut pops_since_gc: u32 = 0;
-    // `gc` only removes segments whose every entry is already read
-    // (`seq < read_seq`), so it never drops un-consumed events; failures are
-    // non-fatal (next cadence retries), so we only warn.
+    // `gc` only removes segments whose every entry is already durably acked
+    // (`seq < ack_seq`), so it never drops un-delivered events; failures are
+    // non-fatal (next cadence retries), so we only warn. Reclamation now follows
+    // the output path's acks (see `AckTracker`); this cadence just bounds how
+    // often the drainer re-scans for newly-acked segments to reclaim.
     let run_gc = |pq: &SharedPersistentQueue| {
         if let Err(e) = pq.gc() {
             warn!(error = %e, "PQ gc error");
@@ -451,8 +578,15 @@ async fn run_pq_drainer(
         if sig.is_shutdown() {
             break;
         }
-        match pq_drain.pop() {
-            Ok(Some(event)) => {
+        match pq_drain.pop_with_seq() {
+            Ok(Some((seq, mut event))) => {
+                // Stamp the originating queue sequence and register it as
+                // in-flight BEFORE handing the event downstream, so the entry is
+                // tracked the instant it can be observed by a filter worker.
+                if let Some(ref tracker) = ack_tracker {
+                    event.set_pq_seq(seq);
+                    tracker.register(seq);
+                }
                 if tx.send(event).await.is_err() {
                     break;
                 }
@@ -484,8 +618,11 @@ async fn run_pq_drainer(
             }
         }
     }
-    // Final reclamation + checkpoint on exit so the last consumed segments are
-    // released and the read cursor is durable.
+    // Final reclamation + checkpoint on exit so segments acked right before
+    // shutdown are released and the durable ack cursor is flushed. The output
+    // path owns advancing `ack_seq` (see `run_outputs`); this only persists
+    // whatever it has acked so far. Entries popped but not yet acked are left in
+    // place on purpose — they replay on the next start (at-least-once).
     run_gc(&pq_drain);
     if let Err(e) = pq_drain.checkpoint() {
         warn!(error = %e, "PQ checkpoint error on shutdown");
@@ -497,10 +634,14 @@ async fn run_filter_worker(
     rx: Arc<tokio::sync::Mutex<mpsc::Receiver<Event>>>,
     tx: mpsc::Sender<Event>,
     filters: Arc<Vec<Box<dyn FilterPlugin>>>,
-    metrics: Arc<PipelineMetrics>,
-    instance_metrics: Option<Arc<PipelineMetrics>>,
-    dlq: Option<SharedDeadLetterQueue>,
+    ctx: WorkerCtx,
 ) {
+    let WorkerCtx {
+        metrics,
+        instance_metrics,
+        dlq,
+        ack_tracker,
+    } = ctx;
     // Batch size for filter processing — amortises Mutex lock and Vec
     // allocation overhead across multiple events, matching Logstash's
     // pipeline.batch.size approach.
@@ -546,6 +687,9 @@ async fn run_filter_worker(
 
         // Process each event through the filter chain
         for event in batch.drain(..) {
+            // Capture the originating PQ sequence (if any) before the chain may
+            // clone/split/drop the event into derivations that don't carry it.
+            let pq_seq = event.pq_seq();
             let mut events = vec![event];
 
             for filter in filters.iter() {
@@ -590,6 +734,21 @@ async fn run_filter_worker(
                 events = next_events;
             }
 
+            // At-least-once accounting: the popped queue entry `pq_seq` fans out
+            // to `events.len()` derived events here. Record that count (0
+            // completes the entry immediately — every derivation was dropped or
+            // DLQ'd during filtering) and re-stamp each surviving event with the
+            // originating seq so the output path can acknowledge the entry once
+            // all of its derivations are delivered/DLQ'd. Re-stamping is required
+            // (not mere propagation) because clone/split produce fresh events
+            // with `pq_seq == None`.
+            if let (Some(tracker), Some(seq)) = (ack_tracker.as_ref(), pq_seq) {
+                tracker.set_fanout(seq, events.len());
+                for ev in &mut events {
+                    ev.set_pq_seq(seq);
+                }
+            }
+
             for ev in events {
                 if tx.send(ev).await.is_err() {
                     return;
@@ -611,13 +770,38 @@ fn clamp_flush_interval(interval: std::time::Duration) -> std::time::Duration {
     interval.max(std::time::Duration::from_millis(1))
 }
 
+/// Advance the persistent queue's durable ack cursor to the tracker's current
+/// high-water mark, checkpointing + reclaiming only when it actually moved.
+///
+/// This is where popped queue entries become durably acknowledged: the tracker
+/// reports the smallest still-in-flight sequence (everything below it delivered),
+/// and the PQ checkpoints that as `ack_seq` and gcs below it. No-op unless both a
+/// PQ and a tracker are present (memory-queue pipelines have nothing to ack). The
+/// `> last_acked` guard skips redundant checkpoint+gc IO when nothing advanced.
+fn advance_durable_ack(
+    pq: Option<&SharedPersistentQueue>,
+    ack_tracker: Option<&Arc<AckTracker>>,
+    last_acked: &mut u64,
+) {
+    if let (Some(pq), Some(tracker)) = (pq, ack_tracker) {
+        if let Some(point) = tracker.ack_point() {
+            if point > *last_acked {
+                if let Err(e) = pq.ack(point) {
+                    warn!(error = %e, "PQ ack error");
+                } else {
+                    *last_acked = point;
+                }
+            }
+        }
+    }
+}
+
 async fn run_outputs(
     mut rx: mpsc::Receiver<Event>,
     outputs: Arc<Vec<Box<dyn OutputPlugin>>>,
-    metrics: Arc<PipelineMetrics>,
-    instance_metrics: Option<Arc<PipelineMetrics>>,
     config: BufferConfig,
-    dlq: Option<SharedDeadLetterQueue>,
+    pq: Option<SharedPersistentQueue>,
+    ctx: WorkerCtx,
 ) {
     let mut collector = BatchCollector::new(config);
     // `flush_interval` is derived from the unvalidated `batch_delay_ms` config
@@ -629,27 +813,41 @@ async fn run_outputs(
     let mut flush_timer = tokio::time::interval(flush_interval);
     flush_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // Highest durable ack point already persisted, so the periodic ack skips the
+    // checkpoint+gc when the in-flight set hasn't advanced.
+    let mut last_acked: u64 = 0;
+
     loop {
         tokio::select! {
             event = rx.recv() => {
                 if let Some(ev) = event {
                     if let Some(batch) = collector.add(ev) {
-                        send_batch(&outputs, batch, &metrics, instance_metrics.as_ref(), dlq.as_ref()).await;
+                        send_batch(&outputs, batch, &ctx).await;
                     }
                 } else {
                     // Channel closed, flush remaining
                     if !collector.is_empty() {
                         let batch = collector.flush();
-                        send_batch(&outputs, batch, &metrics, instance_metrics.as_ref(), dlq.as_ref()).await;
+                        send_batch(&outputs, batch, &ctx).await;
                     }
+                    // Final durable ack on shutdown: everything delivered before
+                    // exit becomes durable so it is not needlessly replayed next
+                    // start (entries still un-acked here replay — at-least-once).
+                    advance_durable_ack(pq.as_ref(), ctx.ack_tracker.as_ref(), &mut last_acked);
                     break;
                 }
             }
             _ = flush_timer.tick() => {
                 if !collector.is_empty() {
                     let batch = collector.flush();
-                    send_batch(&outputs, batch, &metrics, instance_metrics.as_ref(), dlq.as_ref()).await;
+                    send_batch(&outputs, batch, &ctx).await;
                 }
+                // Periodically advance the durable ack cursor for everything
+                // delivered so far, bounding the crash-replay window to ~one flush
+                // interval of in-flight events. Also covers the all-dropped case
+                // (events completed in the filter stage never reach this task, so
+                // only the timer advances their ack).
+                advance_durable_ack(pq.as_ref(), ctx.ack_tracker.as_ref(), &mut last_acked);
             }
         }
     }
@@ -665,13 +863,29 @@ async fn run_outputs(
     }
 }
 
-async fn send_batch(
-    outputs: &[Box<dyn OutputPlugin>],
-    batch: Vec<Event>,
-    metrics: &Arc<PipelineMetrics>,
-    instance_metrics: Option<&Arc<PipelineMetrics>>,
-    dlq: Option<&SharedDeadLetterQueue>,
-) {
+/// Mark every persistent-queue entry represented in `events` as having one
+/// derived event completed (delivered or DLQ'd). No-op when there is no tracker
+/// or the events carry no PQ sequence (memory-queue pipelines).
+///
+/// Called exactly once per event reaching a terminal state, so an entry that
+/// fanned out to K derived events is acknowledged only after all K complete —
+/// even when those K are spread across several output batches.
+fn complete_batch_seqs(ack_tracker: Option<&Arc<AckTracker>>, events: &[Event]) {
+    if let Some(tracker) = ack_tracker {
+        for ev in events {
+            if let Some(seq) = ev.pq_seq() {
+                tracker.complete(seq);
+            }
+        }
+    }
+}
+
+async fn send_batch(outputs: &[Box<dyn OutputPlugin>], batch: Vec<Event>, ctx: &WorkerCtx) {
+    let metrics = &ctx.metrics;
+    let instance_metrics = ctx.instance_metrics.as_ref();
+    let dlq = ctx.dlq.as_ref();
+    let ack_tracker = ctx.ack_tracker.as_ref();
+
     let count = batch.len() as u64;
     // Estimate bytes without expensive JSON serialization — use message
     // length as a proxy. Full JSON is only needed for actual output plugins.
@@ -707,7 +921,14 @@ async fn send_batch(
                         warn!(error = %dlq_err, "failed to write to DLQ");
                     }
                 }
+                // The DLQ captured these failed events, so they are terminal —
+                // acknowledge their queue entries (a DLQ'd event is not replayed).
+                complete_batch_seqs(ack_tracker, &filtered);
             }
+            // Without a DLQ the failed events are left UN-acknowledged on purpose:
+            // their queue entries stay below the ack cursor and replay on the next
+            // start. That is the at-least-once contract — a persistently failing
+            // output backs the queue up (the durable buffer) rather than dropping.
             return;
         }
     }
@@ -716,6 +937,11 @@ async fn send_batch(
     if let Some(im) = instance_metrics {
         im.record_out(count, bytes);
     }
+
+    // Whole batch delivered to every matching output (events that matched no
+    // output are terminal too — there was nothing to deliver). Acknowledge every
+    // queue entry represented in the batch.
+    complete_batch_seqs(ack_tracker, &batch);
 }
 
 #[cfg(test)]
@@ -1054,6 +1280,7 @@ mod tests {
             tx,
             signal,
             Arc::clone(&inputs_done),
+            None,
         ));
 
         // The drainer must terminate (its tx clone dropped) within the timeout.
@@ -1113,6 +1340,116 @@ mod tests {
             seen.load(Ordering::SeqCst),
             10,
             "all 10 finite-input events should flow through PQ to the output"
+        );
+    }
+
+    /// An output that always fails (no successful delivery).
+    #[derive(Debug)]
+    struct FailingOutput;
+
+    #[async_trait::async_trait]
+    impl OutputPlugin for FailingOutput {
+        fn name(&self) -> &str {
+            "failing"
+        }
+        async fn output(&self, _events: Vec<Event>) -> Result<()> {
+            Err(crate::error::FerroStashError::Pipeline(
+                "simulated permanent output failure".to_string(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_at_least_once_failing_output_no_dlq_replays() {
+        // End-to-end at-least-once: with a persistent queue and an output that
+        // never succeeds (and NO DLQ), events flow PQ -> filter -> output, fail
+        // delivery, and must be left UN-acknowledged. After the run, reopening the
+        // queue must still hold every event so they replay on the next start.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pq_path = dir.path().to_string_lossy().to_string();
+
+        let config = PipelineConfig {
+            auto_exit_on_inputs_done: true,
+            workers: 2,
+            queue: QueueType::Persisted(PqConfig {
+                path: pq_path.clone(),
+                checkpoint_interval: 1,
+                ..PqConfig::default()
+            }),
+            // No DLQ: failed events must not be acked (they replay).
+            ..PipelineConfig::default()
+        };
+        let mut pipeline = Pipeline::new(config);
+        pipeline.add_input(Box::new(FiniteInput { count: 10 }));
+        pipeline.add_output(Box::new(FailingOutput));
+
+        let (_controller, signal) = ShutdownController::new();
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(15), pipeline.run(signal)).await;
+        assert!(
+            result.expect("pipeline must terminate").is_ok(),
+            "pipeline run should succeed even when the output fails"
+        );
+
+        // Reopen the queue: nothing was delivered, so nothing was acked — all 10
+        // events must still be present to replay.
+        let reopened = SharedPersistentQueue::open(PqConfig {
+            path: pq_path,
+            checkpoint_interval: 1,
+            ..PqConfig::default()
+        })
+        .expect("reopen PQ");
+        let mut replayed = 0;
+        while reopened.pop().expect("pop").is_some() {
+            replayed += 1;
+        }
+        assert_eq!(
+            replayed, 10,
+            "all 10 undelivered events must survive for replay (at-least-once)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_at_least_once_successful_output_acks_and_drains() {
+        // The complement: when the output succeeds, every event is acknowledged
+        // after delivery, so reopening the queue finds it drained (no needless
+        // replay).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pq_path = dir.path().to_string_lossy().to_string();
+
+        let config = PipelineConfig {
+            auto_exit_on_inputs_done: true,
+            workers: 2,
+            queue: QueueType::Persisted(PqConfig {
+                path: pq_path.clone(),
+                checkpoint_interval: 1,
+                ..PqConfig::default()
+            }),
+            ..PipelineConfig::default()
+        };
+        let mut pipeline = Pipeline::new(config);
+        let seen = Arc::new(AtomicUsize::new(0));
+        pipeline.add_input(Box::new(FiniteInput { count: 10 }));
+        pipeline.add_output(Box::new(CountingOutput {
+            seen: Arc::clone(&seen),
+        }));
+
+        let (_controller, signal) = ShutdownController::new();
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(15), pipeline.run(signal)).await;
+        assert!(result.expect("pipeline must terminate").is_ok());
+        assert_eq!(seen.load(Ordering::SeqCst), 10, "all 10 delivered");
+
+        // Reopen: everything was delivered and acked, so the queue is drained.
+        let reopened = SharedPersistentQueue::open(PqConfig {
+            path: pq_path,
+            checkpoint_interval: 1,
+            ..PqConfig::default()
+        })
+        .expect("reopen PQ");
+        assert!(
+            reopened.pop().expect("pop").is_none(),
+            "all delivered events must be acked; nothing should replay"
         );
     }
 }

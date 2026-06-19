@@ -283,6 +283,18 @@ pub struct Event {
     /// Whether this event has been cancelled (dropped).
     #[serde(skip)]
     cancelled: bool,
+
+    /// Originating persistent-queue sequence number, for at-least-once delivery.
+    ///
+    /// In-memory only (`#[serde(skip)]`, never persisted and never emitted): the
+    /// PQ drainer stamps each popped event with the originating queue entry's
+    /// `seq`, filter workers re-stamp it onto every derived event, and the output
+    /// path uses it to acknowledge (durably checkpoint) the PQ entry only AFTER
+    /// the event has been delivered. That ack-after-output ordering is what makes
+    /// PQ delivery at-least-once across a crash/restart: an event popped but not
+    /// yet delivered is left un-acked and replays on the next start.
+    #[serde(skip)]
+    pq_seq: Option<u64>,
 }
 
 impl Event {
@@ -299,6 +311,7 @@ impl Event {
             metadata: Metadata::new(),
             tags: Vec::new(),
             cancelled: false,
+            pq_seq: None,
         }
     }
 
@@ -311,6 +324,7 @@ impl Event {
             metadata: Metadata::new(),
             tags: Vec::new(),
             cancelled: false,
+            pq_seq: None,
         }
     }
 
@@ -403,6 +417,25 @@ impl Event {
     /// Returns true if the event is cancelled.
     pub fn is_cancelled(&self) -> bool {
         self.cancelled
+    }
+
+    /// Returns the originating persistent-queue sequence number, if this event
+    /// was read from a persistent queue (set by the PQ drainer and propagated by
+    /// filter workers). Used by the output path to acknowledge the PQ entry only
+    /// after delivery. `None` for events that never passed through a PQ.
+    #[must_use]
+    pub fn pq_seq(&self) -> Option<u64> {
+        self.pq_seq
+    }
+
+    /// Stamps this event with the persistent-queue sequence it derives from.
+    ///
+    /// The drainer stamps freshly-popped events; filter workers re-stamp every
+    /// derived event (clones/splits produce new events whose `pq_seq` must be set
+    /// back to the originating entry) so a single PQ entry is acknowledged only
+    /// once all of its derived events reach the output (or are dropped/DLQ'd).
+    pub fn set_pq_seq(&mut self, seq: u64) {
+        self.pq_seq = Some(seq);
     }
 
     /// Returns an iterator over all field names.

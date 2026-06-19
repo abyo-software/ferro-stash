@@ -102,10 +102,25 @@ struct QueueEntry {
 }
 
 /// Persistent Queue implementation.
+///
+/// Two read cursors give at-least-once delivery:
+///
+/// - `read_seq` — the in-memory *pop* cursor. [`dequeue`](Self::dequeue)/`pop`
+///   advance it so a single run never re-reads an entry. It is NOT the durable
+///   recovery point.
+/// - `ack_seq` — the *durable* cursor. It only advances via [`ack`](Self::ack),
+///   which is called after the consumer has delivered the event downstream. It
+///   is the value persisted in `checkpoint.json`, the floor `gc` reclaims below,
+///   and the position `read_seq` is reset to on reopen. An entry that was popped
+///   but not yet acked (in flight, or lost to a crash) therefore replays on the
+///   next start — that is the at-least-once guarantee. (Before this split the
+///   single `read_seq` was checkpointed on read, making the PQ a durable buffer
+///   but NOT at-least-once: popped-then-crashed events were lost.)
 pub struct PersistentQueue {
     config: PqConfig,
     write_seq: u64,
     read_seq: u64,
+    ack_seq: u64,
     current_segment: Option<BufWriter<File>>,
     current_segment_count: usize,
     segment_index: u64,
@@ -118,15 +133,21 @@ impl PersistentQueue {
         fs::create_dir_all(&config.path)
             .map_err(|e| FerroStashError::Pipeline(format!("cannot create PQ directory: {e}")))?;
 
-        // Load checkpoint
+        // Load checkpoint. The durable cursor is `ack_seq`; older checkpoints
+        // (pre at-least-once) only wrote `read_seq`, which was the
+        // checkpoint-on-read position, so fall back to it for back-compat. The
+        // in-memory pop cursor `read_seq` is reset to `ack_seq` so any entry that
+        // was popped but not durably acknowledged replays on reopen.
         let checkpoint_path = Path::new(&config.path).join("checkpoint.json");
-        let (checkpoint_write_seq, read_seq, checkpoint_segment_index) = if checkpoint_path.exists()
-        {
+        let (checkpoint_write_seq, ack_seq, checkpoint_segment_index) = if checkpoint_path.exists() {
             let content = fs::read_to_string(&checkpoint_path).unwrap_or_default();
             if let Ok(cp) = serde_json::from_str::<serde_json::Value>(&content) {
                 (
                     cp["write_seq"].as_u64().unwrap_or(0),
-                    cp["read_seq"].as_u64().unwrap_or(0),
+                    cp["ack_seq"]
+                        .as_u64()
+                        .or_else(|| cp["read_seq"].as_u64())
+                        .unwrap_or(0),
                     cp["segment_index"].as_u64().unwrap_or(0),
                 )
             } else {
@@ -145,7 +166,7 @@ impl PersistentQueue {
         info!(
             path = %config.path,
             write_seq,
-            read_seq,
+            ack_seq,
             compression = ?config.compression,
             "persistent queue opened"
         );
@@ -153,7 +174,10 @@ impl PersistentQueue {
         Ok(Self {
             config,
             write_seq,
-            read_seq,
+            // In-memory pop cursor starts at the durable ack point so unacked
+            // entries are re-delivered (at-least-once) on reopen.
+            read_seq: ack_seq,
+            ack_seq,
             current_segment: None,
             current_segment_count: 0,
             segment_index,
@@ -315,8 +339,29 @@ impl PersistentQueue {
         Ok(())
     }
 
-    /// Dequeue events up to `batch_size`.
+    /// Dequeue events up to `batch_size`, returning only their payloads.
+    ///
+    /// Advances the in-memory pop cursor (`read_seq`) but NOT the durable
+    /// `ack_seq` — call [`ack`](Self::ack) after the events have been delivered
+    /// downstream to make the consumption durable. See
+    /// [`dequeue_with_seq`](Self::dequeue_with_seq) for the variant that returns
+    /// each entry's sequence (needed to acknowledge it).
     pub fn dequeue(&mut self, batch_size: usize) -> Result<Vec<String>> {
+        Ok(self
+            .dequeue_with_seq(batch_size)?
+            .into_iter()
+            .map(|(_, data)| data)
+            .collect())
+    }
+
+    /// Dequeue events up to `batch_size`, returning `(seq, payload)` pairs.
+    ///
+    /// The `seq` is the durable queue-entry sequence; the caller passes the
+    /// highest contiguously-delivered `seq + 1` back to [`ack`](Self::ack) to
+    /// advance the durable cursor. Advances `read_seq` only (the in-memory pop
+    /// cursor), so an entry that is popped but never acked replays after a
+    /// restart — the at-least-once guarantee.
+    pub fn dequeue_with_seq(&mut self, batch_size: usize) -> Result<Vec<(u64, String)>> {
         let mut results = Vec::with_capacity(batch_size);
 
         // Flush current writer before reading
@@ -357,8 +402,8 @@ impl PersistentQueue {
                 }
                 if let Ok(entry) = serde_json::from_str::<QueueEntry>(line) {
                     if entry.seq >= self.read_seq {
-                        results.push(entry.data);
                         self.read_seq = entry.seq + 1;
+                        results.push((entry.seq, entry.data));
                     }
                 }
             }
@@ -367,9 +412,19 @@ impl PersistentQueue {
         Ok(results)
     }
 
-    /// Acknowledge processed events and clean up consumed segments.
+    /// Acknowledge durable delivery up to (but not including) `up_to_seq`, then
+    /// reclaim any segments now fully below the durable cursor.
+    ///
+    /// `up_to_seq` is the exclusive high-water mark of contiguously-delivered
+    /// entries (i.e. the next sequence still in flight). This advances the
+    /// durable `ack_seq` — and pulls the in-memory `read_seq` forward to match if
+    /// it somehow lagged — checkpoints it, and gcs. Both cursors move
+    /// monotonically (`max`), so an out-of-order or stale ack can never rewind
+    /// the queue and re-deliver already-acked data.
     pub fn ack(&mut self, up_to_seq: u64) -> Result<()> {
-        self.read_seq = up_to_seq;
+        self.ack_seq = self.ack_seq.max(up_to_seq);
+        // Acked entries are durably done; never re-pop them in this run either.
+        self.read_seq = self.read_seq.max(self.ack_seq);
         self.checkpoint()?;
         self.gc()?;
         Ok(())
@@ -478,10 +533,13 @@ impl PersistentQueue {
                 continue;
             }
             // Only reclaim a segment when every line parsed cleanly AND every
-            // entry's `seq` is below the read cursor (fully consumed). A segment
-            // with any unparsable line is conservatively kept: corruption is
-            // recoverable (see `test_pq_corruption_recovery`) and there may be
-            // valid un-read entries we must not lose.
+            // entry's `seq` is below the durable ACK cursor (fully delivered). A
+            // segment with any unparsable line is conservatively kept: corruption
+            // is recoverable (see `test_pq_corruption_recovery`) and there may be
+            // valid un-acked entries we must not lose. Gating on `ack_seq` (not
+            // the in-memory `read_seq`) is what makes reclamation safe under
+            // at-least-once: an entry that was popped but not yet delivered is
+            // never deleted, so it can replay after a crash/restart.
             if self.segment_fully_consumed(&seg_path) {
                 let _ = fs::remove_file(&seg_path);
                 debug!(path = %seg_path.display(), "consumed segment removed");
@@ -500,7 +558,7 @@ impl PersistentQueue {
     }
 
     /// Decide whether `path` is safe to reclaim, i.e. every entry it holds has
-    /// already been read (`seq < read_seq`).
+    /// already been durably acknowledged (`seq < ack_seq`).
     ///
     /// This is the corruption-aware GC delete predicate. Unlike a last-line
     /// peek it scans ALL lines:
@@ -508,14 +566,14 @@ impl PersistentQueue {
     /// - Blank lines are ignored (trailing newlines etc.).
     /// - If ANY non-blank line fails to parse as a [`QueueEntry`], the segment
     ///   is treated as NOT consumed (returns `false`) — corruption may sit
-    ///   *after* still-valid un-read entries (e.g. a truncated final append
+    ///   *after* still-valid un-acked entries (e.g. a truncated final append
     ///   following good records), and those recoverable entries must not be
-    ///   dropped. This includes a fully-read segment whose trailing line is
+    ///   dropped. This includes a fully-acked segment whose trailing line is
     ///   corrupted: it is conservatively kept (safe — keeping a file never
     ///   loses data; the cost is at most a delayed reclaim).
     /// - An empty/whitespace-only segment has no entries to lose; it is
-    ///   reclaimed (max over zero parsed entries is 0, which is `< read_seq`
-    ///   once `read_seq > 0`, matching the pre-existing empty-segment behavior).
+    ///   reclaimed (max over zero parsed entries is 0, which is `< ack_seq`
+    ///   once `ack_seq > 0`, matching the pre-existing empty-segment behavior).
     fn segment_fully_consumed(&self, path: &Path) -> bool {
         let content = Self::read_segment_to_string(path);
         let mut max_seq = 0_u64;
@@ -529,13 +587,18 @@ impl PersistentQueue {
                 Err(_) => return false,
             }
         }
-        max_seq < self.read_seq
+        max_seq < self.ack_seq
     }
 
     fn checkpoint(&self) -> Result<()> {
+        // `ack_seq` is the durable recovery cursor. `read_seq` is mirrored to it
+        // (NOT the in-memory pop cursor) so an older reader that only knows the
+        // `read_seq` field still recovers at the at-least-once-correct floor and
+        // replays anything popped-but-unacked.
         let checkpoint = serde_json::json!({
             "write_seq": self.write_seq,
-            "read_seq": self.read_seq,
+            "ack_seq": self.ack_seq,
+            "read_seq": self.ack_seq,
             "segment_index": self.segment_index,
         });
         let path = Path::new(&self.config.path).join("checkpoint.json");
@@ -588,11 +651,23 @@ impl PersistentQueue {
 
     /// Pop a single event from the queue, returning `None` if empty.
     pub fn pop(&mut self) -> Result<Option<Event>> {
-        let batch = self.dequeue(1)?;
-        if let Some(json_str) = batch.into_iter().next() {
+        Ok(self.pop_with_seq()?.map(|(_, event)| event))
+    }
+
+    /// Pop a single event together with its durable queue sequence, returning
+    /// `None` if empty.
+    ///
+    /// The `seq` must be acknowledged via [`ack`](Self::ack) (as `seq + 1`, the
+    /// exclusive high-water mark) only AFTER the event has been delivered
+    /// downstream — that ack-after-delivery ordering is what makes the queue
+    /// at-least-once. The drainer stamps this `seq` onto the event so the output
+    /// path can acknowledge it once delivery completes.
+    pub fn pop_with_seq(&mut self) -> Result<Option<(u64, Event)>> {
+        let batch = self.dequeue_with_seq(1)?;
+        if let Some((seq, json_str)) = batch.into_iter().next() {
             let value: serde_json::Value = serde_json::from_str(&json_str)
                 .map_err(|e| FerroStashError::Pipeline(format!("PQ deserialize error: {e}")))?;
-            Ok(Some(Event::from_json(value)))
+            Ok(Some((seq, Event::from_json(value))))
         } else {
             Ok(None)
         }
@@ -650,6 +725,27 @@ impl SharedPersistentQueue {
             .pop()
     }
 
+    /// Pop a single event together with its durable queue sequence.
+    ///
+    /// The caller acknowledges it via [`ack`](Self::ack) (as `seq + 1`) only
+    /// after the event has been delivered downstream — see
+    /// [`PersistentQueue::pop_with_seq`].
+    pub fn pop_with_seq(&self) -> Result<Option<(u64, Event)>> {
+        self.inner
+            .lock()
+            .map_err(|e| FerroStashError::Pipeline(format!("PQ lock poisoned: {e}")))?
+            .pop_with_seq()
+    }
+
+    /// Acknowledge durable delivery up to (exclusive) `up_to_seq`, advancing the
+    /// durable cursor, checkpointing, and reclaiming fully-acked segments.
+    pub fn ack(&self, up_to_seq: u64) -> Result<()> {
+        self.inner
+            .lock()
+            .map_err(|e| FerroStashError::Pipeline(format!("PQ lock poisoned: {e}")))?
+            .ack(up_to_seq)
+    }
+
     /// Number of unconsumed events.
     pub fn len(&self) -> u64 {
         self.inner.lock().map_or(0, |g| g.len())
@@ -668,12 +764,13 @@ impl SharedPersistentQueue {
             .checkpoint()
     }
 
-    /// Reclaim fully-consumed segment files (segments whose every entry has
-    /// `seq < read_seq`), decrementing `total_bytes`.
+    /// Reclaim fully-acknowledged segment files (segments whose every entry has
+    /// `seq < ack_seq`), recomputing `total_bytes`.
     ///
-    /// Uses the queue's already-advanced internal read cursor, so a drainer that
-    /// consumes via [`SharedPersistentQueue::pop`] can call this directly without
-    /// tracking the sequence itself. Un-read data is never removed.
+    /// Gated on the durable `ack_seq`, not the in-memory pop cursor, so an entry
+    /// that was popped but not yet acknowledged is never removed and can replay
+    /// after a restart (at-least-once). Reclamation therefore follows
+    /// [`SharedPersistentQueue::ack`], not [`SharedPersistentQueue::pop`].
     pub fn gc(&self) -> Result<()> {
         self.inner
             .lock()
@@ -767,6 +864,10 @@ mod tests {
             pq.enqueue(r#"{"msg":"a"}"#).expect("enqueue");
             pq.enqueue(r#"{"msg":"b"}"#).expect("enqueue");
             pq.dequeue(1).expect("dequeue");
+            // At-least-once: only acked consumption is durable. Acknowledge the
+            // first entry so "a" is not replayed on reopen (a bare dequeue
+            // without ack would replay both, by design).
+            pq.ack(1).expect("ack first");
             pq.close().expect("close");
         }
 
@@ -918,11 +1019,14 @@ mod tests {
 
         pq.push(&Event::new("ev1")).expect("push");
         pq.push(&Event::new("ev2")).expect("push");
-        let _ = pq.pop().expect("pop");
+        let (seq, _ev1) = pq.pop_with_seq().expect("pop").expect("event");
+        // At-least-once: acknowledge the delivered entry so it is durable and not
+        // replayed on reopen (a bare pop without ack would replay it, by design).
+        pq.ack(seq + 1).expect("ack");
         pq.checkpoint().expect("checkpoint");
         pq.close().expect("close");
 
-        // Reopen — should resume from checkpoint
+        // Reopen — should resume from the acked checkpoint
         let mut pq2 = PersistentQueue::new(path, 1_073_741_824).expect("reopen");
         let ev = pq2.pop().expect("pop").expect("event");
         assert_eq!(ev.message(), Some("ev2"));
@@ -1038,7 +1142,10 @@ mod tests {
                     .expect("enqueue for checkpoint_durability");
             }
             let _first_50 = pq.dequeue(50).expect("dequeue first 50");
-            pq.checkpoint().expect("checkpoint at 50");
+            // At-least-once: only ACKed consumption is durable. Acknowledge the
+            // first 50 so they are not replayed on reopen (a bare dequeue without
+            // ack would, by design, replay all 100).
+            pq.ack(50).expect("ack first 50");
             pq.close().expect("close after checkpoint");
         }
 
@@ -1048,7 +1155,7 @@ mod tests {
         assert_eq!(
             remaining.len(),
             50,
-            "only 50 events should remain after checkpoint at 50"
+            "only 50 events should remain after ack at 50"
         );
         assert!(
             remaining[0].contains("ckpt-50"),
@@ -1282,6 +1389,9 @@ mod tests {
                     .expect("enqueue for checkpoint_after_empty");
             }
             let _ = pq.dequeue(10).expect("dequeue all");
+            // At-least-once: durability follows ack, not read. Acknowledge all 10
+            // so the drained queue stays empty across reopen.
+            pq.ack(10).expect("ack all");
             pq.checkpoint().expect("checkpoint after emptying");
             pq.close().expect("close after checkpoint_after_empty");
         }
@@ -1291,7 +1401,7 @@ mod tests {
         let batch = pq.dequeue(100).expect("dequeue after reopen");
         assert!(
             batch.is_empty(),
-            "queue should be empty after checkpoint on drained queue"
+            "queue should be empty after acking a drained queue"
         );
     }
 
@@ -1370,16 +1480,20 @@ mod tests {
         let bytes_before = pq.total_bytes();
         assert!(bytes_before > 0, "should have written bytes");
 
-        // Consume everything.
+        // Consume AND acknowledge everything. Under at-least-once, gc reclaims
+        // below the durable ack cursor, so consumption alone (dequeue) is not
+        // enough — the consumer must ack.
         let batch = pq.dequeue(25).expect("dequeue");
         assert_eq!(batch.len(), 25);
         assert_eq!(pq.pending(), 0);
+        pq.ack(25).expect("ack");
 
-        // gc must reclaim the consumed (non-active) segments.
+        // gc (already run by ack) must have reclaimed the acked (non-active)
+        // segments.
         pq.gc().expect("gc");
         assert!(
             pq.total_bytes() < bytes_before,
-            "gc must reclaim consumed segment bytes (before={bytes_before}, after={})",
+            "gc must reclaim acked segment bytes (before={bytes_before}, after={})",
             pq.total_bytes()
         );
     }
@@ -1406,12 +1520,15 @@ mod tests {
 
         let batch = pq.dequeue(25).expect("dequeue");
         assert_eq!(batch.len(), 25);
+        // Acknowledge so the consumed segments fall below the durable cursor and
+        // become reclaimable.
+        pq.ack(25).expect("ack");
 
         pq.gc().expect("gc");
         let files_after = count_segment_files(&path);
         assert!(
             files_after < files_before,
-            "gc must delete consumed segment files (before={files_before}, after={files_after})"
+            "gc must delete acked segment files (before={files_before}, after={files_after})"
         );
     }
 
@@ -1481,14 +1598,17 @@ mod tests {
                 .unwrap_or_else(|e| {
                     panic!("enqueue {i} wedged at max_bytes despite consumption: {e}")
                 });
-            // Consume immediately and reclaim periodically.
+            // Consume immediately and acknowledge periodically. Under
+            // at-least-once, reclamation follows the durable ack cursor, so the
+            // consumer must ack (a bare dequeue would back the queue up); `ack`
+            // both checkpoints and gcs.
             let _ = pq.dequeue(1).expect("dequeue");
             if i % 8 == 0 {
-                pq.gc().expect("gc");
+                pq.ack(i + 1).expect("ack");
             }
         }
-        // Final drain + gc; queue should be empty and well under max_bytes.
-        pq.gc().expect("final gc");
+        // Final drain + ack; queue should be empty and well under max_bytes.
+        pq.ack(2_000).expect("final ack");
         assert_eq!(pq.pending(), 0, "all events should be consumed");
         assert!(
             pq.total_bytes() < 4_096,
@@ -1555,8 +1675,11 @@ mod tests {
             pq.enqueue(&format!(r#"{{"msg":"event {i}"}}"#))
                 .expect("enqueue");
         }
-        // Read the first 6 so read_seq advances past the first full segment.
+        // Read+ack the first 5 so the durable cursor advances past the first full
+        // segment (acked => reclaimable), leaving the un-read seq 5 in the active
+        // segment.
         let _ = pq.dequeue(5).expect("dequeue");
+        pq.ack(5).expect("ack first segment");
         // gc with an active, possibly-unflushed segment must not delete it and
         // must not lose the un-read event(s).
         pq.gc().expect("gc with active segment");
@@ -1653,8 +1776,12 @@ mod tests {
         // entries of the corrupted segment to set read_seq to 5.
         let consumed = pq.dequeue(5).expect("dequeue first segment");
         assert_eq!(consumed.len(), 5, "first segment's 5 valid entries read");
+        // Acknowledge the first 5 so the corrupted segment is fully below the ACK
+        // cursor — its retention must be driven by corruption-conservatism, not
+        // by the entries being un-acked.
+        pq.ack(5).expect("ack first segment");
 
-        // gc now. read_seq == 5. The corrupted segment holds entries 0..4
+        // gc now. ack_seq == 5. The corrupted segment holds entries 0..4
         // (all < 5) BUT also a corrupt line. Conservative policy keeps it.
         pq.gc().expect("gc");
         assert!(
@@ -1747,6 +1874,10 @@ mod tests {
         // Read the first segment only (seqs 0..4) -> read_seq == 5.
         let first = pq.dequeue(5).expect("dequeue first segment");
         assert_eq!(first.len(), 5);
+        // Acknowledge the first segment so the still-unread second segment is the
+        // genuine subject of the test (kept because it holds un-acked entries
+        // behind a corrupt tail).
+        pq.ack(5).expect("ack first segment");
 
         pq.gc().expect("gc");
         assert!(
@@ -1791,12 +1922,14 @@ mod tests {
 
         let batch = pq.dequeue(25).expect("dequeue");
         assert_eq!(batch.len(), 25);
+        // Acknowledge so the clean, fully-read segments fall below the ack cursor.
+        pq.ack(25).expect("ack");
 
         pq.gc().expect("gc");
         let files_after = count_segment_files(&path);
         assert!(
             files_after < files_before,
-            "gc must still reclaim clean, fully-read segments (before={files_before}, after={files_after})"
+            "gc must still reclaim clean, fully-acked segments (before={files_before}, after={files_after})"
         );
     }
 
@@ -1843,12 +1976,16 @@ mod tests {
         let drained = pq.dequeue(1000).expect("dequeue all");
         assert_eq!(drained.len(), 11, "all 11 valid entries should drain");
         assert_eq!(pq.pending(), 0);
+        // Acknowledge everything so the corrupt first segment is fully below the
+        // ack cursor: its retention must be driven by corruption, not by un-acked
+        // entries.
+        pq.ack(11).expect("ack all");
 
         pq.gc().expect("gc");
-        // Conservative: corrupt first segment is KEPT despite being fully-read.
+        // Conservative: corrupt first segment is KEPT despite being fully-acked.
         assert!(
             corrupted.exists(),
-            "conservative policy keeps a corrupt segment even when fully-read (safe)"
+            "conservative policy keeps a corrupt segment even when fully-acked (safe)"
         );
     }
 
@@ -1917,14 +2054,16 @@ mod tests {
                     )
                 });
             let _ = pq.dequeue(1).expect("dequeue");
+            // Acknowledge periodically so reclamation can run (ack gcs); under
+            // at-least-once a bare dequeue does not advance the durable cursor.
             if i % 4 == 0 {
-                pq.gc().expect("gc");
+                pq.ack(i + 1).expect("ack");
             }
         }
 
-        // Final drain + gc. The queue is empty; only the (empty) active write
+        // Final drain + ack. The queue is empty; only the (empty) active write
         // segment should remain on disk.
-        pq.gc().expect("final gc");
+        pq.ack(2_000).expect("final ack");
         assert_eq!(pq.pending(), 0, "all events should be consumed");
 
         let on_disk = on_disk_segment_bytes(&path);
@@ -1946,5 +2085,140 @@ mod tests {
         // And the producer must still be able to enqueue (not wedged).
         pq.enqueue(r#"{"msg":"post-drain still accepts writes"}"#)
             .expect("enqueue must still succeed after a long compressed run");
+    }
+
+    // ---- At-least-once delivery (read_seq / ack_seq split) tests ----
+
+    #[test]
+    fn test_pq_at_least_once_replays_popped_but_unacked_after_restart() {
+        // The core at-least-once guarantee: entries popped (read) but NOT
+        // acknowledged before a crash MUST replay on reopen. Before the
+        // read_seq/ack_seq split, a bare dequeue checkpointed the read cursor and
+        // these events were silently lost.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_string_lossy().to_string();
+        let config = PqConfig {
+            path: path.clone(),
+            checkpoint_interval: 1,
+            ..Default::default()
+        };
+
+        {
+            let mut pq = PersistentQueue::open(config.clone()).expect("open");
+            for i in 0..10 {
+                pq.enqueue(&format!(r#"{{"msg":"event {i}"}}"#))
+                    .expect("enqueue");
+            }
+            // Pop ALL 10 but acknowledge NONE (simulates events in flight to the
+            // output when the process dies). Checkpoint to make the durable state
+            // observable, then drop without acking.
+            let popped = pq.dequeue_with_seq(10).expect("dequeue");
+            assert_eq!(popped.len(), 10, "all 10 read in this run");
+            pq.checkpoint().expect("checkpoint");
+            pq.close().expect("close (no ack)");
+        }
+
+        // Reopen: every un-acked entry must replay.
+        let mut pq = PersistentQueue::open(config).expect("reopen");
+        let replayed = pq.dequeue(100).expect("dequeue after restart");
+        assert_eq!(
+            replayed.len(),
+            10,
+            "all 10 popped-but-unacked events must replay (at-least-once)"
+        );
+        for (i, entry) in replayed.iter().enumerate() {
+            assert!(
+                entry.contains(&format!("event {i}")),
+                "replayed event {i} mismatch: {entry}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pq_partial_ack_replays_only_unacked_tail_after_restart() {
+        // A consumer that acked the first 6 of 10 delivered events: on restart
+        // only the 4 un-acked tail entries replay (at-least-once with no
+        // unnecessary duplication of the acked prefix).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_string_lossy().to_string();
+        let config = PqConfig {
+            path: path.clone(),
+            checkpoint_interval: 1,
+            ..Default::default()
+        };
+
+        {
+            let mut pq = PersistentQueue::open(config.clone()).expect("open");
+            for i in 0..10 {
+                pq.enqueue(&format!(r#"{{"msg":"event {i}"}}"#))
+                    .expect("enqueue");
+            }
+            let _ = pq.dequeue_with_seq(10).expect("dequeue all");
+            // Acknowledge only the first 6 (seqs 0..5 delivered; 6 is the next
+            // exclusive high-water mark). The remaining 4 are still in flight.
+            pq.ack(6).expect("ack first 6");
+            pq.close().expect("close");
+        }
+
+        let mut pq = PersistentQueue::open(config).expect("reopen");
+        let replayed = pq.dequeue(100).expect("dequeue after restart");
+        assert_eq!(
+            replayed.len(),
+            4,
+            "only the 4 un-acked tail events should replay"
+        );
+        assert!(replayed[0].contains("event 6"), "tail starts at event 6");
+        assert!(replayed[3].contains("event 9"), "tail ends at event 9");
+    }
+
+    #[test]
+    fn test_pq_ack_is_monotonic_and_ignores_stale_acks() {
+        // An out-of-order / stale ack must never rewind the durable cursor and
+        // re-expose already-acked entries.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_string_lossy().to_string();
+        let config = PqConfig {
+            path: path.clone(),
+            checkpoint_interval: 1,
+            ..Default::default()
+        };
+        let mut pq = PersistentQueue::open(config.clone()).expect("open");
+        for i in 0..10 {
+            pq.enqueue(&format!(r#"{{"msg":"event {i}"}}"#))
+                .expect("enqueue");
+        }
+        let _ = pq.dequeue(10).expect("dequeue all");
+        pq.ack(8).expect("ack 8");
+        // A stale/duplicate lower ack must be a no-op (no rewind).
+        pq.ack(3).expect("stale ack");
+        pq.close().expect("close");
+
+        let mut pq = PersistentQueue::open(config).expect("reopen");
+        let replayed = pq.dequeue(100).expect("dequeue after restart");
+        assert_eq!(
+            replayed.len(),
+            2,
+            "ack must be monotonic: only seqs 8,9 remain despite the stale ack(3)"
+        );
+        assert!(replayed[0].contains("event 8"));
+        assert!(replayed[1].contains("event 9"));
+    }
+
+    #[test]
+    fn test_pq_pop_with_seq_returns_contiguous_sequences() {
+        // `pop_with_seq` must hand back the durable queue sequence so the caller
+        // can acknowledge it; sequences are contiguous from 0 in FIFO order.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_string_lossy().to_string();
+        let mut pq = PersistentQueue::new(path, 1_073_741_824).expect("new");
+        for i in 0..5 {
+            pq.push(&Event::new(format!("e{i}"))).expect("push");
+        }
+        for expected_seq in 0..5 {
+            let (seq, ev) = pq.pop_with_seq().expect("pop").expect("event");
+            assert_eq!(seq, expected_seq, "sequence must be contiguous and in order");
+            assert_eq!(ev.message(), Some(format!("e{expected_seq}").as_str()));
+        }
+        assert!(pq.pop_with_seq().expect("pop").is_none(), "drained");
     }
 }

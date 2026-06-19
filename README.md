@@ -411,16 +411,26 @@ Data sources → FerroStash → FerroSearch → Applications
 - **Enterprise features absent.** No centralized/Kibana management, no
   X-Pack security, no keystore. A persistent queue and DLQ exist in the
   core crate but are not a full Logstash-parity feature set.
-- **Persistent queue is a durable buffer, not at-least-once delivery.**
-  `queue.type: persisted` checkpoints the read position when an event is
-  *dequeued for processing*, not after the output acknowledges it. So the
-  PQ guarantees durability for events that are **queued but not yet read**
-  across a restart, but an event that has been read and then fails at the
-  output is **not** replayed from the PQ on restart. For delivery
-  durability through output failures, enable the **dead-letter queue**
-  (failed events are written to the DLQ and can be replayed via the
-  `dead_letter_queue` input). Full at-least-once PQ semantics
-  (checkpoint-after-output-ack) is a roadmap item, not yet implemented.
+- **Persistent queue provides at-least-once delivery (duplicates possible,
+  not exactly-once).** `queue.type: persisted` advances its durable cursor
+  only *after* the output acknowledges delivery (or the event is
+  intentionally dropped by a filter, or captured by the DLQ) — not when the
+  event is dequeued for processing. An event that has been read but not yet
+  delivered when the process crashes or restarts is **replayed** from the
+  PQ. The cost of at-least-once is **duplicates**: an event delivered in the
+  short window after delivery but before its acknowledgement is
+  checkpointed will be re-delivered on the next start, so make outputs
+  idempotent (e.g. document IDs) where exactly-once matters — exactly-once
+  is **not** provided. A persistently failing output with no DLQ backs the
+  queue up (the durable buffer) rather than dropping; enable the
+  **dead-letter queue** to instead capture output-failure events for replay
+  via the `dead_letter_queue` input. The duplicate/replay window is bounded
+  by the output flush interval (`pipeline.batch.delay`). Because entries are
+  now retained until *delivered* (not just until read), size
+  `queue.max_bytes` for the in-flight/undelivered window: if the queue
+  reaches `max_bytes` while delivery lags, new events fall back to the
+  non-durable in-memory path (a best-effort handoff, not replayable), so a
+  too-small cap under sustained output lag re-opens a durability gap.
 - **Single developer; no production deployments.** Bus factor 1; no
   operational history. Performance numbers come from one benchmark
   environment.

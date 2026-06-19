@@ -51,6 +51,21 @@ is cut. Pre-1.0 releases may introduce breaking changes between minor tags.
 
 ### Changed
 
+- **Persistent queue is now at-least-once, not just a durable buffer.**
+  `queue.type: persisted` previously checkpointed the read cursor when an
+  event was *dequeued for processing*, so an event read but not yet
+  delivered was lost on a crash. The queue now splits the in-memory pop
+  cursor (`read_seq`) from a durable acknowledgement cursor (`ack_seq`)
+  that advances **only after the output delivers** the event (or it is
+  dropped by a filter / captured by the DLQ). Events popped but not
+  delivered before a crash **replay** on restart. The engine tracks
+  per-entry fan-out (clone/split/drop) so a queue entry is acknowledged
+  only once all of its derived events are terminal. Trade-off: at-least-once
+  implies **duplicates** are possible on replay (make outputs idempotent
+  for exactly-once needs); a persistently failing output with no DLQ backs
+  the queue up rather than dropping. See [`README.md`](README.md) "Honest
+  limitations". New API: `PersistentQueue::pop_with_seq` / `dequeue_with_seq`
+  and `SharedPersistentQueue::{pop_with_seq, ack}`.
 - **New build requirement: `cmake`.** The kafka plugins pull `rdkafka`,
   which builds a vendored `librdkafka` via CMake, so `cmake` is now
   required at build time (in addition to the existing clang/gcc for the
