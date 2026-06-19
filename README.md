@@ -9,7 +9,8 @@ configuration language (`pipeline.conf`) natively so existing pipelines
 can run without a JVM. The Ruby filter is supported through an embedded
 [Artichoke](https://www.artichokeruby.org/) (mruby-based) Ruby
 interpreter, and an alternative native scripting filter (Painless-style,
-Cranelift-JIT-backed) is provided for high-throughput custom logic.
+parsed once and executed natively — no JVM) is provided for high-throughput
+custom logic.
 
 ## Status
 
@@ -44,6 +45,55 @@ caveats before deploying any connector.
 The memory/startup/binary-size figures above are measured on a single
 benchmark host; treat all comparative throughput numbers as evidence
 from one environment, not a universal guarantee.
+
+## Performance
+
+Measured on a single dedicated host (AWS `c7i.2xlarge`, 8 vCPU, x86-64) against
+**Logstash 9.4.2** — identical pipeline and byte-identical input on both
+engines, output to `null` (so the sink is never the bottleneck), 8 workers,
+throughput startup-subtracted and reported as the mean of 3 runs. Reproduce with
+[`bench/`](bench/) (`./bench/run_bench.sh`). These are **one-environment
+numbers, not a universal guarantee.**
+
+### Throughput and memory (native filters, 5M events)
+
+| Filter | Logstash 9.4.2 | FerroStash | Throughput | Logstash RSS | FerroStash RSS | Memory |
+|--------|---------------:|-----------:|:----------:|-------------:|---------------:|:------:|
+| grok          | 193k ev/s | 332k ev/s | **1.7×** | 1,113 MB | 98 MB  | **11× less** |
+| dissect       | 193k      | 318k      | **1.6×** | 1,098 MB | 106 MB | 10× less |
+| json          | 174k      | 255k      | **1.5×** | 1,100 MB | 133 MB | 8× less  |
+| kv            | 171k      | 258k      | **1.5×** | 1,170 MB | 126 MB | 9× less  |
+| csv           | 25k       | 79k       | **3.2×** | 1,471 MB | 117 MB | 13× less |
+| grok + mutate | 186k      | 251k      | **1.35×**| 1,099 MB | 120 MB | 9× less  |
+
+Cold start is **~0.01 s for FerroStash vs ~7 s** (JVM warm-up) for Logstash on
+every workload. The throughput edge is modest-but-consistent; the decisive wins
+are **~8–13× lower memory** and near-instant startup.
+
+### Custom logic: Painless vs Ruby
+
+Logstash's only in-pipeline custom-logic path is `ruby { }`. FerroStash runs that
+same Ruby (Artichoke/mruby, for drop-in migration) **and** offers a native
+`script { }` filter (a Painless subset) for the hot path. Same transformation,
+same input:
+
+| Engine | Throughput |
+|--------|-----------:|
+| FerroStash `script` (native Painless) | **525k ev/s** |
+| Logstash `ruby` (JRuby)               | ~145k ev/s |
+| FerroStash `ruby` (mruby)             | 11k ev/s |
+
+- **`script` is ~3.6× faster than Logstash's `ruby`/JRuby** (and ~48× faster
+  than FerroStash's own mruby filter) — native execution, no JVM, the script is
+  parsed once and the cached AST is reused per event.
+- **`ruby` (mruby) is ~13× slower than JRuby.** It exists for *migration
+  compatibility* — your existing `ruby { }` configs run unchanged — **not** for
+  speed. Move hot-path logic to `script { }` to get native, JRuby-beating
+  throughput. The mruby gap is inherent (no JIT + per-event marshalling);
+  parallelizing it across workers narrows but does not close it.
+
+The JRuby custom-logic figure is corroborated across runs (~143–147k); see
+[`bench/`](bench/) for the full methodology and configs.
 
 ## Logstash compatibility scope
 
@@ -126,7 +176,7 @@ test exercises and the per-plugin feature residuals.
 | `drop` | functional | drop events |
 | `clone` | functional | duplicate events |
 | `ruby` | functional | full Ruby via embedded Artichoke interpreter |
-| `script` / `painless` | functional | native Painless-style DSL, Cranelift JIT (`ferro-script`) |
+| `script` / `painless` | functional | native Painless-style DSL (`ferro-script`), parsed once + interpreted natively (a Cranelift JIT path exists for numeric scoring) |
 | `sleep` | functional | rate limiting / delay |
 | `aggregate` | functional | stateful cross-event aggregation |
 | `throttle` | functional | rate-based throttling |
@@ -253,10 +303,12 @@ afterwards, so Ruby code cannot corrupt Rust memory.
 **Performance trade-off (honest):** the Artichoke (mruby) interpreter has
 no JIT and pays a per-event Rust↔Ruby serialization cost, so the Ruby
 filter is measurably *slower* than Logstash's JRuby on the same code
-(roughly 3–7× slower in our benchmarks). The Ruby filter exists for
-**migration compatibility**, not throughput. For custom logic that needs
-to be fast, prefer the native `script` (Painless-style) filter, which is
-JIT-compiled and considerably faster than either Ruby engine.
+(~13× slower against Logstash 9.4.2 in our benchmark — see
+[Performance](#performance)). The Ruby filter exists for **migration
+compatibility**, not throughput. For custom logic that needs to be fast,
+prefer the native `script` (Painless-style) filter: it is executed natively
+(parsed once, no JVM) and in our benchmark ran ~3.6× faster than Logstash's
+JRuby and ~48× faster than the mruby filter.
 
 **Optional, off by default.** The Ruby filter lives behind the `ruby` cargo
 feature and is **not** built by default, so the common build is light and
@@ -313,7 +365,7 @@ Ruby-filter compatibility. Notes:
 | `ferro-stash-filter` | Filter plugins |
 | `ferro-stash-output` | Output plugins |
 | `ferro-stash-ruby` | Artichoke (mruby) Ruby interpreter bridge for the `ruby` filter |
-| `ferro-script` | Native Painless-style scripting engine with a Cranelift JIT backend (powers the `script` filter/codec) |
+| `ferro-script` | Native Painless-style scripting engine — tree-walking interpreter (parsed once, reused per event); a Cranelift JIT path exists for numeric scoring. Powers the `script` filter/codec |
 | `ferro-stash-cli` | `ferro-stash` binary: CLI, signal handling, metrics API |
 | `ferro-stash-e2e` | Integration / Logstash-parity test harness (no library code) |
 
