@@ -116,10 +116,14 @@ is cut. Pre-1.0 releases may introduce breaking changes between minor tags.
   SQS-notification mode; `delete_after_read` deletes immediately after
   emit.
 - **s3 output**: single `PutObject` (no multipart upload) in v1.
-- **kafka & redis** produce/consume round-trips are not live-validated
-  (compile + `#[ignore]` smoke tests only).
-- **elasticsearch filter** is not validated against a real ES cluster
-  (mock only).
+- **All connectors are now live-validated against real services** (real
+  Apache Kafka 3.9.1 + redpanda, Redis, AWS S3 + MinIO, Elasticsearch
+  8.15.3 for the filter and output, and the real DataDog intake on AP1),
+  via `#[ignore]`, env-gated smoke tests. These are run **manually** with
+  the service available — they are not part of CI (which has no brokers or
+  credentials) and verify reachability + a round-trip, not exhaustive
+  conformance. The feature residuals above (SASL, ACL/TLS, sincedb,
+  multipart, …) remain regardless of validation.
 
 ### Documentation
 
