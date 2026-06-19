@@ -1,24 +1,41 @@
 # FerroStash
 
-**A Logstash-compatible data pipeline written in Rust.**
+[![CI](https://github.com/abyo-software/ferro-stash/actions/workflows/ci.yml/badge.svg)](https://github.com/abyo-software/ferro-stash/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
 
-FerroStash ingests, transforms, and routes events through the same
-three-stage `input → filter → output` model as
-[Logstash](https://www.elastic.co/logstash), parsing the Logstash
-configuration language (`pipeline.conf`) natively so existing pipelines
-can run without a JVM. The Ruby filter is supported through an embedded
-[Artichoke](https://www.artichokeruby.org/) (mruby-based) Ruby
-interpreter, and an alternative native scripting filter (Painless-style,
-parsed once and executed natively — no JVM) is provided for high-throughput
-custom logic.
+## Drop the JVM: a Logstash-compatible data pipeline in Rust — ~10× less memory, instant start
+
+**FerroStash** ingests, transforms, and routes events through the same
+`input → filter → output` model as [Logstash](https://www.elastic.co/logstash),
+parsing the Logstash `pipeline.conf` DSL natively so your existing pipelines run
+**without a JVM**. Same config language, same event model (`@timestamp`, tags,
+`[a][b]` field references, `%{field}` interpolation) — but a single ~14 MB static
+binary that starts in milliseconds and holds tens of MB of RAM instead of ~1 GB.
+
+```
+  inputs  ──▶   filters   ──▶   outputs
+  stdin, file,      grok, mutate, json,     elasticsearch, kafka,
+  tcp, http,        kv, dissect, date,      s3, http, file, datadog,
+  syslog, kafka,    ruby (mruby) +          tcp, stdout, …
+  beats, redis, …   native `script`, …
+```
+
+- **Drop-in config** — runs your `pipeline.conf` unchanged; output verified
+  byte-for-byte against Logstash 9.4.2 across 24 parity fixtures.
+- **A fraction of the footprint** — ~8–13× lower RSS and ~700× faster cold start
+  than Logstash in our benchmark (see [Performance](#performance)).
+- **Keep your Ruby, or go fast** — an embedded [Artichoke](https://www.artichokeruby.org/)
+  (mruby) interpreter runs your `ruby { }` unchanged for migration; the native
+  `script { }` filter (Painless subset) runs custom logic ~3.6× faster than JRuby.
+- **No JVM, no GC pauses** — one static binary, deterministic latency.
 
 ## Status
 
-**v0.1.0 — first stable tag (`v0.1.0`, 2026-05-05; latest commit
-2026-05-24).** Single-developer project; not yet deployed in production.
-The current `cargo test --workspace` run measures **1,165 tests passing /
-16 ignored / 0 failing** across 15 binary test targets, with `cargo
-clippy -D warnings`, `cargo fmt --check`, and `cargo deny check` clean.
+**v0.1.0 — first stable tag.** Single-developer project; not yet deployed in
+production. `cargo test --workspace` runs **1,400+ tests, 0 failing**, with
+`cargo clippy -D warnings`, `cargo fmt --check`, and `cargo deny check` clean,
+and parity verified byte-for-byte against Logstash 9.4.2 (24/24 fixtures).
 
 The ten previously-stubbed connector plugins (input/output `kafka`,
 `redis`, `s3`; output `datadog`; filters `geoip`, `dns`,
@@ -32,19 +49,29 @@ conformance. See [Honest limitations](#honest-limitations) for exactly
 what was validated and the feature residuals per plugin; read those
 caveats before deploying any connector.
 
-## Why FerroStash
+## Why teams use FerroStash
+
+| Need | What FerroStash gives you |
+|---|---|
+| Logstash's JVM holds ~1 GB RAM per pipeline | A native binary that holds tens of MB — pack far more shippers per host |
+| ~8–30 s JVM cold start hurts sidecars, autoscaling, short-lived jobs | Sub-second start (~10 ms in practice) |
+| ~350 MB install + a JDK to ship everywhere | One ~14 MB static binary, no runtime to install |
+| You can't rewrite hundreds of existing `pipeline.conf` files | They run unchanged — same DSL and event model, byte-eq verified against Logstash 9.4.2 |
+| Custom `ruby { }` logic is your escape hatch | mruby runs it as-is for migration; rewrite the hot path in native `script { }` for ~3.6× JRuby |
+| GC pauses jitter your tail latency | No GC — deterministic latency |
+
+**At a glance** (vs Logstash on the JVM):
 
 | Property | Logstash (JVM) | FerroStash (native) |
 |----------|----------------|---------------------|
 | Runtime | JVM (Java) + JRuby | Native Rust binary |
 | Idle memory (RSS) | ~0.5–1 GB+ | ~10–50 MB |
-| Cold start | ~8–30 s (JVM warm-up) | < 1 s |
+| Cold start | ~8–30 s (JVM warm-up) | < 1 s (~10 ms) |
 | Install / binary size | ~300–400 MB (+JVM) | ~12–15 MB stripped |
 | GC pauses | Yes (G1GC) | None (deterministic) |
 
-The memory/startup/binary-size figures above are measured on a single
-benchmark host; treat all comparative throughput numbers as evidence
-from one environment, not a universal guarantee.
+Figures are measured on a single host; treat all comparative numbers as evidence
+from one environment (see [Performance](#performance)), not a universal guarantee.
 
 ## Performance
 
@@ -133,6 +160,29 @@ cargo test -p ferro-stash-e2e --test logstash_docker_compat_test \
 The docker-driven regression harness under
 [`tests/logstash-compat/`](tests/logstash-compat/) is the authoritative,
 runnable record of what this evidence does and does not substantiate.
+
+## When NOT to use FerroStash
+
+Honest list of cases where FerroStash isn't the right call — better to know now:
+
+- **You need the full Logstash plugin catalogue.** FerroStash implements the
+  production-common subset (see [Plugins](#plugins)); the 200+ community plugins
+  are out of scope. If your pipeline leans on a niche plugin, check the list first.
+- **You need a battle-tested tool with a production track record today.** This is
+  a single-developer project with **no public production deployments yet**. For
+  irreplaceable data, run it alongside your existing pipeline first.
+- **Your hot path is heavy custom Ruby.** The `ruby { }` filter (mruby) is for
+  *migration* and is ~13× slower than Logstash's JRuby — port hot logic to the
+  native `script { }` filter, or stay on Logstash if you can't.
+- **You're already throughput-saturated and memory isn't a concern.** The native
+  throughput edge is modest (~1.4–1.7×); FerroStash's decisive wins are memory
+  (~8–13× less) and cold start (~700×). If neither helps you, the upside is small.
+- **You need SOC2 / ISO 27001 / FedRAMP evidence.** Those reports don't exist
+  yet.
+
+> If you run Logstash on the JVM, want your existing `.conf` to keep working, and
+> care about memory or startup time, FerroStash is built for you — point one
+> pipeline at it next to your current one and compare.
 
 ## Plugins
 
@@ -540,8 +590,55 @@ Data sources → FerroStash → FerroSearch → Applications
   genuinely flat dotted field names. Aligning the `json` filter's
   dotted-key handling with Logstash is tracked as future work.
 
+## Documentation
+
+| Area | Docs |
+|---|---|
+| Get started | [Quick start](#quick-start) · [onboarding / build](docs/onboarding.md) · [configuration](#configuration) |
+| Reference | [architecture](docs/ARCHITECTURE.md) · [plugins](#plugins) · [Logstash compatibility](#logstash-compatibility-scope) |
+| Proof & trust | [Performance](#performance) · [parity harness](tests/logstash-compat/) · [benchmarks](bench/) · [honest limitations](#honest-limitations) |
+| Project | [CHANGELOG](CHANGELOG.md) · [release notes](RELEASE_NOTES_0.1.0.md) · [security](docs/SECURITY.md) · [contributing](docs/CONTRIBUTING.md) |
+
+## More from abyo software
+
+FerroStash is part of a family of Rust infrastructure tools from **abyo
+software**; several ship on AWS Marketplace under one seller account — browse the
+catalog at **[abyo software on AWS Marketplace](https://aws.amazon.com/marketplace/seller-profile?id=seller-65lhisp4ppavm)**.
+
+| Product | What it does |
+|---|---|
+| **FerroStash** | This project: a Logstash-compatible data pipeline in Rust. |
+| **S4 — Squished S3** | Transparent GPU/CPU compression gateway in front of S3 — cut storage 50–80%. |
+| **S4 Logs** | CloudWatch Logs → S3 archiver that cuts log-storage cost. |
+| **S4 Scan** | Amazon Athena scan-cost reducer. |
+| **S4 NAT** | Cost-optimized NAT for Amazon VPC. |
+| **S4 MockAPI** | Security API simulator for testing and demos. |
+
+## Contributing
+
+Pull requests welcome — see [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md) for
+setup, conventions, and the test/fuzz protocol. Contributions are licensed under
+Apache-2.0 (no separate CLA).
+
+## Security
+
+Found a vulnerability? Please **do not open a public issue** — follow
+[docs/SECURITY.md](docs/SECURITY.md) for coordinated disclosure.
+
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE). Third-party license summary:
-[LICENSES.md](LICENSES.md). Changelog: [CHANGELOG.md](CHANGELOG.md);
-GA release notes: [RELEASE_NOTES_0.1.0.md](RELEASE_NOTES_0.1.0.md).
+Apache-2.0 — see [LICENSE](LICENSE). Third-party license summary:
+[LICENSES.md](LICENSES.md). The optional `ruby` feature pulls a fork of the
+Artichoke (mruby) interpreter at build time (Apache-2.0/MIT; see its repo).
+Changelog: [CHANGELOG.md](CHANGELOG.md); GA release notes:
+[RELEASE_NOTES_0.1.0.md](RELEASE_NOTES_0.1.0.md).
+
+`"FerroStash"` is an unregistered trademark of abyo software 合同会社.
+`"Logstash"`, `"Elasticsearch"`, and `"Elastic"` are trademarks of Elasticsearch
+B.V.; FerroStash is an independent reimplementation and is not affiliated with,
+endorsed by, or sponsored by Elastic.
+
+## Authors
+
+- abyo software 合同会社 — sponsoring organization, commercial distribution
+- masumi-ryugo — original author / maintainer
