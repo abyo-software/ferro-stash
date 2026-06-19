@@ -105,14 +105,20 @@ impl Default for PqConfig {
 
 /// `fsync` a directory so a newly-created or renamed entry within it is durably
 /// linked (POSIX: the file's data being fsync'd does not guarantee its directory
-/// entry survives a power loss until the directory itself is fsync'd). Best
-/// effort — a platform that cannot open a directory as a file simply skips it.
+/// entry survives a power loss until the directory itself is fsync'd).
+///
+/// **Fails closed.** This is only called on the `fsync`-mode durability paths, so
+/// if the directory cannot be opened/synced we propagate the error rather than
+/// silently skipping it: returning `Ok` on a failed open would let an append be
+/// accepted as "power-loss durable" while the directory entry is not, breaking
+/// the very claim `fsync: true` makes. (On the supported platforms — Linux and
+/// macOS — opening a directory read-only and `fsync`-ing it is the standard idiom
+/// and succeeds; a platform that cannot do so should fail loudly, not pretend.)
 pub(crate) fn sync_dir(dir: &str) -> Result<()> {
-    if let Ok(handle) = File::open(dir) {
-        handle
-            .sync_all()
-            .map_err(|e| FerroStashError::Pipeline(format!("PQ dir fsync error: {e}")))?;
-    }
+    File::open(dir)
+        .map_err(|e| FerroStashError::Pipeline(format!("PQ dir open for fsync error: {e}")))?
+        .sync_all()
+        .map_err(|e| FerroStashError::Pipeline(format!("PQ dir fsync error: {e}")))?;
     Ok(())
 }
 
