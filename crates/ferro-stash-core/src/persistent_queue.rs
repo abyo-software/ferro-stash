@@ -2461,7 +2461,7 @@ mod tests {
 
         // Reopen + dequeue: must read the intact `.seg` (3 entries), ignoring the
         // corrupt duplicate `.zst` — no error, no wedge.
-        let mut pq = PersistentQueue::open(config).expect("reopen");
+        let mut pq = PersistentQueue::open(config.clone()).expect("reopen");
         let batch = pq.dequeue(100).expect("dequeue must not error on corrupt duplicate");
         assert_eq!(
             batch.len(),
