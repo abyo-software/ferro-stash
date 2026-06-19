@@ -182,7 +182,8 @@ impl PersistentQueue {
 
         // Calculate total size
         let total_bytes = Self::calculate_total_size(&config.path);
-        let (segment_write_seq, last_segment_index) = Self::recover_segment_state(&config.path);
+        let (segment_write_seq, last_segment_index) =
+            Self::recover_segment_state(&config.path, config.segment_size);
         let write_seq = checkpoint_write_seq.max(segment_write_seq);
         let segment_index = checkpoint_segment_index.max(last_segment_index);
 
@@ -257,9 +258,10 @@ impl PersistentQueue {
         Ok(())
     }
 
-    fn recover_segment_state(path: &str) -> (u64, u64) {
+    fn recover_segment_state(path: &str, segment_size: usize) -> (u64, u64) {
         let mut next_write_seq = 0_u64;
         let mut last_segment_index = 0_u64;
+        let mut unreadable = 0_u64;
 
         let Ok(entries) = fs::read_dir(path) else {
             return (next_write_seq, last_segment_index);
@@ -280,14 +282,28 @@ impl PersistentQueue {
                 last_segment_index = last_segment_index.max(index);
             }
 
-            let content = Self::read_segment_to_string(&path);
-            for line in content.lines() {
-                if let Ok(entry) = serde_json::from_str::<QueueEntry>(line) {
-                    next_write_seq = next_write_seq.max(entry.seq.saturating_add(1));
+            match Self::try_read_segment_to_string(&path) {
+                Some(content) => {
+                    for line in content.lines() {
+                        if let Ok(entry) = serde_json::from_str::<QueueEntry>(line) {
+                            next_write_seq = next_write_seq.max(entry.seq.saturating_add(1));
+                        }
+                    }
                 }
+                // An unreadable segment hides the seqs it assigned. If we recovered
+                // `write_seq` only from the readable segments (and the checkpoint
+                // lags), a new enqueue could REUSE a seq the corrupt segment already
+                // holds; a later dequeue would then skip the duplicate-new record
+                // and gc could delete it — data loss. Reserve a conservative gap of
+                // one full segment's worth of seqs per unreadable segment so
+                // `write_seq` always clears anything they could contain. Over-
+                // reserving just skips seq numbers (harmless, u64); reuse is loss.
+                None => unreadable = unreadable.saturating_add(1),
             }
         }
 
+        let next_write_seq =
+            next_write_seq.saturating_add(unreadable.saturating_mul(segment_size.max(1) as u64));
         (next_write_seq, last_segment_index)
     }
 
@@ -300,15 +316,11 @@ impl PersistentQueue {
             .ok()
     }
 
-    fn read_segment_to_string(path: &Path) -> String {
-        Self::try_read_segment_to_string(path).unwrap_or_default()
-    }
-
     /// Read a segment's text, distinguishing a read/decode **failure** (`None`)
-    /// from a legitimately **empty** file (`Some("")`). `read_segment_to_string`
-    /// is the infallible wrapper (`unwrap_or_default`); gc needs this distinction
-    /// so it never mistakes an *unreadable* segment for an empty-and-reclaimable
-    /// one (which would silently delete unacked data).
+    /// from a legitimately **empty** file (`Some("")`). gc and recovery need this
+    /// distinction so they never mistake an *unreadable* segment for an
+    /// empty-and-reclaimable one (which would silently delete unacked data or
+    /// rewind the write cursor into reused sequence numbers).
     fn try_read_segment_to_string(path: &Path) -> Option<String> {
         if path.extension().is_some_and(|e| e == "zst") {
             let file = File::open(path).ok()?;
@@ -400,6 +412,14 @@ impl PersistentQueue {
     /// restart — the at-least-once guarantee.
     pub fn dequeue_with_seq(&mut self, batch_size: usize) -> Result<Vec<(u64, String)>> {
         let mut results = Vec::with_capacity(batch_size);
+        // Advance a LOCAL cursor and commit it to `self.read_seq` only once the
+        // whole batch is assembled without error. If a later segment errors
+        // mid-batch (the `?` below), `self.read_seq` is left untouched so the
+        // retry re-reads the earlier segments' entries — otherwise the entries
+        // already pushed would have advanced `read_seq`, be dropped with the
+        // errored batch, and then be skipped (and gc-deleted) on the next call
+        // (silent loss for a multi-segment `batch_size >= 2` read).
+        let mut next_read_seq = self.read_seq;
 
         // Flush current writer before reading
         if let Some(ref mut writer) = self.current_segment {
@@ -451,14 +471,16 @@ impl PersistentQueue {
                     break;
                 }
                 if let Ok(entry) = serde_json::from_str::<QueueEntry>(line) {
-                    if entry.seq >= self.read_seq {
-                        self.read_seq = entry.seq + 1;
+                    if entry.seq >= next_read_seq {
+                        next_read_seq = entry.seq + 1;
                         results.push((entry.seq, entry.data));
                     }
                 }
             }
         }
 
+        // Commit the cursor only after the whole batch read without error.
+        self.read_seq = next_read_seq;
         Ok(results)
     }
 
