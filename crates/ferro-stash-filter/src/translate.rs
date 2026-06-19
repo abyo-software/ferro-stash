@@ -237,7 +237,10 @@ mod tests {
         let mut miss = Event::new("test");
         miss.set("code", EventValue::String("418".into()));
         let r = filter.filter(miss).await.expect("filter");
-        assert_eq!(r[0].get("status"), Some(&EventValue::String("Unknown".into())));
+        assert_eq!(
+            r[0].get("status"),
+            Some(&EventValue::String("Unknown".into()))
+        );
     }
 
     #[test]

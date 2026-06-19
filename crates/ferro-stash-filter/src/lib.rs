@@ -181,7 +181,10 @@ mod tests {
     fn test_ruby_filter_errors_without_feature() {
         let settings = serde_json::json!({ "code": "" });
         let err = create_filter("ruby", &settings, None);
-        assert!(err.is_err(), "ruby must error when built without the feature");
+        assert!(
+            err.is_err(),
+            "ruby must error when built without the feature"
+        );
     }
 
     #[test]

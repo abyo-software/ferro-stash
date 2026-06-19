@@ -1877,7 +1877,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let pq_path = dir.path().to_string_lossy().to_string();
         const N: i64 = 2000;
-        let delivered = Arc::new(std::sync::Mutex::new(std::collections::HashSet::<i64>::new()));
+        let delivered = Arc::new(std::sync::Mutex::new(
+            std::collections::HashSet::<i64>::new(),
+        ));
         let attempts = Arc::new(AtomicUsize::new(0));
 
         // Seed N unique events into the PQ.

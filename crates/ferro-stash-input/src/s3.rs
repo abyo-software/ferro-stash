@@ -169,14 +169,11 @@ impl S3Input {
     /// back to the default AWS credential provider chain (env / profile / IMDS).
     async fn build_client(&self) -> Client {
         let region = Region::new(self.config.region.clone());
-        let mut loader =
-            aws_config::defaults(aws_config::BehaviorVersion::latest()).region(region);
+        let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest()).region(region);
 
         // Static credentials when both are configured; otherwise the default AWS
         // credential provider chain (env / profile / IMDS).
-        if let (Some(ak), Some(sk)) =
-            (&self.config.access_key_id, &self.config.secret_access_key)
-        {
+        if let (Some(ak), Some(sk)) = (&self.config.access_key_id, &self.config.secret_access_key) {
             let creds =
                 Credentials::new(ak.clone(), sk.clone(), None, None, "ferro-stash-s3-input");
             loader = loader.credentials_provider(creds);

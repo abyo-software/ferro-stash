@@ -782,10 +782,12 @@ impl PersistentQueue {
                     .map_err(|e| {
                         FerroStashError::Pipeline(format!("checkpoint tmp open error: {e}"))
                     })?;
-                f.write_all(body.as_bytes())
-                    .map_err(|e| FerroStashError::Pipeline(format!("checkpoint write error: {e}")))?;
-                f.sync_all()
-                    .map_err(|e| FerroStashError::Pipeline(format!("checkpoint fsync error: {e}")))?;
+                f.write_all(body.as_bytes()).map_err(|e| {
+                    FerroStashError::Pipeline(format!("checkpoint write error: {e}"))
+                })?;
+                f.sync_all().map_err(|e| {
+                    FerroStashError::Pipeline(format!("checkpoint fsync error: {e}"))
+                })?;
             }
             fs::rename(&tmp, &path)
                 .map_err(|e| FerroStashError::Pipeline(format!("checkpoint rename error: {e}")))?;
@@ -2475,7 +2477,8 @@ mod tests {
         {
             let mut pq = PersistentQueue::open(config.clone()).expect("open");
             for i in 0..3 {
-                pq.enqueue(&format!(r#"{{"msg":"e{i}"}}"#)).expect("enqueue");
+                pq.enqueue(&format!(r#"{{"msg":"e{i}"}}"#))
+                    .expect("enqueue");
             }
             pq.close().expect("close"); // flushes segment_00000001.seg
         }
@@ -2490,7 +2493,9 @@ mod tests {
         // Reopen + dequeue: must read the intact `.seg` (3 entries), ignoring the
         // corrupt duplicate `.zst` — no error, no wedge.
         let mut pq = PersistentQueue::open(config.clone()).expect("reopen");
-        let batch = pq.dequeue(100).expect("dequeue must not error on corrupt duplicate");
+        let batch = pq
+            .dequeue(100)
+            .expect("dequeue must not error on corrupt duplicate");
         assert_eq!(
             batch.len(),
             3,
