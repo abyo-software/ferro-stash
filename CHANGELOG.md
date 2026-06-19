@@ -5,7 +5,13 @@ All notable changes to `ferro-stash` are documented here. The format follows
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once `v1.0.0`
 is cut. Pre-1.0 releases may introduce breaking changes between minor tags.
 
-## [Unreleased]
+## [1.0.0] — 2026-06-20
+
+First stable release: SemVer-stable surface (config DSL, event model, CLI
+flags, plugin set frozen for 1.x). Output verified byte-for-byte against
+Logstash 9.4.2 across 24 parity fixtures. See [README "Performance"](README.md#performance)
+for the benchmark and [README "Status"](README.md#status) for the honest
+production caveat (no public production deployments yet).
 
 ### Added
 
@@ -287,5 +293,5 @@ is promoted to GA.
   Upstream Artichoke parity is tracked separately and is not the
   load-bearing contract for this release.
 
-[Unreleased]: https://github.com/abyo-software/ferro-stash/compare/v0.1.0...HEAD
+[1.0.0]: https://github.com/abyo-software/ferro-stash/compare/v0.1.0...v1.0.0
 [0.1.0]: https://github.com/abyo-software/ferro-stash/releases/tag/v0.1.0

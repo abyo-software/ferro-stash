@@ -32,10 +32,14 @@ binary that starts in milliseconds and holds tens of MB of RAM instead of ~1 GB.
 
 ## Status
 
-**v0.1.0 — first stable tag.** Single-developer project; not yet deployed in
-production. `cargo test --workspace` runs **1,400+ tests, 0 failing**, with
-`cargo clippy -D warnings`, `cargo fmt --check`, and `cargo deny check` clean,
-and parity verified byte-for-byte against Logstash 9.4.2 (24/24 fixtures).
+**v1.0.0 — first stable release**, with a SemVer-stable surface (config DSL,
+event model, CLI flags, and plugin set are frozen for the 1.x line). This is a
+contract on API/behaviour stability, **not** a production track record:
+single-developer project, **no public production deployments yet** — run it
+beside your existing pipeline before trusting it with irreplaceable data.
+`cargo test --workspace` runs **1,400+ tests, 0 failing**, with `cargo clippy
+-D warnings`, `cargo fmt --check`, and `cargo deny check` clean, and output
+verified byte-for-byte against Logstash 9.4.2 (24/24 parity fixtures).
 
 The ten previously-stubbed connector plugins (input/output `kafka`,
 `redis`, `s3`; output `datadog`; filters `geoip`, `dns`,
@@ -597,7 +601,7 @@ Data sources → FerroStash → FerroSearch → Applications
 | Get started | [Quick start](#quick-start) · [onboarding / build](docs/onboarding.md) · [configuration](#configuration) |
 | Reference | [architecture](docs/ARCHITECTURE.md) · [plugins](#plugins) · [Logstash compatibility](#logstash-compatibility-scope) |
 | Proof & trust | [Performance](#performance) · [parity harness](tests/logstash-compat/) · [benchmarks](bench/) · [honest limitations](#honest-limitations) |
-| Project | [CHANGELOG](CHANGELOG.md) · [release notes](RELEASE_NOTES_0.1.0.md) · [security](docs/SECURITY.md) · [contributing](docs/CONTRIBUTING.md) |
+| Project | [CHANGELOG](CHANGELOG.md) · [release notes](RELEASE_NOTES_1.0.0.md) · [security](docs/SECURITY.md) · [contributing](docs/CONTRIBUTING.md) |
 
 ## More from abyo software
 
@@ -631,7 +635,7 @@ Apache-2.0 — see [LICENSE](LICENSE). Third-party license summary:
 [LICENSES.md](LICENSES.md). The optional `ruby` feature pulls a fork of the
 Artichoke (mruby) interpreter at build time (Apache-2.0/MIT; see its repo).
 Changelog: [CHANGELOG.md](CHANGELOG.md); GA release notes:
-[RELEASE_NOTES_0.1.0.md](RELEASE_NOTES_0.1.0.md).
+[RELEASE_NOTES_1.0.0.md](RELEASE_NOTES_1.0.0.md).
 
 `"FerroStash"` is an unregistered trademark of abyo software 合同会社.
 `"Logstash"`, `"Elasticsearch"`, and `"Elastic"` are trademarks of Elasticsearch

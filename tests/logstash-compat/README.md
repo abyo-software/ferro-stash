@@ -1,6 +1,6 @@
 # Logstash compatibility test harness
 
-Black-box compatibility tests for ferro-stash against the Logstash 9.3.2
+Black-box compatibility tests for ferro-stash against the Logstash 9.4.2
 pipeline contract. Each test is a self-contained directory containing a
 Logstash DSL pipeline, NDJSON input, and a golden output JSON array.
 
@@ -68,17 +68,17 @@ See [Docker side-by-side regression harness](#docker-side-by-side-regression-har
 below.
 
 **2. Local tarball install (used by `runner.py`, `jruby_parity.py`, and
-`run_smoke_tests.sh`).** Download a Logstash 9.3.x release from Elastic,
+`run_smoke_tests.sh`).** Download a Logstash 9.4.x release from Elastic,
 extract it anywhere, and point the harness at it via environment
 variables:
 
 ```bash
 # Pick the build for your platform from https://www.elastic.co/downloads/logstash
-curl -fsSLO https://artifacts.elastic.co/downloads/logstash/logstash-9.3.2-linux-x86_64.tar.gz
-tar xzf logstash-9.3.2-linux-x86_64.tar.gz
+curl -fsSLO https://artifacts.elastic.co/downloads/logstash/logstash-9.4.2-linux-x86_64.tar.gz
+tar xzf logstash-9.4.2-linux-x86_64.tar.gz
 
 # jruby_parity.py reads LOGSTASH_HOME (the extracted directory):
-export LOGSTASH_HOME="$PWD/logstash-9.3.2"
+export LOGSTASH_HOME="$PWD/logstash-9.4.2"
 
 # run_smoke_tests.sh reads LOGSTASH_BIN (defaults to `logstash` on PATH):
 export LOGSTASH_BIN="$LOGSTASH_HOME/bin/logstash"
@@ -113,18 +113,14 @@ exits non-zero on any mismatch.
 ## Running — Rust
 
 `tests/e2e/logstash_compat_test.rs` is a fixture-driven Rust test that
-reuses the same comparison logic in-process (no binary spawn). It is **not
-yet wired into Cargo** — to enable it, add the following block to
-`crates/ferro-stash-e2e/Cargo.toml`:
+reuses the same comparison logic in-process (no binary spawn). It is wired
+into `crates/ferro-stash-e2e/Cargo.toml` and runs in CI, so
+`cargo test --workspace` exercises every fixture under `fixtures/`
+automatically (no Docker needed):
 
-```toml
-[[test]]
-name = "logstash_compat_test"
-path = "../../tests/e2e/logstash_compat_test.rs"
+```bash
+cargo test -p ferro-stash-e2e --test logstash_compat_test
 ```
-
-After that, `cargo test --workspace` will exercise every fixture under
-`fixtures/` automatically.
 
 ## Adding a new fixture
 
@@ -216,7 +212,7 @@ None as of 2026-06-20. The 24 bundled fixtures cover stdin input, ~17 filter
 plugins (grok, dissect, json, kv, mutate, date, translate, csv, truncate,
 split, clone, urldecode, fingerprint, drop, conditionals), and stdout JSON
 output. They produce **byte-identical event payloads** between Logstash 9.4.2
-and ferro-stash 0.1.0, modulo the runtime-only fields above.
+and ferro-stash 1.0.0, modulo the runtime-only fields above.
 
 This does *not* substantiate full Logstash compat — it substantiates
 the surface tested (43 of 165+ Logstash plugins implemented; the
