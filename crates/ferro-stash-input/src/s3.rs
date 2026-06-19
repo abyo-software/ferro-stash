@@ -34,6 +34,12 @@ pub struct S3InputConfig {
     pub region: String,
     pub access_key_id: Option<String>,
     pub secret_access_key: Option<String>,
+    /// Optional custom endpoint for S3-compatible stores (MinIO, LocalStack,
+    /// Ceph, …). When unset, the default AWS S3 endpoints are used.
+    pub endpoint: Option<String>,
+    /// Use path-style addressing (`endpoint/bucket/key`) — required by most
+    /// S3-compatible stores. Defaults to false (virtual-hosted style).
+    pub force_path_style: bool,
     pub interval: u64,
     pub codec: String,
     /// Codec sub-settings extracted from the `codec => name { ... }` block;
@@ -71,6 +77,8 @@ impl std::fmt::Debug for S3InputConfig {
                 "secret_access_key",
                 &self.secret_access_key.as_ref().map(|_| "***"),
             )
+            .field("endpoint", &self.endpoint)
+            .field("force_path_style", &self.force_path_style)
             .field("interval", &self.interval)
             .field("codec", &self.codec)
             .field("codec_settings", &self.codec_settings)
@@ -102,6 +110,8 @@ impl S3Input {
             .unwrap_or_else(|| "us-east-1".to_string());
         let access_key_id = settings.get_string("access_key_id");
         let secret_access_key = settings.get_string("secret_access_key");
+        let endpoint = settings.get_string("endpoint");
+        let force_path_style = settings.get_bool("force_path_style").unwrap_or(false);
         // Clamp the poll interval to a sane minimum. `interval => 0` would make
         // `Duration::from_secs(0)` a no-op sleep, turning the poll loop into a
         // tight spin against S3 (retry storm / throttling / cost) — so we floor
@@ -125,6 +135,8 @@ impl S3Input {
                 region,
                 access_key_id,
                 secret_access_key,
+                endpoint,
+                force_path_style,
                 interval,
                 codec,
                 codec_settings,
@@ -157,26 +169,31 @@ impl S3Input {
     /// back to the default AWS credential provider chain (env / profile / IMDS).
     async fn build_client(&self) -> Client {
         let region = Region::new(self.config.region.clone());
+        let mut loader =
+            aws_config::defaults(aws_config::BehaviorVersion::latest()).region(region);
 
-        match (&self.config.access_key_id, &self.config.secret_access_key) {
-            (Some(ak), Some(sk)) => {
-                let creds =
-                    Credentials::new(ak.clone(), sk.clone(), None, None, "ferro-stash-s3-input");
-                let conf = aws_sdk_s3::config::Builder::new()
-                    .region(region)
-                    .credentials_provider(creds)
-                    .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
-                    .build();
-                Client::from_conf(conf)
-            }
-            _ => {
-                let sdk_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-                    .region(region)
-                    .load()
-                    .await;
-                Client::new(&sdk_config)
-            }
+        // Static credentials when both are configured; otherwise the default AWS
+        // credential provider chain (env / profile / IMDS).
+        if let (Some(ak), Some(sk)) =
+            (&self.config.access_key_id, &self.config.secret_access_key)
+        {
+            let creds =
+                Credentials::new(ak.clone(), sk.clone(), None, None, "ferro-stash-s3-input");
+            loader = loader.credentials_provider(creds);
         }
+
+        let sdk_config = loader.load().await;
+
+        // Apply S3-compatible-store overrides (MinIO / LocalStack / Ceph). This
+        // mirrors the S3 *output* so reading from a non-AWS store works too.
+        let mut s3_config = aws_sdk_s3::config::Builder::from(&sdk_config);
+        if let Some(endpoint) = self.config.endpoint.as_ref() {
+            s3_config = s3_config.endpoint_url(endpoint);
+        }
+        if self.config.force_path_style {
+            s3_config = s3_config.force_path_style(true);
+        }
+        Client::from_conf(s3_config.build())
     }
 }
 
@@ -855,6 +872,14 @@ mod tests {
         ) {
             settings["access_key_id"] = serde_json::Value::String(ak);
             settings["secret_access_key"] = serde_json::Value::String(sk);
+        }
+        // S3-compatible store overrides (MinIO / LocalStack / Ceph), so this
+        // live test can run without real AWS.
+        if let Ok(endpoint) = std::env::var("S3_ENDPOINT") {
+            settings["endpoint"] = serde_json::Value::String(endpoint);
+        }
+        if std::env::var("S3_FORCE_PATH_STYLE").is_ok() {
+            settings["force_path_style"] = serde_json::Value::Bool(true);
         }
 
         let mut input = S3Input::from_config(&settings).expect("config");

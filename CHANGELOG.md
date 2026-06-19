@@ -9,6 +9,13 @@ is cut. Pre-1.0 releases may introduce breaking changes between minor tags.
 
 ### Added
 
+- **S3 input now supports `endpoint` / `force_path_style`** for S3-compatible
+  object stores (MinIO, LocalStack, Ceph, …), matching the S3 output. Previously
+  only the output could target non-AWS stores; the input was AWS-only. This also
+  lets the S3 input be validated live against MinIO. Live-validated: S3 in/out
+  (MinIO), Kafka in/out (redpanda), Redis in/out, Elasticsearch filter, and the
+  DataDog output (real intake) now pass against real services.
+
 - **Real external integrations for the ten formerly-stub connector
   plugins.** The plugins that previously parsed config and ran a
   lifecycle skeleton without any external call now perform real I/O. New
