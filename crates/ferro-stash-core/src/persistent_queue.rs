@@ -415,6 +415,13 @@ impl PersistentQueue {
     /// The currently-open write segment is never collected: its `BufWriter`
     /// may hold un-flushed bytes (so its on-disk image can read as empty/stale),
     /// and deleting the file out from under the live writer would lose data.
+    ///
+    /// The delete decision is made by [`Self::segment_fully_consumed`], which
+    /// scans EVERY line of the segment (not just the last) and refuses to
+    /// reclaim a segment that contains any unparsable line. A crash or partial
+    /// append can leave valid un-read entries followed by a truncated/garbage
+    /// trailing line; a last-line-only check would mis-read that as
+    /// fully-consumed and drop the recoverable data, so the scan is mandatory.
     pub fn gc(&mut self) -> Result<()> {
         let active_segment = Path::new(&self.config.path)
             .join(format!("segment_{:08}.seg", self.segment_index));
@@ -424,12 +431,12 @@ impl PersistentQueue {
             if self.current_segment.is_some() && seg_path == active_segment {
                 continue;
             }
-            // Check if all entries in this segment are consumed. `extract_max_seq`
-            // returns the highest `seq` present; an empty/unparsable segment
-            // yields 0, which is only reclaimed once `read_seq > 0` (nothing
-            // un-read can be there to lose).
-            let max_seq = self.extract_max_seq(&seg_path);
-            if max_seq < self.read_seq {
+            // Only reclaim a segment when every line parsed cleanly AND every
+            // entry's `seq` is below the read cursor (fully consumed). A segment
+            // with any unparsable line is conservatively kept: corruption is
+            // recoverable (see `test_pq_corruption_recovery`) and there may be
+            // valid un-read entries we must not lose.
+            if self.segment_fully_consumed(&seg_path) {
                 let size = fs::metadata(&seg_path).map(|m| m.len()).unwrap_or(0);
                 let _ = fs::remove_file(&seg_path);
                 self.total_bytes = self.total_bytes.saturating_sub(size);
@@ -439,14 +446,37 @@ impl PersistentQueue {
         Ok(())
     }
 
-    fn extract_max_seq(&self, path: &Path) -> u64 {
-        // Read last line to get max seq
+    /// Decide whether `path` is safe to reclaim, i.e. every entry it holds has
+    /// already been read (`seq < read_seq`).
+    ///
+    /// This is the corruption-aware GC delete predicate. Unlike a last-line
+    /// peek it scans ALL lines:
+    ///
+    /// - Blank lines are ignored (trailing newlines etc.).
+    /// - If ANY non-blank line fails to parse as a [`QueueEntry`], the segment
+    ///   is treated as NOT consumed (returns `false`) — corruption may sit
+    ///   *after* still-valid un-read entries (e.g. a truncated final append
+    ///   following good records), and those recoverable entries must not be
+    ///   dropped. This includes a fully-read segment whose trailing line is
+    ///   corrupted: it is conservatively kept (safe — keeping a file never
+    ///   loses data; the cost is at most a delayed reclaim).
+    /// - An empty/whitespace-only segment has no entries to lose; it is
+    ///   reclaimed (max over zero parsed entries is 0, which is `< read_seq`
+    ///   once `read_seq > 0`, matching the pre-existing empty-segment behavior).
+    fn segment_fully_consumed(&self, path: &Path) -> bool {
         let content = Self::read_segment_to_string(path);
-        content
-            .lines()
-            .last()
-            .and_then(|line| serde_json::from_str::<QueueEntry>(line).ok())
-            .map_or(0, |e| e.seq)
+        let mut max_seq = 0_u64;
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<QueueEntry>(line) {
+                Ok(entry) => max_seq = max_seq.max(entry.seq),
+                // Any unparsable non-blank line -> conservatively keep.
+                Err(_) => return false,
+            }
+        }
+        max_seq < self.read_seq
     }
 
     fn checkpoint(&self) -> Result<()> {
@@ -1486,5 +1516,286 @@ mod tests {
             "the un-read event in the active segment must survive gc"
         );
         assert!(remaining[0].contains("event 5"));
+    }
+
+    // ---- GC corruption-robustness regression tests (DD round-24) ----
+
+    /// Appends raw bytes to the first non-active `segment_*` file on disk and
+    /// returns the path that was touched. Used to inject a truncated/garbage
+    /// trailing line into a segment that already holds valid entries.
+    fn append_raw_to_first_segment(path: &str, active_index: u64, bytes: &[u8]) -> PathBuf {
+        let active_name = format!("segment_{active_index:08}.seg");
+        let active_name_zst = format!("segment_{active_index:08}.seg.zst");
+        let mut segs: Vec<PathBuf> = fs::read_dir(path)
+            .expect("read dir")
+            .filter_map(std::result::Result::ok)
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("segment_"))
+            })
+            .filter(|p| {
+                let n = p.file_name().map(|n| n.to_string_lossy().to_string());
+                n.as_deref() != Some(active_name.as_str())
+                    && n.as_deref() != Some(active_name_zst.as_str())
+            })
+            .collect();
+        segs.sort();
+        let target = segs.first().cloned().expect("at least one non-active segment");
+        let mut f = OpenOptions::new()
+            .append(true)
+            .open(&target)
+            .expect("open segment for raw append");
+        f.write_all(bytes).expect("append raw bytes");
+        f.flush().expect("flush raw append");
+        target
+    }
+
+    #[test]
+    fn test_pq_gc_keeps_segment_with_unread_then_corrupt_tail() {
+        // DD round-24 regression (a): a segment holding valid UNREAD entries
+        // (seq >= read_seq) followed by a truncated/garbage trailing line must
+        // NOT be reclaimed by gc, and those unread entries must remain
+        // recoverable. A last-line-only `extract_max_seq` would parse only the
+        // garbage tail, return 0, and delete the whole segment — losing data.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_string_lossy().to_string();
+        let config = PqConfig {
+            path: path.clone(),
+            segment_size: 5, // 5 entries per segment
+            checkpoint_interval: 1,
+            ..Default::default()
+        };
+
+        // Write 5 full segments worth (25 entries), then one more event into a
+        // fresh active segment so the earlier segments are non-active and
+        // closed on disk.
+        {
+            let mut pq = PersistentQueue::open(config.clone()).expect("open");
+            for i in 0..26 {
+                pq.enqueue(&format!(r#"{{"msg":"event {i}"}}"#))
+                    .expect("enqueue");
+            }
+            pq.close().expect("close");
+        }
+
+        // Corrupt the FIRST segment (seqs 0..4) by appending a truncated line
+        // AFTER its valid entries. The active (last) segment index is 6 because
+        // rotate_segment pre-increments and the first segment is index 1.
+        // We discover the active index from the queue state instead.
+        let active_index = {
+            let pq = PersistentQueue::open(config.clone()).expect("reopen to read index");
+            pq.segment_index
+        };
+        let corrupted = append_raw_to_first_segment(
+            &path,
+            active_index,
+            b"{truncated json without closing brace, valid utf8 but not parseable\n",
+        );
+
+        // Reopen, consume only the FIRST segment's worth (seqs 0..4) so its
+        // valid entries are read but the LATER segments are still un-read.
+        let mut pq = PersistentQueue::open(config).expect("reopen after corruption");
+        // Note: dequeue itself skips the corrupt line; we only read the 5 valid
+        // entries of the corrupted segment to set read_seq to 5.
+        let consumed = pq.dequeue(5).expect("dequeue first segment");
+        assert_eq!(consumed.len(), 5, "first segment's 5 valid entries read");
+
+        // gc now. read_seq == 5. The corrupted segment holds entries 0..4
+        // (all < 5) BUT also a corrupt line. Conservative policy keeps it.
+        pq.gc().expect("gc");
+        assert!(
+            corrupted.exists(),
+            "gc must NOT delete a segment containing a corrupt (possibly unread) line"
+        );
+
+        // The later segments' un-read entries (5..25) must all be recoverable.
+        let remaining = pq.dequeue(1000).expect("dequeue remaining");
+        assert_eq!(
+            remaining.len(),
+            21,
+            "all 21 later un-read events must survive gc (got {})",
+            remaining.len()
+        );
+        for (idx, entry) in remaining.iter().enumerate() {
+            let expected = 5 + idx;
+            assert!(
+                entry.contains(&format!("event {expected}")),
+                "remaining event {idx} should be 'event {expected}', got {entry}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pq_gc_keeps_fully_unread_segment_with_corrupt_tail() {
+        // Sharper variant of (a): a segment whose valid entries are ALL un-read
+        // (seq >= read_seq) and which also has a corrupt trailing line must be
+        // kept AND its valid entries must still dequeue. This is the direct
+        // data-loss case: last-line-only -> max_seq 0 -> 0 < read_seq -> delete.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_string_lossy().to_string();
+        let config = PqConfig {
+            path: path.clone(),
+            segment_size: 5,
+            checkpoint_interval: 1,
+            ..Default::default()
+        };
+
+        // Write 2 full segments (seqs 0..9) plus an active segment, then
+        // consume the first segment so read_seq == 5 while the SECOND segment
+        // (seqs 5..9) is entirely un-read.
+        {
+            let mut pq = PersistentQueue::open(config.clone()).expect("open");
+            for i in 0..11 {
+                pq.enqueue(&format!(r#"{{"msg":"event {i}"}}"#))
+                    .expect("enqueue");
+            }
+            pq.close().expect("close");
+        }
+
+        let active_index = {
+            let pq = PersistentQueue::open(config.clone()).expect("reopen for index");
+            pq.segment_index
+        };
+
+        // Corrupt the SECOND segment (seqs 5..9), which is entirely un-read once
+        // read_seq advances to 5. Find it: the second-smallest non-active seg.
+        let second_seg = {
+            let active_name = format!("segment_{active_index:08}.seg");
+            let active_name_zst = format!("segment_{active_index:08}.seg.zst");
+            let mut segs: Vec<PathBuf> = fs::read_dir(&path)
+                .expect("read dir")
+                .filter_map(std::result::Result::ok)
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .is_some_and(|n| n.to_string_lossy().starts_with("segment_"))
+                })
+                .filter(|p| {
+                    let n = p.file_name().map(|n| n.to_string_lossy().to_string());
+                    n.as_deref() != Some(active_name.as_str())
+                        && n.as_deref() != Some(active_name_zst.as_str())
+                })
+                .collect();
+            segs.sort();
+            segs.get(1).cloned().expect("second non-active segment")
+        };
+        {
+            let mut f = OpenOptions::new()
+                .append(true)
+                .open(&second_seg)
+                .expect("open second segment");
+            f.write_all(b"GARBAGE TRUNCATED TAIL\n")
+                .expect("append garbage");
+            f.flush().expect("flush");
+        }
+
+        let mut pq = PersistentQueue::open(config).expect("reopen");
+        // Read the first segment only (seqs 0..4) -> read_seq == 5.
+        let first = pq.dequeue(5).expect("dequeue first segment");
+        assert_eq!(first.len(), 5);
+
+        pq.gc().expect("gc");
+        assert!(
+            second_seg.exists(),
+            "gc must NOT delete a fully-unread segment with a corrupt tail"
+        );
+
+        // Its 5 valid un-read entries (5..9) plus the active segment's entry
+        // (seq 10) must still be recoverable.
+        let remaining = pq.dequeue(1000).expect("dequeue remaining");
+        assert_eq!(
+            remaining.len(),
+            6,
+            "all 6 later un-read events must survive gc (got {})",
+            remaining.len()
+        );
+        assert!(remaining[0].contains("event 5"));
+        assert!(remaining.last().is_some_and(|e| e.contains("event 10")));
+    }
+
+    #[test]
+    fn test_pq_gc_reclaims_fully_read_clean_segment() {
+        // DD round-24 regression (b): a fully-read segment with NO corruption
+        // (every entry seq < read_seq, all lines parse) must STILL be reclaimed
+        // — the corruption-aware predicate must not regress the round-23
+        // reclaim behavior.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_string_lossy().to_string();
+        let config = PqConfig {
+            path: path.clone(),
+            segment_size: 5,
+            ..Default::default()
+        };
+        let mut pq = PersistentQueue::open(config).expect("open");
+
+        for i in 0..25 {
+            pq.enqueue(&format!(r#"{{"msg":"event {i}"}}"#))
+                .expect("enqueue");
+        }
+        let files_before = count_segment_files(&path);
+        assert!(files_before > 1, "should have rotated multiple segments");
+
+        let batch = pq.dequeue(25).expect("dequeue");
+        assert_eq!(batch.len(), 25);
+
+        pq.gc().expect("gc");
+        let files_after = count_segment_files(&path);
+        assert!(
+            files_after < files_before,
+            "gc must still reclaim clean, fully-read segments (before={files_before}, after={files_after})"
+        );
+    }
+
+    #[test]
+    fn test_pq_gc_keeps_fully_read_segment_with_corrupt_tail_conservative() {
+        // DD round-24 regression (c): a segment whose valid entries are ALL
+        // already read (seq < read_seq) but whose last line is corrupted.
+        //
+        // DOCUMENTED CHOICE: conservative — the segment is KEPT (not reclaimed).
+        // This is always data-loss-safe (keeping a file never drops entries; the
+        // only cost is a delayed reclaim). We cannot distinguish "corrupt tail
+        // after only-read entries" from "corrupt tail hiding unread entries"
+        // without trusting the corrupt bytes, so we keep it. Reclamation
+        // resumes for this segment if/when the corruption is repaired or the
+        // segment is otherwise removed.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_string_lossy().to_string();
+        let config = PqConfig {
+            path: path.clone(),
+            segment_size: 5,
+            checkpoint_interval: 1,
+            ..Default::default()
+        };
+
+        {
+            let mut pq = PersistentQueue::open(config.clone()).expect("open");
+            for i in 0..11 {
+                pq.enqueue(&format!(r#"{{"msg":"event {i}"}}"#))
+                    .expect("enqueue");
+            }
+            pq.close().expect("close");
+        }
+
+        let active_index = {
+            let pq = PersistentQueue::open(config.clone()).expect("reopen for index");
+            pq.segment_index
+        };
+        // Corrupt the FIRST segment (seqs 0..4).
+        let corrupted = append_raw_to_first_segment(&path, active_index, b"NOT JSON TAIL\n");
+
+        // Consume past ALL entries (read_seq advances to 11) so the corrupted
+        // first segment is genuinely fully-read.
+        let mut pq = PersistentQueue::open(config).expect("reopen");
+        let drained = pq.dequeue(1000).expect("dequeue all");
+        assert_eq!(drained.len(), 11, "all 11 valid entries should drain");
+        assert_eq!(pq.pending(), 0);
+
+        pq.gc().expect("gc");
+        // Conservative: corrupt first segment is KEPT despite being fully-read.
+        assert!(
+            corrupted.exists(),
+            "conservative policy keeps a corrupt segment even when fully-read (safe)"
+        );
     }
 }
