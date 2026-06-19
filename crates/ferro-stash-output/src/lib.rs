@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Output plugins for `FerroStash`.
 
+pub mod csv;
 pub mod datadog;
 pub mod elasticsearch;
 pub mod file;
@@ -15,6 +16,7 @@ pub mod sns;
 pub mod sqs;
 pub mod stdout;
 pub mod tcp;
+pub mod udp;
 
 use std::sync::Arc;
 
@@ -62,6 +64,8 @@ pub fn create_output_with_bus(
             settings, condition,
         )?)),
         "tcp" => Ok(Box::new(tcp::TcpOutput::from_config(settings, condition)?)),
+        "udp" => Ok(Box::new(udp::UdpOutput::from_config(settings, condition)?)),
+        "csv" => Ok(Box::new(csv::CsvOutput::from_config(settings, condition)?)),
         "jdbc" => Ok(Box::new(jdbc::JdbcOutput::from_config(settings, condition)?)),
         "null" => Ok(Box::new(null::NullOutput::from_config(
             settings, condition,
@@ -154,6 +158,22 @@ mod tests {
         let settings = serde_json::json!({ "host": "localhost", "port": 5000 });
         let output = create_output("tcp", &settings, None);
         assert!(output.is_ok());
+    }
+
+    #[test]
+    fn test_create_udp_output() {
+        let settings = serde_json::json!({ "host": "127.0.0.1", "port": 9000 });
+        let output = create_output("udp", &settings, None);
+        assert!(output.is_ok());
+        assert_eq!(output.expect("udp output").name(), "udp");
+    }
+
+    #[test]
+    fn test_create_csv_output() {
+        let settings = serde_json::json!({ "path": "/tmp/out.csv", "fields": ["message"] });
+        let output = create_output("csv", &settings, None);
+        assert!(output.is_ok());
+        assert_eq!(output.expect("csv output").name(), "csv");
     }
 
     #[test]

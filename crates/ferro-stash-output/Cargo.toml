@@ -24,6 +24,7 @@ url = { workspace = true }
 flate2 = { workspace = true }
 base64 = { workspace = true }
 percent-encoding = { workspace = true }
+csv = { workspace = true }
 async-trait = "0.1"
 rdkafka = { version = "0.39.0", features = ["cmake-build", "tokio"] }
 redis = { version = "0.32.2", features = ["tokio-comp", "connection-manager"] }

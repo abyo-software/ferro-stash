@@ -129,8 +129,8 @@ The JRuby custom-logic figure is corroborated across runs (~143–147k); see
 ## Logstash compatibility scope
 
 FerroStash targets the **production-common subset** of Logstash, not its
-full plugin catalogue. It implements **~68% of the plugins bundled with
-Logstash 9.4.2** (76 / 111) — **codecs 100%, filters 74%, inputs 53%, outputs 57%** — weighted toward the parse/filter hot path; the long tail of connectors
+full plugin catalogue. It implements **~74% of the plugins bundled with
+Logstash 9.4.2** (82 / 111) — **codecs 100%, filters 86%, inputs 53%, outputs 65%** — weighted toward the parse/filter hot path; the long tail of connectors
 (AWS CloudWatch, RabbitMQ, …) is the main gap. A
 config that uses a missing plugin **fails fast** at load, so check the full
 **[compatibility matrix](docs/COMPATIBILITY.md)** before migrating. The
@@ -224,7 +224,7 @@ test exercises and the per-plugin feature residuals.
 | `redis` | real (live-validated) | async client: `BLPOP` (list), `SUBSCRIBE`/`PSUBSCRIBE` (channel/pattern), `AUTH` + `SELECT`. Password-only AUTH (no username/ACL), no TLS (`rediss://`), pub/sub `key` is a single channel/pattern |
 | `s3` | real (live-validated) | `aws-sdk-s3`: paginated `ListObjectsV2` + `GetObject` poll, in-memory seen-key dedup, optional `delete_after_read`. Seen-key set is not persisted (reprocesses non-deleted objects after restart — no sincedb); no SQS-notification mode |
 
-### Filter plugins (29 registered)
+### Filter plugins (33 registered)
 
 | Plugin | Status | Notes |
 |--------|--------|-------|
@@ -254,11 +254,15 @@ test exercises and the per-plugin feature residuals.
 | `de_dot` | functional | replace `.` in field names |
 | `json_encode` | functional | serialize a field to a JSON string |
 | `bytes` | functional | parse human byte sizes (e.g. `1.5kB`) |
+| `cidr` | functional | match address(es) against CIDR network(s) (IPv4/IPv6); on match applies `add_field` / `add_tag` |
+| `uuid` | functional | set a v4 UUID into `target` (with `overwrite`) |
+| `syslog_pri` | functional | decode syslog PRI into facility/severity codes + labels (default PRI 13) |
+| `anonymize` | functional | replace field values with a consistent hash (SHA1/256/384/512, MD5, MURMUR3; optional HMAC `key`) |
 | `geoip` | real (live-validated) | `maxminddb` lookups against a configured `.mmdb` (`database` field), full Logstash-style subfields. Falls back to private/loopback/public classification when no `database` is set. Validated against a real GeoLite2-City database |
 | `dns` | real (live-validated) | `hickory-resolver` forward (A/AAAA) and reverse (PTR) lookups, custom `nameserver`, `Replace`/`Append` action. Validated against `8.8.8.8` |
 | `elasticsearch` | real (live-validated) | `reqwest` `_search` with host failover, query-template `%{field}` sprintf, hits→field mapping. Live-validated against real Elasticsearch 8.15.3 (a seeded hit is mapped into the target field) via an `#[ignore]` smoke test (`ES_URL`); not run in CI |
 
-### Output plugins (14 registered)
+### Output plugins (16 registered)
 
 | Plugin | Status | Notes |
 |--------|--------|-------|
@@ -267,6 +271,8 @@ test exercises and the per-plugin feature residuals.
 | `file` | functional | JSON lines or custom format |
 | `http` | functional | POST/PUT/PATCH |
 | `tcp` | functional | TLS via rustls |
+| `udp` | functional | codec-encoded datagrams via `tokio::net::UdpSocket` (best-effort, fire-and-forget) |
+| `csv` | functional | append CSV rows to a file; `fields` define column order, `csv_options` (separator/quote) |
 | `null` | functional | discard (benchmarking) |
 | `pipeline` | functional | pipeline-to-pipeline (multi-pipeline mode) |
 | `kafka` | real (live-validated) | `rdkafka` `FutureProducer`: codec serialize, key sprintf, compression/acks/retries, flush. Live round-trip validated against real Apache Kafka 3.9.1 (and redpanda) via an `#[ignore]` smoke test (`KAFKA_BROKERS`); not run in CI |

@@ -2,7 +2,9 @@
 //! Filter plugins for `FerroStash`.
 
 pub mod aggregate;
+pub mod anonymize;
 pub mod bytes_filter;
+pub mod cidr;
 pub mod clone_filter;
 pub mod csv_filter;
 pub mod date;
@@ -25,11 +27,13 @@ pub mod ruby;
 pub mod script;
 pub mod sleep_filter;
 pub mod split_filter;
+pub mod syslog_pri;
 pub mod throttle;
 pub mod translate;
 pub mod truncate;
 pub mod urldecode;
 pub mod useragent;
+pub mod uuid_filter;
 pub mod xml;
 
 use ferro_stash_core::condition::Condition;
@@ -97,6 +101,14 @@ pub fn create_filter(
             settings, condition,
         )?),
         "bytes" => Box::new(bytes_filter::BytesFilter::from_config(settings, condition)?),
+        "cidr" => Box::new(cidr::CidrFilter::from_config(settings, condition)?),
+        "uuid" => Box::new(uuid_filter::UuidFilter::from_config(settings, condition)?),
+        "syslog_pri" => Box::new(syslog_pri::SyslogPriFilter::from_config(
+            settings, condition,
+        )?),
+        "anonymize" => Box::new(anonymize::AnonymizeFilter::from_config(
+            settings, condition,
+        )?),
         _ => {
             return Err(FerroStashError::Filter {
                 plugin: name.to_string(),
@@ -192,6 +204,38 @@ mod tests {
         let settings = serde_json::json!({});
         let filter = create_filter("geoip", &settings, None);
         assert!(filter.is_ok());
+    }
+
+    #[test]
+    fn test_create_cidr_filter() {
+        let settings = serde_json::json!({ "network": ["10.0.0.0/8"] });
+        let filter = create_filter("cidr", &settings, None);
+        assert!(filter.is_ok());
+        assert_eq!(filter.expect("cidr filter").name(), "cidr");
+    }
+
+    #[test]
+    fn test_create_uuid_filter() {
+        let settings = serde_json::json!({ "target": "uuid" });
+        let filter = create_filter("uuid", &settings, None);
+        assert!(filter.is_ok());
+        assert_eq!(filter.expect("uuid filter").name(), "uuid");
+    }
+
+    #[test]
+    fn test_create_syslog_pri_filter() {
+        let settings = serde_json::json!({});
+        let filter = create_filter("syslog_pri", &settings, None);
+        assert!(filter.is_ok());
+        assert_eq!(filter.expect("syslog_pri filter").name(), "syslog_pri");
+    }
+
+    #[test]
+    fn test_create_anonymize_filter() {
+        let settings = serde_json::json!({ "fields": ["message"] });
+        let filter = create_filter("anonymize", &settings, None);
+        assert!(filter.is_ok());
+        assert_eq!(filter.expect("anonymize filter").name(), "anonymize");
     }
 
     #[test]

@@ -1913,6 +1913,7 @@ dependencies = [
  "base64",
  "bytes",
  "chrono",
+ "csv",
  "ferro-stash-codec",
  "ferro-stash-core",
  "flate2",
