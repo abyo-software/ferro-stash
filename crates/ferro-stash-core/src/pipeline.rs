@@ -444,6 +444,13 @@ impl Pipeline {
 struct AckState {
     /// `seq` -> number of derived events not yet terminal.
     outstanding: BTreeMap<u64, u64>,
+    /// Sequences that must NEVER be acknowledged in this run: an event derived
+    /// from them was neither delivered nor durably captured (output failure with
+    /// no/failed DLQ, filter error with no/failed DLQ). Keeping them here pins the
+    /// ack cursor at or below them so they replay on restart (at-least-once) — the
+    /// pipeline has no in-run retry, so a genuinely-undelivered entry stays
+    /// un-acked until a restart re-reads it. Never cleared within a run.
+    blocked: std::collections::BTreeSet<u64>,
     /// Highest sequence ever registered, so the ack can advance past the final
     /// entry once nothing is outstanding.
     highest_registered: Option<u64>,
@@ -458,6 +465,7 @@ impl AckTracker {
         Self {
             state: Mutex::new(AckState {
                 outstanding: BTreeMap::new(),
+                blocked: std::collections::BTreeSet::new(),
                 highest_registered: None,
             }),
         }
@@ -490,8 +498,9 @@ impl AckTracker {
         }
     }
 
-    /// Mark one derived event of `seq` terminal (delivered or DLQ'd). Removes the
-    /// entry once the last completes. A no-op for an unknown/already-done seq.
+    /// Mark one derived event of `seq` terminal (delivered or durably DLQ'd).
+    /// Removes the entry once the last completes. A no-op for an unknown/already-
+    /// done seq.
     fn complete(&self, seq: u64) {
         let mut s = self.lock();
         if let Some(remaining) = s.outstanding.get_mut(&seq) {
@@ -502,15 +511,26 @@ impl AckTracker {
         }
     }
 
+    /// Permanently prevent `seq` from being acknowledged in this run: an event
+    /// derived from it was lost (delivery failed AND it was not durably captured
+    /// in the DLQ). The entry replays on the next start. See [`AckState::blocked`].
+    fn block(&self, seq: u64) {
+        self.lock().blocked.insert(seq);
+    }
+
     /// The exclusive ack high-water mark, or `None` if nothing has been
-    /// registered yet.
+    /// registered yet. Never advances past the smallest still-in-flight OR
+    /// blocked sequence, so neither an undelivered nor a lost entry can be acked.
     fn ack_point(&self) -> Option<u64> {
         let s = self.lock();
-        match s.outstanding.keys().next() {
-            // Everything below the smallest in-flight seq is durably done.
-            Some(&min) => Some(min),
-            // Nothing in flight: everything registered is done.
-            None => s.highest_registered.map(|h| h + 1),
+        let min_outstanding = s.outstanding.keys().next().copied();
+        let min_blocked = s.blocked.iter().next().copied();
+        match (min_outstanding, min_blocked) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            // Nothing in flight and nothing blocked: everything registered is done.
+            (None, None) => s.highest_registered.map(|h| h.saturating_add(1)),
         }
     }
 }
@@ -691,6 +711,10 @@ async fn run_filter_worker(
             // clone/split/drop the event into derivations that don't carry it.
             let pq_seq = event.pq_seq();
             let mut events = vec![event];
+            // Set when a derivation of this entry was lost during filtering (a
+            // filter errored and the event was NOT durably captured in the DLQ).
+            // Such an entry must never be acked — it replays on restart.
+            let mut lost_uncaptured = false;
 
             for filter in filters.iter() {
                 let mut next_events = Vec::with_capacity(events.len());
@@ -704,6 +728,10 @@ async fn run_filter_worker(
                             continue;
                         }
                     }
+                    // `filter.filter(ev)` consumes the event; keep a copy (only
+                    // when a DLQ exists) so a filter error can capture the real
+                    // payload rather than a marker.
+                    let ev_backup = dlq.as_ref().map(|_| ev.clone());
                     match filter.filter(ev).await {
                         Ok(filtered) => {
                             for fe in filtered {
@@ -718,15 +746,28 @@ async fn run_filter_worker(
                             if let Some(im) = instance_metrics.as_ref() {
                                 im.record_failed(1);
                             }
-                            if let Some(ref dlq_handle) = dlq {
-                                if let Err(dlq_err) = dlq_handle.write(
+                            // Capture the failed event (real payload) in the DLQ.
+                            // It is terminal only if DURABLY captured (`Ok(true)`);
+                            // a full DLQ (`Ok(false)`), a write error, or no DLQ
+                            // leaves the originating PQ entry un-acked for replay.
+                            let captured = match (dlq.as_ref(), ev_backup) {
+                                (Some(dlq_handle), Some(failed_ev)) => match dlq_handle.write(
                                     "filter",
                                     filter.name(),
                                     &e.to_string(),
-                                    serde_json::json!({"_dlq_filter_error": true}),
+                                    failed_ev.to_json(),
                                 ) {
-                                    warn!(error = %dlq_err, "failed to write to DLQ");
-                                }
+                                    Ok(true) => true,
+                                    Ok(false) => false,
+                                    Err(dlq_err) => {
+                                        warn!(error = %dlq_err, "failed to write to DLQ");
+                                        false
+                                    }
+                                },
+                                _ => false,
+                            };
+                            if !captured {
+                                lost_uncaptured = true;
                             }
                         }
                     }
@@ -737,12 +778,16 @@ async fn run_filter_worker(
             // At-least-once accounting: the popped queue entry `pq_seq` fans out
             // to `events.len()` derived events here. Record that count (0
             // completes the entry immediately — every derivation was dropped or
-            // DLQ'd during filtering) and re-stamp each surviving event with the
-            // originating seq so the output path can acknowledge the entry once
-            // all of its derivations are delivered/DLQ'd. Re-stamping is required
-            // (not mere propagation) because clone/split produce fresh events
-            // with `pq_seq == None`.
+            // durably DLQ'd during filtering) and re-stamp each surviving event
+            // with the originating seq so the output path can acknowledge the
+            // entry once all derivations are delivered/DLQ'd. Re-stamping is
+            // required (not mere propagation) because clone/split produce fresh
+            // events with `pq_seq == None`. If any derivation was lost without
+            // durable capture, block the entry so it is never acked (replays).
             if let (Some(tracker), Some(seq)) = (ack_tracker.as_ref(), pq_seq) {
+                if lost_uncaptured {
+                    tracker.block(seq);
+                }
                 tracker.set_fanout(seq, events.len());
                 for ev in &mut events {
                     ev.set_pq_seq(seq);
@@ -825,15 +870,15 @@ async fn run_outputs(
                         send_batch(&outputs, batch, &ctx).await;
                     }
                 } else {
-                    // Channel closed, flush remaining
+                    // Channel closed: flush remaining, then break. The FINAL ack
+                    // is deferred until AFTER outputs are flushed/closed below, so
+                    // a clean shutdown only acks events the outputs have durably
+                    // taken (important for buffering outputs like s3 that upload on
+                    // flush/rotation rather than per `output()` call).
                     if !collector.is_empty() {
                         let batch = collector.flush();
                         send_batch(&outputs, batch, &ctx).await;
                     }
-                    // Final durable ack on shutdown: everything delivered before
-                    // exit becomes durable so it is not needlessly replayed next
-                    // start (entries still un-acked here replay — at-least-once).
-                    advance_durable_ack(pq.as_ref(), ctx.ack_tracker.as_ref(), &mut last_acked);
                     break;
                 }
             }
@@ -852,7 +897,7 @@ async fn run_outputs(
         }
     }
 
-    // Close all outputs
+    // Close all outputs (flush buffering outputs to their durable store first).
     for output in outputs.iter() {
         if let Err(e) = output.flush().await {
             warn!(output = output.name(), error = %e, "output flush error");
@@ -861,23 +906,12 @@ async fn run_outputs(
             warn!(output = output.name(), error = %e, "output close error");
         }
     }
-}
 
-/// Mark every persistent-queue entry represented in `events` as having one
-/// derived event completed (delivered or DLQ'd). No-op when there is no tracker
-/// or the events carry no PQ sequence (memory-queue pipelines).
-///
-/// Called exactly once per event reaching a terminal state, so an entry that
-/// fanned out to K derived events is acknowledged only after all K complete —
-/// even when those K are spread across several output batches.
-fn complete_batch_seqs(ack_tracker: Option<&Arc<AckTracker>>, events: &[Event]) {
-    if let Some(tracker) = ack_tracker {
-        for ev in events {
-            if let Some(seq) = ev.pq_seq() {
-                tracker.complete(seq);
-            }
-        }
-    }
+    // Final durable ack AFTER outputs are flushed/closed: on a clean shutdown
+    // every delivered event is now durable in its output, so acking here will not
+    // strand a buffering output's not-yet-uploaded events. Entries still un-acked
+    // (undelivered, lost, or blocked) are intentionally left to replay.
+    advance_durable_ack(pq.as_ref(), ctx.ack_tracker.as_ref(), &mut last_acked);
 }
 
 async fn send_batch(outputs: &[Box<dyn OutputPlugin>], batch: Vec<Event>, ctx: &WorkerCtx) {
@@ -886,62 +920,86 @@ async fn send_batch(outputs: &[Box<dyn OutputPlugin>], batch: Vec<Event>, ctx: &
     let dlq = ctx.dlq.as_ref();
     let ack_tracker = ctx.ack_tracker.as_ref();
 
-    let count = batch.len() as u64;
-    // Estimate bytes without expensive JSON serialization — use message
-    // length as a proxy. Full JSON is only needed for actual output plugins.
-    let bytes: u64 = batch
-        .iter()
-        .map(|e| e.message().map_or(64, str::len) as u64)
-        .sum();
+    // Per-event terminal tracking (index-aligned with `batch`). An event is
+    // "lost" once some matching output FAILS to deliver it AND it is not durably
+    // captured in the DLQ. A lost event's PQ entry is left un-acked → it replays
+    // on restart (at-least-once). Events matching no output, or delivered to
+    // every matching output, stay non-lost and are acknowledged.
+    let mut lost = vec![false; batch.len()];
 
+    // Attempt EVERY output. Do NOT abort the batch after the first failing output:
+    // a healthy output must still receive the event even when another is down, and
+    // aborting early would acknowledge entries that the skipped outputs never got
+    // (data loss across a restart, since the entry would not replay).
     for output in outputs {
-        // Filter events by output condition
-        let filtered: Vec<Event> = batch
+        let matching: Vec<usize> = batch
             .iter()
-            .filter(|ev| output.condition().map_or(true, |cond| cond.evaluate(ev)))
-            .cloned()
+            .enumerate()
+            .filter(|(_, ev)| output.condition().map_or(true, |cond| cond.evaluate(ev)))
+            .map(|(i, _)| i)
             .collect();
-
-        if filtered.is_empty() {
+        if matching.is_empty() {
             continue;
         }
 
-        if let Err(e) = output.output(filtered.clone()).await {
+        let filtered: Vec<Event> = matching.iter().map(|&i| batch[i].clone()).collect();
+        let n = matching.len() as u64;
+        // Message-length proxy for bytes (full JSON only matters to the plugin).
+        let out_bytes: u64 = filtered
+            .iter()
+            .map(|e| e.message().map_or(64, str::len) as u64)
+            .sum();
+
+        if let Err(e) = output.output(filtered).await {
             error!(output = output.name(), error = %e, "output error");
-            metrics.record_failed(count);
+            metrics.record_failed(n);
             if let Some(im) = instance_metrics {
-                im.record_failed(count);
+                im.record_failed(n);
             }
-            // Send failed events to DLQ if enabled
-            if let Some(dlq_handle) = dlq {
-                for ev in &filtered {
-                    if let Err(dlq_err) =
-                        dlq_handle.write("output", output.name(), &e.to_string(), ev.to_json())
-                    {
-                        warn!(error = %dlq_err, "failed to write to DLQ");
-                    }
+            // Capture each failed event in the DLQ. It is terminal only if DURABLY
+            // captured (`Ok(true)`); a full DLQ (`Ok(false)`), a write error, or no
+            // DLQ marks it lost so its PQ entry replays instead of being acked.
+            for &i in &matching {
+                let captured = match dlq {
+                    Some(dlq_handle) => match dlq_handle.write(
+                        "output",
+                        output.name(),
+                        &e.to_string(),
+                        batch[i].to_json(),
+                    ) {
+                        Ok(true) => true,
+                        Ok(false) => false,
+                        Err(dlq_err) => {
+                            warn!(error = %dlq_err, "failed to write to DLQ");
+                            false
+                        }
+                    },
+                    None => false,
+                };
+                if !captured {
+                    lost[i] = true;
                 }
-                // The DLQ captured these failed events, so they are terminal —
-                // acknowledge their queue entries (a DLQ'd event is not replayed).
-                complete_batch_seqs(ack_tracker, &filtered);
             }
-            // Without a DLQ the failed events are left UN-acknowledged on purpose:
-            // their queue entries stay below the ack cursor and replay on the next
-            // start. That is the at-least-once contract — a persistently failing
-            // output backs the queue up (the durable buffer) rather than dropping.
-            return;
+        } else {
+            metrics.record_out(n, out_bytes);
+            if let Some(im) = instance_metrics {
+                im.record_out(n, out_bytes);
+            }
         }
     }
 
-    metrics.record_out(count, bytes);
-    if let Some(im) = instance_metrics {
-        im.record_out(count, bytes);
+    // Acknowledge every entry whose event reached a terminal state on ALL of its
+    // matching outputs (delivered, or durably DLQ'd on failure). Lost events are
+    // skipped — their entries stay un-acked and replay on the next start.
+    if let Some(tracker) = ack_tracker {
+        for (i, ev) in batch.iter().enumerate() {
+            if !lost[i] {
+                if let Some(seq) = ev.pq_seq() {
+                    tracker.complete(seq);
+                }
+            }
+        }
     }
-
-    // Whole batch delivered to every matching output (events that matched no
-    // output are terminal too — there was nothing to deliver). Acknowledge every
-    // queue entry represented in the batch.
-    complete_batch_seqs(ack_tracker, &batch);
 }
 
 #[cfg(test)]
@@ -1357,6 +1415,209 @@ mod tests {
                 "simulated permanent output failure".to_string(),
             ))
         }
+    }
+
+    /// A filter that always errors.
+    #[derive(Debug)]
+    struct FailingFilter;
+
+    #[async_trait::async_trait]
+    impl FilterPlugin for FailingFilter {
+        fn name(&self) -> &str {
+            "failing-filter"
+        }
+        async fn filter(&self, _event: Event) -> Result<Vec<Event>> {
+            Err(crate::error::FerroStashError::Pipeline(
+                "simulated filter failure".to_string(),
+            ))
+        }
+    }
+
+    /// Build a PQ-backed auto-exit pipeline, run it to completion within a
+    /// timeout, then return how many events remain in the queue (i.e. were NOT
+    /// acknowledged and would replay on the next start).
+    async fn run_and_count_replayable(
+        pq_path: &str,
+        dlq: DlqSettings,
+        inputs: usize,
+        filters: Vec<Box<dyn FilterPlugin>>,
+        outputs: Vec<Box<dyn OutputPlugin>>,
+    ) -> usize {
+        {
+            let config = PipelineConfig {
+                auto_exit_on_inputs_done: true,
+                workers: 2,
+                queue: QueueType::Persisted(PqConfig {
+                    path: pq_path.to_string(),
+                    checkpoint_interval: 1,
+                    ..PqConfig::default()
+                }),
+                dead_letter_queue: dlq,
+                ..PipelineConfig::default()
+            };
+            let mut pipeline = Pipeline::new(config);
+            pipeline.add_input(Box::new(FiniteInput { count: inputs }));
+            for f in filters {
+                pipeline.add_filter(f);
+            }
+            for o in outputs {
+                pipeline.add_output(o);
+            }
+            let (_controller, signal) = ShutdownController::new();
+            let result =
+                tokio::time::timeout(std::time::Duration::from_secs(15), pipeline.run(signal)).await;
+            assert!(
+                result.expect("pipeline must terminate").is_ok(),
+                "pipeline run should succeed"
+            );
+        }
+        // Reopen and drain to count what survived (un-acked => replay).
+        let reopened = SharedPersistentQueue::open(PqConfig {
+            path: pq_path.to_string(),
+            checkpoint_interval: 1,
+            ..PqConfig::default()
+        })
+        .expect("reopen PQ");
+        let mut n = 0;
+        while reopened.pop().expect("pop").is_some() {
+            n += 1;
+        }
+        n
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_multi_output_partial_failure_replays() {
+        // DD round-1 (Critical): with two outputs where one succeeds and one
+        // fails (no DLQ), an entry must NOT be acked just because the first output
+        // delivered it — the failing output never received it, so it must replay.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pq_path = dir.path().to_string_lossy().to_string();
+        let seen = Arc::new(AtomicUsize::new(0));
+        let replayable = run_and_count_replayable(
+            &pq_path,
+            DlqSettings::default(), // no DLQ
+            10,
+            vec![],
+            vec![
+                Box::new(CountingOutput {
+                    seen: Arc::clone(&seen),
+                }),
+                Box::new(FailingOutput),
+            ],
+        )
+        .await;
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            10,
+            "the healthy output should still receive every event"
+        );
+        assert_eq!(
+            replayable, 10,
+            "every entry must replay because the second output never delivered it"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_filter_error_no_dlq_replays() {
+        // DD round-1 (Critical): a filter error with NO DLQ must NOT ack the
+        // entry (the event was neither delivered nor captured) — it replays.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pq_path = dir.path().to_string_lossy().to_string();
+        let seen = Arc::new(AtomicUsize::new(0));
+        let replayable = run_and_count_replayable(
+            &pq_path,
+            DlqSettings::default(),
+            10,
+            vec![Box::new(FailingFilter)],
+            vec![Box::new(CountingOutput {
+                seen: Arc::clone(&seen),
+            })],
+        )
+        .await;
+        assert_eq!(seen.load(Ordering::SeqCst), 0, "filter dropped all events");
+        assert_eq!(
+            replayable, 10,
+            "filter-errored events with no DLQ must replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_filter_error_with_dlq_captures_payload_and_acks() {
+        // DD round-1: a filter error WITH a DLQ must capture the REAL event
+        // payload (not a marker) and, because it is durably captured, ack the
+        // entry so it does NOT replay.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pq_path = dir.path().to_string_lossy().to_string();
+        let dlq_path = dir.path().join("dlq").to_string_lossy().to_string();
+        let seen = Arc::new(AtomicUsize::new(0));
+        let replayable = run_and_count_replayable(
+            &pq_path,
+            DlqSettings {
+                enable: true,
+                config: Some(DlqConfig {
+                    path: dlq_path.clone(),
+                    ..DlqConfig::default()
+                }),
+            },
+            10,
+            vec![Box::new(FailingFilter)],
+            vec![Box::new(CountingOutput {
+                seen: Arc::clone(&seen),
+            })],
+        )
+        .await;
+        assert_eq!(seen.load(Ordering::SeqCst), 0, "filter dropped all events");
+        assert_eq!(
+            replayable, 0,
+            "durably DLQ-captured filter errors must be acked (no replay)"
+        );
+        // The DLQ must contain the real event payloads, not a marker.
+        let dlq = crate::dead_letter_queue::DeadLetterQueue::open(DlqConfig {
+            path: dlq_path,
+            ..DlqConfig::default()
+        })
+        .expect("reopen DLQ");
+        let entries = dlq.read_all().expect("read DLQ");
+        assert_eq!(entries.len(), 10, "all 10 filter failures captured");
+        let has_real_payload = entries.iter().any(|e| {
+            e.event
+                .get("message")
+                .and_then(|m| m.as_str())
+                .is_some_and(|s| s.starts_with("ev-"))
+        });
+        assert!(
+            has_real_payload,
+            "DLQ must store the real event payload, not just a marker"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_output_failure_full_dlq_replays() {
+        // DD round-1 (Critical): a full DLQ silently dropping a failed event must
+        // NOT cause the entry to be acked. With max_bytes=0 the DLQ is full from
+        // the start (captures nothing), so every failed delivery must replay.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pq_path = dir.path().to_string_lossy().to_string();
+        let dlq_path = dir.path().join("dlq").to_string_lossy().to_string();
+        let replayable = run_and_count_replayable(
+            &pq_path,
+            DlqSettings {
+                enable: true,
+                config: Some(DlqConfig {
+                    path: dlq_path,
+                    max_bytes: 0, // always "full" => captures nothing
+                    ..DlqConfig::default()
+                }),
+            },
+            10,
+            vec![],
+            vec![Box::new(FailingOutput)],
+        )
+        .await;
+        assert_eq!(
+            replayable, 10,
+            "events the full DLQ could not capture must replay, not be acked"
+        );
     }
 
     #[tokio::test]

@@ -413,24 +413,38 @@ Data sources → FerroStash → FerroSearch → Applications
   core crate but are not a full Logstash-parity feature set.
 - **Persistent queue provides at-least-once delivery (duplicates possible,
   not exactly-once).** `queue.type: persisted` advances its durable cursor
-  only *after* the output acknowledges delivery (or the event is
-  intentionally dropped by a filter, or captured by the DLQ) — not when the
-  event is dequeued for processing. An event that has been read but not yet
-  delivered when the process crashes or restarts is **replayed** from the
-  PQ. The cost of at-least-once is **duplicates**: an event delivered in the
-  short window after delivery but before its acknowledgement is
-  checkpointed will be re-delivered on the next start, so make outputs
-  idempotent (e.g. document IDs) where exactly-once matters — exactly-once
-  is **not** provided. A persistently failing output with no DLQ backs the
-  queue up (the durable buffer) rather than dropping; enable the
-  **dead-letter queue** to instead capture output-failure events for replay
-  via the `dead_letter_queue` input. The duplicate/replay window is bounded
-  by the output flush interval (`pipeline.batch.delay`). Because entries are
-  now retained until *delivered* (not just until read), size
-  `queue.max_bytes` for the in-flight/undelivered window: if the queue
-  reaches `max_bytes` while delivery lags, new events fall back to the
-  non-durable in-memory path (a best-effort handoff, not replayable), so a
-  too-small cap under sustained output lag re-opens a durability gap.
+  only *after* an event reaches a terminal state — not when it is dequeued
+  for processing. An entry is terminal once **every** matching output's
+  `output()` returned `Ok` for it (the delivery point), OR it was
+  intentionally dropped by a filter, OR its delivery/filter failure was
+  **durably captured** in the DLQ. An entry that is read but not yet terminal
+  when the process crashes is **replayed** on restart. Consequences to know:
+  - **Duplicates.** An event delivered in the window after delivery but
+    before its ack is checkpointed re-delivers on restart; with multiple
+    outputs, replaying an entry that one output already took re-delivers to
+    that output. Make outputs idempotent (e.g. document IDs) where it
+    matters — exactly-once is **not** provided.
+  - **The delivery point is `output()` returning `Ok`.** Outputs that buffer
+    internally and upload later (only **s3**, which uploads on size/time
+    rotation) return `Ok` before the object is durable, so a crash between
+    that `Ok` and the next rotation can lose those buffered events even
+    though the entry was acked. A clean shutdown flushes outputs *before* the
+    final ack, so it is lossless; for crash-durability with s3, tune its
+    rotation small or rely on replay. All other outputs deliver synchronously
+    within `output()`.
+  - **Failure handling.** A failed delivery (or filter error) is acked only
+    if it is durably captured in the DLQ; if there is no DLQ, the DLQ is full,
+    or the DLQ write fails, the entry is left un-acked and replays. A
+    persistently failing output with no DLQ therefore backs the queue up (the
+    durable buffer) rather than dropping. Enable the **dead-letter queue** to
+    capture failures (with the real event payload) for replay via the
+    `dead_letter_queue` input.
+  - **Sizing.** Because entries are retained until *terminal* (not just until
+    read), size `queue.max_bytes` for the in-flight/undelivered window: if the
+    queue reaches `max_bytes` while delivery lags, new events fall back to the
+    non-durable in-memory path (best-effort, not replayable), re-opening a
+    durability gap. The duplicate/replay window is otherwise bounded by the
+    output flush interval (`pipeline.batch.delay`).
 - **Single developer; no production deployments.** Bus factor 1; no
   operational history. Performance numbers come from one benchmark
   environment.

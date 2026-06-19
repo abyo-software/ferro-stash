@@ -136,17 +136,30 @@ impl DeadLetterQueue {
             .unwrap_or(0)
     }
 
-    /// Write a dead letter event.
+    /// Write a dead letter event, returning whether it was **durably captured**.
+    ///
+    /// - `Ok(true)`  — the record was written AND flushed to disk (durable).
+    /// - `Ok(false)` — the DLQ is full, so the record was dropped (a warning is
+    ///   logged). The event is NOT captured.
+    /// - `Err(..)`   — serialization or I/O error; the record was NOT captured.
+    ///
+    /// The boolean exists so an at-least-once caller can distinguish "captured"
+    /// from "dropped": a popped persistent-queue entry whose delivery failed must
+    /// only be acknowledged when its failure is durably captured here (`Ok(true)`)
+    /// — on `Ok(false)`/`Err` the caller must leave it un-acked so it replays.
+    /// For that reason the record is flushed immediately rather than batched: a
+    /// record buffered-but-not-flushed would be lost by a crash even though the
+    /// source PQ entry was already acked.
     pub fn write(
         &mut self,
         plugin_type: &str,
         plugin_name: &str,
         reason: &str,
         event_json: serde_json::Value,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if self.total_bytes >= self.config.max_bytes {
             warn!("DLQ full, dropping dead letter event");
-            return Ok(());
+            return Ok(false);
         }
 
         let entry = DeadLetterEntry {
@@ -166,18 +179,14 @@ impl DeadLetterQueue {
                 .map_err(|e| FerroStashError::Pipeline(format!("DLQ write error: {e}")))?;
             self.total_bytes += line.len() as u64 + 1;
             self.events_written += 1;
-
-            // `flush_interval` is an unvalidated `usize` from config; a value of
-            // 0 would make this modulo a division-by-zero panic (same zero-period
-            // class as the output flush timer). Clamp the divisor to >=1.
-            if self.events_written % self.config.flush_interval.max(1) == 0 {
-                writer
-                    .flush()
-                    .map_err(|e| FerroStashError::Pipeline(format!("DLQ flush error: {e}")))?;
-            }
+            // Flush immediately so `Ok(true)` means durable (see doc comment).
+            writer
+                .flush()
+                .map_err(|e| FerroStashError::Pipeline(format!("DLQ flush error: {e}")))?;
+            return Ok(true);
         }
 
-        Ok(())
+        Ok(false)
     }
 
     /// Read all entries from the DLQ.
@@ -344,14 +353,16 @@ impl SharedDeadLetterQueue {
             .push(event, error_message, plugin_name, timestamp)
     }
 
-    /// Write a raw dead letter entry (low-level API).
+    /// Write a raw dead letter entry (low-level API). Returns `Ok(true)` when the
+    /// record is durably captured, `Ok(false)` when dropped because the DLQ is
+    /// full, `Err` on serialize/I/O failure. See [`DeadLetterQueue::write`].
     pub fn write(
         &self,
         plugin_type: &str,
         plugin_name: &str,
         reason: &str,
         event_json: serde_json::Value,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         self.inner
             .lock()
             .map_err(|e| FerroStashError::Pipeline(format!("DLQ lock poisoned: {e}")))?

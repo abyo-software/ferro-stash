@@ -65,7 +65,16 @@ is cut. Pre-1.0 releases may introduce breaking changes between minor tags.
   for exactly-once needs); a persistently failing output with no DLQ backs
   the queue up rather than dropping. See [`README.md`](README.md) "Honest
   limitations". New API: `PersistentQueue::pop_with_seq` / `dequeue_with_seq`
-  and `SharedPersistentQueue::{pop_with_seq, ack}`.
+  and `SharedPersistentQueue::{pop_with_seq, ack}`. To make the durable cursor
+  safe, supporting changes: `send_batch` now attempts **every** output (it no
+  longer aborts the whole batch after the first failing output, which would
+  have acked entries the later outputs never received); the DLQ `write` now
+  returns `Result<bool>` (`true` = durably persisted+flushed, `false` =
+  dropped because full) and flushes per write, so an entry is acked on a
+  delivery/filter failure only when its DLQ capture is durable (a full or
+  failing DLQ leaves it un-acked to replay); and filter-error DLQ records now
+  store the real event payload instead of a `{"_dlq_filter_error": true}`
+  marker.
 - **New build requirement: `cmake`.** The kafka plugins pull `rdkafka`,
   which builds a vendored `librdkafka` via CMake, so `cmake` is now
   required at build time (in addition to the existing clang/gcc for the
