@@ -110,6 +110,29 @@ is cut. Pre-1.0 releases may introduce breaking changes between minor tags.
   is needed. The `geoip` filter additionally needs a user-supplied
   `.mmdb` database file at runtime (not vendored).
 
+### Fixed
+
+- **`date` filter now accepts Logstash Joda/Java patterns.** `match`
+  patterns such as `yyyy-MM-dd HH:mm:ss` were passed straight to chrono's
+  strptime parser and failed (every event got `_dateparsefailure`). A
+  Joda→strptime translator is applied for non-`%` patterns (year/month/
+  day/hour/minute/second, fractional `SSS`, month/weekday names, AM/PM,
+  zone offsets, and `'T'` quoted literals); existing `%`-style patterns
+  are unchanged. Found via Logstash byte-eq parity testing.
+- **`translate` filter honours the modern `source`/`target` keys.** It
+  previously read only the legacy `field`/`destination` names, so a
+  Logstash 8.x `source`/`target` config was silently ignored — it looked
+  up the wrong field and sent every event to the fallback. Both spellings
+  are now accepted (modern wins). Found via parity testing.
+- **`clone` filter tags each clone with its name.** `clones => ["a","b"]`
+  now emits clones tagged `["a"]` / `["b"]` (matching Logstash); they were
+  previously emitted untagged. Integer-count form still yields untagged
+  clones. Found via parity testing.
+- **Logstash byte-eq parity fixtures expanded 13 → 24** (~17 filters),
+  each generated from the real Logstash 8.15.3 oracle via the new
+  `tests/logstash-compat/gen_expected.py`, and run automatically in CI by
+  the in-process `logstash_compat_test`.
+
 ### Honest residual limitations
 
 - **kafka input**: `consumer_threads` / `max_poll_records` are parsed but
