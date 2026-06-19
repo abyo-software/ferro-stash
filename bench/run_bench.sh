@@ -43,13 +43,18 @@ mkdir -p "$PD"
 gen() { local fmt="$1" n="$2"; local f="$PD/input_${fmt}_${n}.log"; [ -f "$f" ] || python3 "$HERE/gen_input.py" "$n" --format "$fmt" > "$f"; echo "$f"; }
 one_line() { local fmt="$1"; local f="$PD/oneline_$fmt.log"; [ -f "$f" ] || python3 "$HERE/gen_input.py" 1 --format "$fmt" > "$f"; echo "$f"; }
 
-# wall_seconds <logfile-of-time-v>
-wall_s() { awk -F': ' '/Elapsed \(wall clock\)/{print $2}' "$1" | python3 -c "import sys;t=sys.stdin.read().strip().split(':');print(sum(float(x)*60**i for i,x in enumerate(reversed(t))))"; }
 rss_kb()  { awk -F': ' '/Maximum resident set size/{print $2}' "$1"; }
 
-run_once() { # engine conf input  -> sets RC, writes time -v to $LOG
+# run_once: sets RC and WALL (wall-clock seconds, HIGH RESOLUTION via
+# `date +%s.%N`). `/usr/bin/time -v`'s own "Elapsed" is only 0.01s-granular, so
+# at sub-second runs throughput quantizes to suspiciously round numbers (e.g.
+# 200000/0.25 = exactly 800000). We time the whole invocation with nanosecond
+# `date` instead and keep time -v solely for peak RSS (written to $LOG).
+run_once() { # engine conf input  -> sets RC, WALL; writes time -v to $LOG
   local engine="$1" conf="$2" input="$3"
   set +e
+  local t0 t1
+  t0=$(date +%s.%N)
   case "$engine" in
     fs) $TIME -v "$FS" -f "$conf" --auto-exit -w "$WORKERS" --api.enabled false -l error < "$input" >/dev/null 2>"$LOG" ;;
     ls) rm -rf "$PD/lsdata"; mkdir -p "$PD/lsdata"
@@ -57,6 +62,8 @@ run_once() { # engine conf input  -> sets RC, writes time -v to $LOG
               --path.data "$PD/lsdata" --log.level error < "$input" >/dev/null 2>"$LOG" ;;
   esac
   RC=$?            # /usr/bin/time -v propagates the command's exit code
+  t1=$(date +%s.%N)
+  WALL=$(python3 -c "print($t1 - $t0)")
   set -e
 }
 
@@ -73,12 +80,12 @@ measure() { # label engine conf fmt [lines]  -> appends a row to $RESULTS
   # broken — record FAILED, never a throughput number.
   LOG=$(mktemp); run_once "$engine" "$conf" "$(one_line "$fmt")"
   if [ "$RC" -ne 0 ]; then fail_row "$label" "$RC"; rm -f "$LOG"; return; fi
-  local start; start="$(wall_s "$LOG")"; rm -f "$LOG"
+  local start="$WALL"; rm -f "$LOG"
   local secs=() rss=()
   for r in $(seq 0 "$RUNS"); do
     LOG=$(mktemp); run_once "$engine" "$conf" "$input"
     if [ "$RC" -ne 0 ]; then fail_row "$label" "$RC"; rm -f "$LOG"; return; fi
-    if [ "$r" -gt 0 ]; then secs+=("$(wall_s "$LOG")"); rss+=("$(rss_kb "$LOG")"); fi
+    if [ "$r" -gt 0 ]; then secs+=("$WALL"); rss+=("$(rss_kb "$LOG")"); fi
     rm -f "$LOG"
   done
   python3 - "$label" "$n" "$start" "${secs[*]}" "${rss[*]}" >> "$RESULTS" <<'PY'
@@ -87,11 +94,12 @@ label, lines, start = sys.argv[1], int(sys.argv[2]), float(sys.argv[3])
 secs = [float(x) for x in sys.argv[4].split()]
 rss  = [float(x) for x in sys.argv[5].split()]
 proc = [s - start for s in secs]                     # startup-subtracted
-wall_mean = statistics.mean(secs)
-# Steady-state is only trustworthy when processing time clearly exceeds both the
-# timer floor and the startup we subtracted. Otherwise the input is too small —
-# fall back to end-to-end and flag it (raise LINES) instead of emitting garbage.
-if min(proc) > 0.2 and min(proc) > 0.05 * wall_mean:
+# With high-resolution timing the timer floor is a non-issue, but the
+# startup-subtraction is only well-conditioned when processing time exceeds the
+# startup we subtracted (and isn't trivially short). Otherwise the input is too
+# small — fall back to end-to-end and flag it (raise LINES) rather than divide
+# by a noisy near-zero difference.
+if min(proc) > 0.1 and min(proc) > start:
     eps = [lines / p for p in proc]
     tput, sd = f"{statistics.mean(eps):,.0f}", f"±{statistics.pstdev(eps):,.0f}"
 else:
