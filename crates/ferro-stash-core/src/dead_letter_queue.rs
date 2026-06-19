@@ -121,6 +121,17 @@ impl DeadLetterQueue {
             .open(&current_file)
             .map_err(|e| FerroStashError::Pipeline(format!("DLQ open error: {e}")))?;
 
+        // Power-loss durability: durably link the freshly-created DLQ file's
+        // directory entry before any `write()` can return `Ok(true)`. Without
+        // this, `sync_data` on a record only persists the file's contents — a
+        // power loss could still lose the new file's directory entry entirely,
+        // dropping a record whose source PQ entry was already acked. The DLQ
+        // never rotates its file, so one dir fsync at open suffices. (Mirrors the
+        // PQ's `sync_dir`-after-segment-create; gated on `fsync` like the PQ.)
+        if config.fsync {
+            crate::persistent_queue::sync_dir(&config.path)?;
+        }
+
         let total_bytes = Self::calculate_total_size(&config.path);
 
         Ok(Self {
@@ -160,11 +171,14 @@ impl DeadLetterQueue {
     /// record buffered-but-not-flushed would be lost by a crash even though the
     /// source PQ entry was already acked.
     ///
-    /// Durability scope: `flush()` pushes the record to the OS (page cache), which
-    /// survives a *process* crash but not a power loss / kernel panic (there is no
-    /// `fsync`). This matches the persistent queue's own checkpoint/segment
-    /// durability — the whole at-least-once guarantee is process-crash-scoped, not
-    /// power-loss-scoped.
+    /// Durability scope: by default `flush()` pushes the record to the OS (page
+    /// cache), which survives a *process* crash but not a power loss / kernel
+    /// panic. With `DlqConfig::fsync` enabled, the record is additionally
+    /// `sync_data`'d (and the file's directory entry is fsync'd once at open), so
+    /// `Ok(true)` is power-loss durable. This matches the persistent queue's own
+    /// `fsync` option — the at-least-once guarantee is process-crash-scoped by
+    /// default and power-loss-scoped when `fsync` is on, for both the queue and
+    /// the DLQ.
     pub fn write(
         &mut self,
         plugin_type: &str,

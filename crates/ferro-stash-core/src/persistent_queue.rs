@@ -107,7 +107,7 @@ impl Default for PqConfig {
 /// linked (POSIX: the file's data being fsync'd does not guarantee its directory
 /// entry survives a power loss until the directory itself is fsync'd). Best
 /// effort — a platform that cannot open a directory as a file simply skips it.
-fn sync_dir(dir: &str) -> Result<()> {
+pub(crate) fn sync_dir(dir: &str) -> Result<()> {
     if let Ok(handle) = File::open(dir) {
         handle
             .sync_all()
@@ -492,7 +492,28 @@ impl PersistentQueue {
                     fs::write(&compressed_path, &compressed).map_err(|e| {
                         FerroStashError::Pipeline(format!("PQ compress write error: {e}"))
                     })?;
+                    // Make the compressed segment durable+linked BEFORE removing
+                    // the (already per-append-fsync'd) original, so a power loss in
+                    // fsync mode can never lose BOTH: fsync the `.zst` contents,
+                    // fsync the directory to durably link it, remove the original,
+                    // then fsync the directory again so the removal is durable. The
+                    // original `.seg` remains the fallback until the `.zst` is
+                    // confirmed on disk; if both transiently exist, reads dedupe by
+                    // `seq`. Without this, the later active-segment dir fsync could
+                    // durably record the removal while the `.zst` is still only in
+                    // page cache — losing unacked events.
+                    if self.config.fsync {
+                        File::open(&compressed_path)
+                            .and_then(|f| f.sync_all())
+                            .map_err(|e| {
+                                FerroStashError::Pipeline(format!("PQ compress fsync error: {e}"))
+                            })?;
+                        sync_dir(&self.config.path)?;
+                    }
                     let _ = fs::remove_file(&seg_path);
+                    if self.config.fsync {
+                        sync_dir(&self.config.path)?;
+                    }
                     let saved = input.len() as i64 - compressed.len() as i64;
                     debug!(
                         segment = self.segment_index,
@@ -2310,6 +2331,9 @@ mod tests {
             segment_size: 4, // force rotations (exercises the dir fsync on rotate)
             checkpoint_interval: 1,
             fsync: true,
+            // Compression ON so rotations exercise the durable `.seg`->`.seg.zst`
+            // replacement path under fsync (DD found that rewrite was not durable).
+            compression: PqCompression::Speed,
             ..Default::default()
         };
         {
