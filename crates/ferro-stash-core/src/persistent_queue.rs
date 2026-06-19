@@ -416,12 +416,29 @@ impl PersistentQueue {
                 break;
             }
 
-            // Corruption-tolerant read (matches gc/recovery's `read_segment_to_string`):
-            // a segment that fails to decode/read yields empty rather than erroring
-            // the entire dequeue and wedging the drainer. The deduped listing already
-            // prefers the intact `.seg` when both copies exist, so this only matters
-            // for a lone, partially-written `.seg.zst`.
-            let data = Self::read_segment_to_string(&seg_path);
+            // Propagate read/decode errors rather than swallowing them. The
+            // deduped listing (`segment_files`) already drops a duplicate
+            // `.seg.zst` in favour of the intact `.seg`, so the only segment that
+            // can fail to read here is a *lone* genuinely-unreadable one. For that,
+            // a hard error (the drainer warns + retries — a safe wedge) is correct:
+            // a TRANSIENT fault (EMFILE/ENOMEM/EIO) clears on retry, and a partial
+            // corruption is preserved for salvage. Swallowing the error instead
+            // would skip the segment, let `ack_point` jump the gap, and let gc
+            // delete intact-but-temporarily-unreadable data — silent loss.
+            let data = if seg_path.extension().is_some_and(|e| e == "zst") {
+                let file = File::open(&seg_path)
+                    .map_err(|e| FerroStashError::Pipeline(format!("PQ read error: {e}")))?;
+                let mut decoder = zstd::Decoder::new(file)
+                    .map_err(|e| FerroStashError::Pipeline(format!("PQ zstd decode error: {e}")))?;
+                let mut content = String::new();
+                decoder
+                    .read_to_string(&mut content)
+                    .map_err(|e| FerroStashError::Pipeline(format!("PQ read error: {e}")))?;
+                content
+            } else {
+                fs::read_to_string(&seg_path)
+                    .map_err(|e| FerroStashError::Pipeline(format!("PQ read error: {e}")))?
+            };
 
             for line in data.lines() {
                 if results.len() >= batch_size {
