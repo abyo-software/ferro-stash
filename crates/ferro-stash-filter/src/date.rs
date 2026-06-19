@@ -95,9 +95,21 @@ impl DateFilter {
                     }
                 }
                 fmt => {
-                    // Try chrono format
+                    // Already-strptime (`%`-style) patterns: try as-is.
                     if let Ok(ndt) = NaiveDateTime::parse_from_str(text, fmt) {
                         return Some(ndt.and_utc());
+                    }
+                    // Logstash patterns are Joda/Java-style (e.g.
+                    // `yyyy-MM-dd HH:mm:ss`). Translate to strptime and retry,
+                    // both as a naive datetime and as one carrying an offset.
+                    let translated = joda_to_strptime(fmt);
+                    if translated != fmt {
+                        if let Ok(ndt) = NaiveDateTime::parse_from_str(text, &translated) {
+                            return Some(ndt.and_utc());
+                        }
+                        if let Ok(dt) = DateTime::parse_from_str(text, &translated) {
+                            return Some(dt.with_timezone(&Utc));
+                        }
                     }
                 }
             }
@@ -149,6 +161,89 @@ impl FilterPlugin for DateFilter {
     }
 }
 
+/// Translate a Joda/Java-style date pattern (as used by Logstash, e.g.
+/// `yyyy-MM-dd HH:mm:ss`) into the strptime-style format chrono expects.
+///
+/// Patterns that already contain `%` are assumed to be strptime and returned
+/// unchanged. Quoted literals (`'T'`, `''` → `'`) are emitted verbatim;
+/// unrecognised letter tokens are dropped.
+fn joda_to_strptime(pattern: &str) -> String {
+    if pattern.contains('%') {
+        return pattern.to_string();
+    }
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\'' {
+            // Quoted literal. A doubled quote ('') is a literal single quote.
+            i += 1;
+            if i < chars.len() && chars[i] == '\'' {
+                out.push('\'');
+                i += 1;
+                continue;
+            }
+            while i < chars.len() && chars[i] != '\'' {
+                if chars[i] == '%' {
+                    out.push('%');
+                }
+                out.push(chars[i]);
+                i += 1;
+            }
+            i += 1; // consume closing quote (if present)
+            continue;
+        }
+        if c.is_ascii_alphabetic() {
+            let mut count = 1;
+            while i + count < chars.len() && chars[i + count] == c {
+                count += 1;
+            }
+            out.push_str(&joda_token(c, count));
+            i += count;
+            continue;
+        }
+        if c == '%' {
+            out.push('%');
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// Map one run of a Joda pattern letter to its strptime equivalent.
+fn joda_token(c: char, count: usize) -> String {
+    match c {
+        'y' | 'Y' => if count == 2 { "%y" } else { "%Y" }.to_string(),
+        'M' | 'L' => match count {
+            0..=2 => "%m",
+            3 => "%b",
+            _ => "%B",
+        }
+        .to_string(),
+        'd' => "%d".to_string(),
+        'D' => "%j".to_string(),
+        'E' | 'e' | 'c' => if count >= 4 { "%A" } else { "%a" }.to_string(),
+        'H' | 'k' => "%H".to_string(),
+        'h' | 'K' => "%I".to_string(),
+        'm' => "%M".to_string(),
+        's' => "%S".to_string(),
+        'S' => match count {
+            3 => "%3f",
+            6 => "%6f",
+            9 => "%9f",
+            _ => "%f",
+        }
+        .to_string(),
+        'a' => "%p".to_string(),
+        'z' => "%Z".to_string(),
+        'Z' | 'X' => "%z".to_string(),
+        // Era (G), week-of-year (w/W) etc. have no strptime analogue: drop.
+        _ => String::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,6 +273,38 @@ mod tests {
         let mut event = Event::new("test");
         event.set("ts", EventValue::String("1705312200".into()));
         let result = filter.filter(event).await.expect("filter");
+        assert!(!result[0].has_tag("_dateparsefailure"));
+    }
+
+    #[test]
+    fn test_joda_to_strptime_translation() {
+        assert_eq!(joda_to_strptime("yyyy-MM-dd HH:mm:ss"), "%Y-%m-%d %H:%M:%S");
+        assert_eq!(
+            joda_to_strptime("yyyy-MM-dd'T'HH:mm:ss.SSS"),
+            "%Y-%m-%dT%H:%M:%S.%3f"
+        );
+        assert_eq!(joda_to_strptime("dd/MMM/yyyy"), "%d/%b/%Y");
+        // Already-strptime patterns pass through untouched.
+        assert_eq!(joda_to_strptime("%Y-%m-%d"), "%Y-%m-%d");
+    }
+
+    #[tokio::test]
+    async fn test_date_joda_pattern_to_target() {
+        // Logstash parity: a Joda `match` pattern resolves and the target field
+        // carries the LogStash::Timestamp wire format.
+        let settings = serde_json::json!({
+            "match": ["ts", "yyyy-MM-dd HH:mm:ss"],
+            "timezone": "UTC",
+            "target": "event_time"
+        });
+        let filter = DateFilter::from_config(&settings, None).expect("config");
+        let mut event = Event::new("test");
+        event.set("ts", EventValue::String("2024-01-15 10:30:00".into()));
+        let result = filter.filter(event).await.expect("filter");
+        assert_eq!(
+            result[0].get("event_time"),
+            Some(&EventValue::String("2024-01-15T10:30:00.000Z".into()))
+        );
         assert!(!result[0].has_tag("_dateparsefailure"));
     }
 

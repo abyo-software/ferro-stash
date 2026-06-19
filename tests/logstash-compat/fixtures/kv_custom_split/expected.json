@@ -1,0 +1,10 @@
+[
+  {
+    "message": "user=alice&city=tokyo&role=admin",
+    "params": {
+      "user": "alice",
+      "role": "admin",
+      "city": "tokyo"
+    }
+  }
+]

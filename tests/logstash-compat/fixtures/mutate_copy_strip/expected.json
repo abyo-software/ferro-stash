@@ -1,0 +1,8 @@
+[
+  {
+    "message": "{\"user\": \"alice\", \"note\": \"   padded   \"}",
+    "user_copy": "alice",
+    "note": "padded",
+    "user": "alice"
+  }
+]

@@ -459,10 +459,21 @@ Data sources → FerroStash → FerroSearch → Applications
 - **Single developer; no production deployments.** Bus factor 1; no
   operational history. Performance numbers come from one benchmark
   environment.
-- **Parity evidence is per-fixture.** The 13 docker fixtures that pass
-  byte-equal cover ~6 filters and the stdin/stdout path against Logstash
-  8.15.3; they do not cover every implemented plugin, codec, or edge
-  case. See the compatibility matrix for the explicit scope.
+- **Parity evidence is per-fixture.** The 24 byte-equal fixtures (run
+  in-process by `logstash_compat_test` and end-to-end by `runner.py`)
+  cover ~17 filters and the stdin/stdout path against Logstash 8.15.3;
+  they do not cover every implemented plugin, codec, or edge case. Each
+  golden file is generated from the real Logstash oracle via
+  `tests/logstash-compat/gen_expected.py`. See the compatibility matrix
+  for the explicit scope.
+- **Dotted JSON keys are auto-nested.** The `json` filter expands a key
+  containing dots (e.g. `"app.name"`) into a nested object
+  (`app: { name }`), whereas Logstash keeps it as a single literal field
+  name. Consequently the `de_dot` filter — whose purpose is to flatten
+  such keys — is a no-op on keys that arrived through `json`, since they
+  are already nested by the time it runs. `de_dot` still works on
+  genuinely flat dotted field names. Aligning the `json` filter's
+  dotted-key handling with Logstash is tracked as future work.
 
 ## License
 

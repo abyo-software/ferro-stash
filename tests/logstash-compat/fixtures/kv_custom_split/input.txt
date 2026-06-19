@@ -1,0 +1,1 @@
+user=alice&city=tokyo&role=admin
