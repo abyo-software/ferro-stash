@@ -1830,4 +1830,128 @@ mod tests {
             "all delivered events must be acked; nothing should replay"
         );
     }
+
+    /// An output that deterministically fails every `fail_every`-th batch (0 =
+    /// never) and records the IDs of events it *does* deliver, for the soak test.
+    #[derive(Debug)]
+    struct FlakyOutput {
+        delivered: Arc<std::sync::Mutex<std::collections::HashSet<i64>>>,
+        attempts: Arc<AtomicUsize>,
+        fail_every: usize,
+        batch_ctr: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl OutputPlugin for FlakyOutput {
+        fn name(&self) -> &str {
+            "flaky"
+        }
+        async fn output(&self, events: Vec<Event>) -> Result<()> {
+            self.attempts.fetch_add(events.len(), Ordering::SeqCst);
+            let n = self.batch_ctr.fetch_add(1, Ordering::SeqCst);
+            if self.fail_every > 0 && n % self.fail_every == 0 {
+                return Err(crate::error::FerroStashError::Pipeline(
+                    "flaky batch failure".to_string(),
+                ));
+            }
+            let mut d = self.delivered.lock().expect("delivered lock");
+            for ev in &events {
+                if let Some(crate::event::EventValue::Integer(id)) = ev.get("id") {
+                    d.insert(*id);
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "soak: PQ at-least-once must lose nothing under repeated failure + restart"]
+    async fn soak_pq_at_least_once_no_loss_under_failure_and_restart() {
+        // Chaos/soak: seed N unique events into a persistent queue, then run many
+        // pipeline passes against a flaky output (fails every 3rd batch, no DLQ).
+        // Each failed batch leaves its entries un-acked, so they replay when the
+        // next pass reopens the queue — simulating crash/restart cycles under
+        // sustained failure. A final reliable pass drains the remainder. The
+        // invariant: EVERY event is delivered at least once (zero loss), and the
+        // failure/replay path was actually exercised (re-attempts > N).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pq_path = dir.path().to_string_lossy().to_string();
+        const N: i64 = 2000;
+        let delivered = Arc::new(std::sync::Mutex::new(std::collections::HashSet::<i64>::new()));
+        let attempts = Arc::new(AtomicUsize::new(0));
+
+        // Seed N unique events into the PQ.
+        {
+            let pq = SharedPersistentQueue::open(PqConfig {
+                path: pq_path.clone(),
+                checkpoint_interval: 1,
+                ..Default::default()
+            })
+            .expect("open seed PQ");
+            for i in 0..N {
+                let mut ev = Event::new(format!("evt-{i}"));
+                ev.set("id", crate::event::EventValue::Integer(i));
+                pq.push(&ev).expect("push");
+            }
+        }
+
+        // One pass: a PQ pipeline (no inputs, auto-exit) draining into `output`.
+        async fn run_pass(pq_path: &str, output: Box<dyn OutputPlugin>) {
+            let config = PipelineConfig {
+                auto_exit_on_inputs_done: true,
+                workers: 2,
+                queue: QueueType::Persisted(PqConfig {
+                    path: pq_path.to_string(),
+                    checkpoint_interval: 1,
+                    ..Default::default()
+                }),
+                ..PipelineConfig::default()
+            };
+            let mut pipeline = Pipeline::new(config);
+            pipeline.add_output(output);
+            let (_ctrl, sig) = ShutdownController::new();
+            tokio::time::timeout(std::time::Duration::from_secs(60), pipeline.run(sig))
+                .await
+                .expect("soak pass must terminate")
+                .expect("pass run ok");
+        }
+
+        // Flaky passes; replayed (failed) events get re-tried each pass.
+        for _ in 0..20 {
+            if delivered.lock().expect("lock").len() as i64 == N {
+                break;
+            }
+            run_pass(
+                &pq_path,
+                Box::new(FlakyOutput {
+                    delivered: Arc::clone(&delivered),
+                    attempts: Arc::clone(&attempts),
+                    fail_every: 3,
+                    batch_ctr: AtomicUsize::new(0),
+                }),
+            )
+            .await;
+        }
+        // Final reliable pass drains anything still un-acked.
+        run_pass(
+            &pq_path,
+            Box::new(FlakyOutput {
+                delivered: Arc::clone(&delivered),
+                attempts: Arc::clone(&attempts),
+                fail_every: 0,
+                batch_ctr: AtomicUsize::new(0),
+            }),
+        )
+        .await;
+
+        let got = delivered.lock().expect("lock").len() as i64;
+        assert_eq!(
+            got, N,
+            "at-least-once must lose nothing under failure+restart: delivered {got}/{N}"
+        );
+        assert!(
+            attempts.load(Ordering::SeqCst) as i64 > N,
+            "failed batches must have been re-attempted across restarts (replay path exercised)"
+        );
+    }
 }
