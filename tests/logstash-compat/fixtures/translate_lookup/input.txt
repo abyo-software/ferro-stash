@@ -1,0 +1,3 @@
+{"code": "404", "path": "/login"}
+{"code": "200", "path": "/home"}
+{"code": "418", "path": "/tea"}

@@ -22,14 +22,19 @@ pub struct TranslateFilter {
 
 impl TranslateFilter {
     pub fn from_config(settings: &serde_json::Value, condition: Option<Condition>) -> Result<Self> {
+        // Logstash 8.x renamed the lookup/output keys to `source`/`target`
+        // (the legacy `field`/`destination` names are still accepted here for
+        // backwards-compat). Modern names win when both are present.
         let field = settings
-            .get("field")
+            .get("source")
+            .or_else(|| settings.get("field"))
             .and_then(|v| v.as_str())
             .unwrap_or("message")
             .to_string();
 
         let destination = settings
-            .get("destination")
+            .get("target")
+            .or_else(|| settings.get("destination"))
             .and_then(|v| v.as_str())
             .unwrap_or("translation")
             .to_string();
@@ -210,6 +215,29 @@ mod tests {
         let event = Event::new("test");
         let result = filter.filter(event).await.expect("filter");
         assert_eq!(result[0].message(), Some("test"));
+    }
+
+    #[tokio::test]
+    async fn test_translate_source_target_keys() {
+        // Logstash 8.x parity: `source`/`target` are honoured (not just the
+        // legacy field/destination), and an inline dictionary resolves.
+        let settings = serde_json::json!({
+            "source": "code",
+            "target": "status",
+            "dictionary": { "200": "OK", "404": "NotFound" },
+            "fallback": "Unknown"
+        });
+        let filter = TranslateFilter::from_config(&settings, None).expect("config");
+        let mut hit = Event::new("test");
+        hit.set("code", EventValue::String("200".into()));
+        let r = filter.filter(hit).await.expect("filter");
+        assert_eq!(r[0].get("status"), Some(&EventValue::String("OK".into())));
+        assert!(r[0].get("translation").is_none()); // legacy default unused
+
+        let mut miss = Event::new("test");
+        miss.set("code", EventValue::String("418".into()));
+        let r = filter.filter(miss).await.expect("filter");
+        assert_eq!(r[0].get("status"), Some(&EventValue::String("Unknown".into())));
     }
 
     #[test]

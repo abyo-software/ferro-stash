@@ -1,0 +1,14 @@
+[
+  {
+    "count": 0,
+    "ratio": 10.0,
+    "active": false,
+    "message": "{\"count\": \"0\", \"ratio\": \"10\", \"active\": \"false\"}"
+  },
+  {
+    "count": 42,
+    "ratio": 3.5,
+    "active": true,
+    "message": "{\"count\": \"42\", \"ratio\": \"3.5\", \"active\": \"true\"}"
+  }
+]

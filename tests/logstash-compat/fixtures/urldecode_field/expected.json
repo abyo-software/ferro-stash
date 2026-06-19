@@ -1,0 +1,7 @@
+[
+  {
+    "q": "name=alice&city=Tōkyō",
+    "id": 1,
+    "message": "{\"q\": \"name%3Dalice%26city%3DT%C5%8Dky%C5%8D\", \"id\": 1}"
+  }
+]
