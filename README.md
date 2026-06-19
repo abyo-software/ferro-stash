@@ -129,7 +129,12 @@ The JRuby custom-logic figure is corroborated across runs (~143–147k); see
 ## Logstash compatibility scope
 
 FerroStash targets the **production-common subset** of Logstash, not its
-full plugin catalogue (200+ community plugins are out of scope). The
+full plugin catalogue. It implements **~63% of the plugins bundled with
+Logstash 9.4.2** (70 / 111) — **codecs 100%, filters 74%, inputs 44%, outputs
+43%** — weighted toward the parse/filter hot path; the long tail of connectors
+(JDBC, AWS SQS/SNS/CloudWatch, `http_poller`, RabbitMQ, …) is the main gap. A
+config that uses a missing plugin **fails fast** at load, so check the full
+**[compatibility matrix](docs/COMPATIBILITY.md)** before migrating. The
 default event shape (`@timestamp`, tags, bracket-notation field
 references `[a][b]`, `%{field}` interpolation) and the `.conf` DSL follow
 Logstash semantics; the docker-driven regression harness asserts
@@ -599,7 +604,7 @@ Data sources → FerroStash → FerroSearch → Applications
 | Area | Docs |
 |---|---|
 | Get started | [Quick start](#quick-start) · [onboarding / build](docs/onboarding.md) · [configuration](#configuration) |
-| Reference | [architecture](docs/ARCHITECTURE.md) · [plugins](#plugins) · [Logstash compatibility](#logstash-compatibility-scope) |
+| Reference | [architecture](docs/ARCHITECTURE.md) · [plugins](#plugins) · [Logstash compatibility scope](#logstash-compatibility-scope) · [compatibility matrix](docs/COMPATIBILITY.md) |
 | Proof & trust | [Performance](#performance) · [parity harness](tests/logstash-compat/) · [benchmarks](bench/) · [honest limitations](#honest-limitations) |
 | Project | [CHANGELOG](CHANGELOG.md) · [release notes](RELEASE_NOTES_1.0.0.md) · [security](docs/SECURITY.md) · [contributing](docs/CONTRIBUTING.md) |
 
