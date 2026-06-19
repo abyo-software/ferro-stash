@@ -1,0 +1,2 @@
+2024-01-15T10:30:00Z,INFO,auth,login successful
+2024-01-15T10:30:01Z,ERROR,payment,charge declined

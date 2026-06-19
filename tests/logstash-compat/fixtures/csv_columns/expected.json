@@ -1,0 +1,16 @@
+[
+  {
+    "service": "auth",
+    "level": "INFO",
+    "ts": "2024-01-15T10:30:00Z",
+    "detail": "login successful",
+    "message": "2024-01-15T10:30:00Z,INFO,auth,login successful"
+  },
+  {
+    "service": "payment",
+    "level": "ERROR",
+    "ts": "2024-01-15T10:30:01Z",
+    "detail": "charge declined",
+    "message": "2024-01-15T10:30:01Z,ERROR,payment,charge declined"
+  }
+]
