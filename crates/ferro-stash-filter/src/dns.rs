@@ -3,7 +3,7 @@
 //!
 //! Forward lookups resolve a hostname field to its A/AAAA address(es); reverse
 //! lookups resolve an IP field to its PTR hostname(s). Resolution uses the
-//! `hickory-resolver` (0.25) async resolver over a Tokio connection provider.
+//! `hickory-resolver` (0.26) async resolver over a Tokio connection provider.
 //!
 //! The resolver is built lazily on first use (so config parsing never requires
 //! a runtime or network) and, once built successfully, reused for the filter's
@@ -42,9 +42,10 @@ use ferro_stash_core::condition::Condition;
 use ferro_stash_core::error::{FerroStashError, Result};
 use ferro_stash_core::event::{Event, EventValue};
 use ferro_stash_core::plugin::FilterPlugin;
+use hickory_resolver::config::{NameServerConfig, ResolverConfig};
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::proto::rr::RData;
 use hickory_resolver::TokioResolver;
-use hickory_resolver::config::{NameServerConfigGroup, ResolverConfig};
-use hickory_resolver::name_server::TokioConnectionProvider;
 use tokio::sync::OnceCell;
 use tracing::warn;
 
@@ -171,14 +172,20 @@ impl DnsFilter {
     /// [`Self::apply_bounded_options`] so no single lookup can exhaust hickory's
     /// default ~10s budget.
     fn build_resolver(&self) -> std::result::Result<TokioResolver, String> {
-        let provider = TokioConnectionProvider::default();
+        let provider = TokioRuntimeProvider::default();
         match self.nameserver {
             Some(ip) => {
-                let group = NameServerConfigGroup::from_ips_clear(&[ip], 53, true);
-                let config = ResolverConfig::from_parts(None, Vec::new(), group);
+                // hickory 0.26: a config is built from a Vec<NameServerConfig>;
+                // `udp_and_tcp` mirrors the previous `from_ips_clear(.., 53, true)`
+                // (port 53, udp+tcp, trust_negative_responses = true).
+                let config = ResolverConfig::from_parts(
+                    None,
+                    Vec::new(),
+                    vec![NameServerConfig::udp_and_tcp(ip)],
+                );
                 let mut builder = TokioResolver::builder_with_config(config, provider);
                 self.apply_bounded_options(builder.options_mut());
-                Ok(builder.build())
+                builder.build().map_err(|e| e.to_string())
             }
             None => self.build_system_resolver(provider),
         }
@@ -186,14 +193,14 @@ impl DnsFilter {
 
     fn build_system_resolver(
         &self,
-        provider: TokioConnectionProvider,
+        provider: TokioRuntimeProvider,
     ) -> std::result::Result<TokioResolver, String> {
         match TokioResolver::builder(provider) {
             Ok(mut builder) => {
                 // Preserve the system-derived options (search domains, ndots,
                 // strategy, …) but clamp the latency-relevant ones.
                 self.apply_bounded_options(builder.options_mut());
-                Ok(builder.build())
+                builder.build().map_err(|e| e.to_string())
             }
             Err(e) => {
                 warn!(error = %e, "dns: failed to read system resolver configuration");
@@ -251,11 +258,16 @@ impl DnsFilter {
         };
         let resolver = self.resolver().await?;
         match tokio::time::timeout(LOOKUP_TIMEOUT, resolver.reverse_lookup(addr)).await {
-            Ok(Ok(lookup)) => lookup.iter().next().map(|ptr| {
-                // PTR derefs to a Name whose Display includes a trailing dot;
-                // strip it for Logstash-style output.
-                ptr.to_string().trim_end_matches('.').to_string()
-            }),
+            // hickory 0.26: `reverse_lookup` returns a plain `Lookup` (no `.iter()`);
+            // pull the first PTR record's name from the answers. The PTR name's
+            // Display includes a trailing dot; strip it for Logstash-style output.
+            Ok(Ok(lookup)) => lookup
+                .answers()
+                .iter()
+                .find_map(|record| match &record.data {
+                    RData::PTR(ptr) => Some(ptr.0.to_string().trim_end_matches('.').to_string()),
+                    _ => None,
+                }),
             Ok(Err(e)) => {
                 warn!(ip = %ip, error = %e, "dns: reverse lookup failed");
                 None
@@ -448,7 +460,12 @@ mod tests {
     fn test_apply_result_replace() {
         let mut event = Event::new("test");
         event.set("host", EventValue::String("example.com".into()));
-        apply_result(&mut event, "host", "1.2.3.4".to_string(), DnsAction::Replace);
+        apply_result(
+            &mut event,
+            "host",
+            "1.2.3.4".to_string(),
+            DnsAction::Replace,
+        );
         assert_eq!(
             event.get("host"),
             Some(&EventValue::String("1.2.3.4".into()))
@@ -525,7 +542,10 @@ mod tests {
         let first = filter.resolver().await.map(std::ptr::from_ref);
         let second = filter.resolver().await.map(std::ptr::from_ref);
         assert!(first.is_some(), "resolver should build");
-        assert_eq!(first, second, "successful build must be memoized, not rebuilt");
+        assert_eq!(
+            first, second,
+            "successful build must be memoized, not rebuilt"
+        );
     }
 
     #[tokio::test]
@@ -542,7 +562,9 @@ mod tests {
         assert!(first.is_err(), "failing init should return the error");
         assert!(cell.get().is_none(), "a failed init must NOT be cached");
         // A subsequent attempt succeeds and is then memoized.
-        let second = cell.get_or_try_init(|| async { Ok::<u32, &'static str>(42) }).await;
+        let second = cell
+            .get_or_try_init(|| async { Ok::<u32, &'static str>(42) })
+            .await;
         assert_eq!(second, Ok(&42), "retry after failure should succeed");
         assert_eq!(cell.get(), Some(&42), "successful init is memoized");
     }
@@ -570,7 +592,10 @@ mod tests {
             result[0].get("host")
         );
         // host field should now hold an IP string.
-        let resolved = result[0].get("host").expect("host present").to_string_lossy();
+        let resolved = result[0]
+            .get("host")
+            .expect("host present")
+            .to_string_lossy();
         assert!(
             resolved.parse::<IpAddr>().is_ok(),
             "resolved value should be an IP: {resolved}"

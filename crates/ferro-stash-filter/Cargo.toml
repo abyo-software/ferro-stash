@@ -34,7 +34,7 @@ hmac = { workspace = true }
 hex = { workspace = true }
 reqwest = { workspace = true }
 maxminddb = "0.28.1"
-hickory-resolver = "0.25.2"
+hickory-resolver = "0.26.1"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

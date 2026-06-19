@@ -116,10 +116,17 @@ jobs:
         with:
           tool: cargo-audit
       - name: Run cargo audit
-        # No active ignores: RUSTSEC-2026-0097 (rand 0.8.5 reseed unsoundness)
-        # was previously ignored but the advisory no longer matches any crate
-        # in the resolved graph (cargo-deny emitted advisory-not-detected).
-        run: cargo audit --deny warnings
+        # Ignores kept in sync with deny.toml [advisories].ignore (see that file
+        # for the full justification). RUSTSEC-2026-0098/0099/0104 are
+        # rustls-webpki 0.101 advisories pulled only via the AWS SDK's legacy TLS
+        # connector (latest aws-smithy-http-client still ships rustls 0.21; no
+        # upstream fix) and are not reachable for S3/STS/SSO endpoint TLS. Revisit
+        # when the AWS SDK's default connector moves to rustls 0.23.
+        run: |
+          cargo audit --deny warnings \
+            --ignore RUSTSEC-2026-0098 \
+            --ignore RUSTSEC-2026-0099 \
+            --ignore RUSTSEC-2026-0104
 
   deny:
     name: Cargo Deny

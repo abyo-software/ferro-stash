@@ -51,6 +51,15 @@ is cut. Pre-1.0 releases may introduce breaking changes between minor tags.
 
 ### Changed
 
+- **Security: bumped `hickory-resolver` 0.25 → 0.26** (dns filter), clearing
+  RUSTSEC-2026-0118 (NSEC3 closest-encloser unbounded loop) and
+  RUSTSEC-2026-0119 (O(n²) name compression). The 0.26 resolver-builder API
+  change is internal to the dns filter. The remaining `rustls-webpki` 0.101
+  advisories (RUSTSEC-2026-0098/0099/0104) come only from the AWS SDK's legacy
+  TLS connector — the latest `aws-smithy-http-client` still ships rustls 0.21
+  and there is no upstream fix; they are not reachable for S3/STS/SSO endpoint
+  TLS, so they are documented and ignored in `deny.toml` / the CI audit step
+  (revisit when the AWS SDK's default connector moves to rustls 0.23).
 - **Persistent queue is now at-least-once, not just a durable buffer.**
   `queue.type: persisted` previously checkpointed the read cursor when an
   event was *dequeued for processing*, so an event read but not yet

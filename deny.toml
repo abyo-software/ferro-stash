@@ -4,7 +4,23 @@ db-path = "~/.cargo/advisory-db"
 # 2026-04-30: dropped RUSTSEC-2026-0097 (rand 0.8.5 reseed unsoundness).
 # cargo-deny emitted advisory-not-detected — the advisory no longer matches
 # any crate in the resolved graph, so the ignore was producing a CI warning.
-ignore = []
+#
+# 2026-06-19: rustls-webpki 0.101.7, pulled transitively via the AWS SDK's
+# default TLS connector (aws-config -> aws-smithy-http-client 1.1.13 ->
+# hyper-rustls 0.24 -> rustls 0.21 -> rustls-webpki 0.101). These are the LATEST
+# AWS SDK releases and they still ship rustls 0.21; there is no upstream fix to
+# upgrade to. A newer rustls-webpki (0.103) is already in the graph via our other
+# TLS users (reqwest), so only the AWS legacy path is affected. The three
+# advisories are not reachable for our use (S3/STS/SSO over TLS to AWS public
+# endpoints): 0098/0099 concern name-constraint validation, which AWS public leaf
+# certs do not exercise, and 0104 is a panic in CRL parsing, and the SDK's TLS
+# path uses no CRLs. Revisit when aws-smithy-http-client's default connector
+# moves to rustls 0.23 (then drop these).
+ignore = [
+    "RUSTSEC-2026-0098", # rustls-webpki name constraints (URI) — AWS legacy TLS only
+    "RUSTSEC-2026-0099", # rustls-webpki name constraints (wildcard) — AWS legacy TLS only
+    "RUSTSEC-2026-0104", # rustls-webpki CRL parse panic — unreachable (no CRLs)
+]
 [licenses]
 confidence-threshold = 0.8
 allow = [
