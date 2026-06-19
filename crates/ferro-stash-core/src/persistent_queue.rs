@@ -217,20 +217,14 @@ impl PersistentQueue {
     /// live writer) and — via [`Self::recompute_total_bytes`] — after
     /// `rotate_segment`/`gc` to keep `total_bytes` authoritative.
     fn calculate_total_size(path: &str) -> u64 {
-        fs::read_dir(path)
-            .map(|entries| {
-                entries
-                    .filter_map(std::result::Result::ok)
-                    .filter(|e| {
-                        let name = e.file_name().to_string_lossy().to_string();
-                        name.starts_with("segment_")
-                            && (name.ends_with(".seg") || name.ends_with(".seg.zst"))
-                    })
-                    .filter_map(|e| e.metadata().ok())
-                    .map(|m| m.len())
-                    .sum()
-            })
-            .unwrap_or(0)
+        // Sum the deduped segment set (one file per index) so a transient
+        // `.seg`+`.seg.zst` pair left by a crash mid-rotation is not double-counted
+        // toward `max_bytes` (which could falsely wedge `enqueue` at "queue full").
+        Self::segment_files(path)
+            .iter()
+            .filter_map(|p| fs::metadata(p).ok())
+            .map(|m| m.len())
+            .sum()
     }
 
     /// Recompute `total_bytes` from the actual on-disk segment files, making it
@@ -417,21 +411,12 @@ impl PersistentQueue {
                 break;
             }
 
-            let data = if seg_path.extension().is_some_and(|e| e == "zst") {
-                // ZSTD compressed
-                let file = File::open(&seg_path)
-                    .map_err(|e| FerroStashError::Pipeline(format!("PQ read error: {e}")))?;
-                let mut decoder = zstd::Decoder::new(file)
-                    .map_err(|e| FerroStashError::Pipeline(format!("PQ zstd decode error: {e}")))?;
-                let mut content = String::new();
-                decoder
-                    .read_to_string(&mut content)
-                    .map_err(|e| FerroStashError::Pipeline(format!("PQ read error: {e}")))?;
-                content
-            } else {
-                fs::read_to_string(&seg_path)
-                    .map_err(|e| FerroStashError::Pipeline(format!("PQ read error: {e}")))?
-            };
+            // Corruption-tolerant read (matches gc/recovery's `read_segment_to_string`):
+            // a segment that fails to decode/read yields empty rather than erroring
+            // the entire dequeue and wedging the drainer. The deduped listing already
+            // prefers the intact `.seg` when both copies exist, so this only matters
+            // for a lone, partially-written `.seg.zst`.
+            let data = Self::read_segment_to_string(&seg_path);
 
             for line in data.lines() {
                 if results.len() >= batch_size {
@@ -556,18 +541,50 @@ impl PersistentQueue {
     }
 
     fn list_segments(&self) -> Result<Vec<PathBuf>> {
-        let entries = fs::read_dir(&self.config.path)
-            .map_err(|e| FerroStashError::Pipeline(format!("PQ list error: {e}")))?;
-        let mut segments: Vec<PathBuf> = entries
-            .filter_map(std::result::Result::ok)
-            .map(|e| e.path())
-            .filter(|p| {
-                p.file_name()
-                    .is_some_and(|n| n.to_string_lossy().starts_with("segment_"))
-            })
-            .collect();
-        segments.sort();
-        Ok(segments)
+        Ok(Self::segment_files(&self.config.path))
+    }
+
+    /// The current segment files, **deduplicated by index** and sorted by index.
+    ///
+    /// When both `segment_N.seg` and `segment_N.seg.zst` exist for the same index
+    /// — a transient state after a crash between writing the compressed `.zst`
+    /// and removing the original `.seg` during compression-rotation — the
+    /// uncompressed `.seg` is preferred: it is the durable original and is
+    /// definitely valid, whereas the `.zst` may be partial/corrupt; gc removes
+    /// the leftover later. Without this dedup, recovery would read both copies
+    /// (`dequeue` could error on the corrupt `.zst` and wedge) and
+    /// `calculate_total_size` would double-count the index toward `max_bytes`.
+    fn segment_files(path: &str) -> Vec<PathBuf> {
+        let Ok(entries) = fs::read_dir(path) else {
+            return Vec::new();
+        };
+        let mut by_index: std::collections::BTreeMap<u64, PathBuf> =
+            std::collections::BTreeMap::new();
+        for entry in entries.filter_map(std::result::Result::ok) {
+            let p = entry.path();
+            let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !name.starts_with("segment_")
+                || !(name.ends_with(".seg") || name.ends_with(".seg.zst"))
+            {
+                continue;
+            }
+            let Some(idx) = Self::parse_segment_index(name) else {
+                continue;
+            };
+            let is_plain = name.ends_with(".seg");
+            // Take this file if there is nothing for the index yet, or if this is
+            // the plain `.seg` replacing a previously-seen compressed `.zst`.
+            let take = match by_index.get(&idx) {
+                None => true,
+                Some(existing) => is_plain && existing.extension().is_some_and(|e| e == "zst"),
+            };
+            if take {
+                by_index.insert(idx, p);
+            }
+        }
+        by_index.into_values().collect()
     }
 
     /// Reclaim fully-consumed segment files.
@@ -2358,5 +2375,46 @@ mod tests {
             "fsync-mode atomic checkpoint must recover ack_seq=6 (4 entries replay)"
         );
         assert!(remaining[0].contains("fsync-6"));
+    }
+
+    #[test]
+    fn test_pq_dedup_prefers_seg_over_corrupt_duplicate_zst() {
+        // DD round-2 regression: a crash mid-compression-rotation can leave both
+        // `segment_N.seg` (the durable original) and a partial `segment_N.seg.zst`
+        // for the same index. Recovery must prefer the intact `.seg` and must NOT
+        // error the whole dequeue on the corrupt `.zst` (which would wedge the
+        // drainer), nor double-count both toward `max_bytes`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_string_lossy().to_string();
+        let config = PqConfig {
+            path: path.clone(),
+            segment_size: 100, // single segment
+            ..Default::default()
+        };
+        {
+            let mut pq = PersistentQueue::open(config.clone()).expect("open");
+            for i in 0..3 {
+                pq.enqueue(&format!(r#"{{"msg":"e{i}"}}"#)).expect("enqueue");
+            }
+            pq.close().expect("close"); // flushes segment_00000001.seg
+        }
+        // Simulate the crash artifact: a CORRUPT `.zst` next to the intact `.seg`.
+        let zst = Path::new(&path).join("segment_00000001.seg.zst");
+        fs::write(&zst, b"this is not a valid zstd stream").expect("write corrupt zst");
+        assert!(
+            Path::new(&path).join("segment_00000001.seg").exists(),
+            "the intact .seg must still be present"
+        );
+
+        // Reopen + dequeue: must read the intact `.seg` (3 entries), ignoring the
+        // corrupt duplicate `.zst` — no error, no wedge.
+        let mut pq = PersistentQueue::open(config).expect("reopen");
+        let batch = pq.dequeue(100).expect("dequeue must not error on corrupt duplicate");
+        assert_eq!(
+            batch.len(),
+            3,
+            "must recover all 3 entries from the intact .seg, ignoring the corrupt .zst"
+        );
+        assert!(batch[0].contains("e0") && batch[2].contains("e2"));
     }
 }
