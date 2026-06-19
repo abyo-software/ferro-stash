@@ -63,6 +63,23 @@ pub struct DatadogOutput {
     client: Client,
 }
 
+/// Map a DataDog `site` shorthand to its Log Intake host, mirroring DataDog's
+/// documented `site` values. Returns `None` for an unrecognized site so the
+/// caller can fail loudly (a silent US1 fall-through on a typo'd site produces a
+/// confusing "API key is invalid" against the wrong region). Accepts both the
+/// short form (`us3`) and the bare domain (`datadoghq.eu`); case-insensitive.
+fn datadog_intake_host(site: &str) -> Option<&'static str> {
+    match site.to_ascii_lowercase().as_str() {
+        "us1" | "datadoghq.com" => Some("http-intake.logs.datadoghq.com"),
+        "us3" | "us3.datadoghq.com" => Some("http-intake.logs.us3.datadoghq.com"),
+        "us5" | "us5.datadoghq.com" => Some("http-intake.logs.us5.datadoghq.com"),
+        "eu" | "eu1" | "datadoghq.eu" => Some("http-intake.logs.datadoghq.eu"),
+        "ap1" | "ap1.datadoghq.com" => Some("http-intake.logs.ap1.datadoghq.com"),
+        "us1-fed" | "gov" | "ddog-gov.com" => Some("http-intake.logs.ddog-gov.com"),
+        _ => None,
+    }
+}
+
 impl DatadogOutput {
     pub fn from_config(settings: &serde_json::Value, condition: Option<Condition>) -> Result<Self> {
         let api_key = settings
@@ -72,9 +89,26 @@ impl DatadogOutput {
                 message: "api_key is required".to_string(),
             })?;
 
-        let host = settings
-            .get_string("host")
-            .unwrap_or_else(|| "http-intake.logs.datadoghq.com".to_string());
+        // Resolve the Log Intake host. An explicit `host` always wins (full
+        // override, e.g. a proxy). Otherwise a friendly `site` shorthand
+        // (us1/us3/us5/eu/ap1/us1-fed) maps to the matching DataDog intake host.
+        // This matters in practice: an account on a non-US1 site (e.g. AP1)
+        // returns "API key is invalid" against the US1 default, so an operator on
+        // another site MUST select it — and a typo'd `site` is a loud config error
+        // rather than a silent fall-through to US1.
+        let host = match (settings.get_string("host"), settings.get_string("site")) {
+            (Some(h), _) => h,
+            (None, Some(site)) => datadog_intake_host(&site)
+                .ok_or_else(|| FerroStashError::Output {
+                    plugin: "datadog".to_string(),
+                    message: format!(
+                        "unknown datadog `site` {site:?}; valid: us1, us3, us5, eu, \
+                         ap1, us1-fed (or set `host` to a full intake host)"
+                    ),
+                })?
+                .to_string(),
+            (None, None) => "http-intake.logs.datadoghq.com".to_string(),
+        };
 
         let codec = settings
             .get_string("codec")
@@ -298,6 +332,44 @@ mod tests {
         assert!(output.config.use_ssl);
         assert_eq!(output.config.source, "ferro-stash");
         assert_eq!(output.name(), "datadog");
+    }
+
+    #[test]
+    fn test_datadog_site_shorthand_maps_to_intake_host() {
+        // `site` maps to the matching intake host (the AP1 case that produced a
+        // real "API key is invalid" against the US1 default).
+        for (site, host) in [
+            ("us1", "http-intake.logs.datadoghq.com"),
+            ("us3", "http-intake.logs.us3.datadoghq.com"),
+            ("us5", "http-intake.logs.us5.datadoghq.com"),
+            ("eu", "http-intake.logs.datadoghq.eu"),
+            ("AP1", "http-intake.logs.ap1.datadoghq.com"), // case-insensitive
+            ("us1-fed", "http-intake.logs.ddog-gov.com"),
+        ] {
+            let settings = serde_json::json!({ "api_key": "k", "site": site });
+            let output = DatadogOutput::from_config(&settings, None)
+                .unwrap_or_else(|e| panic!("site {site}: {e}"));
+            assert_eq!(output.config.host, host, "site {site}");
+        }
+    }
+
+    #[test]
+    fn test_datadog_explicit_host_wins_over_site() {
+        let settings = serde_json::json!({
+            "api_key": "k",
+            "site": "ap1",
+            "host": "my-proxy.internal:8443",
+        });
+        let output = DatadogOutput::from_config(&settings, None).expect("config");
+        assert_eq!(output.config.host, "my-proxy.internal:8443");
+    }
+
+    #[test]
+    fn test_datadog_unknown_site_is_a_loud_error() {
+        let settings = serde_json::json!({ "api_key": "k", "site": "mars" });
+        let err = DatadogOutput::from_config(&settings, None)
+            .expect_err("unknown site must be a config error");
+        assert!(err.to_string().contains("site"), "got: {err}");
     }
 
     #[test]
@@ -631,6 +703,9 @@ mod tests {
         let mut settings = serde_json::json!({ "api_key": api_key });
         if let Ok(host) = std::env::var("DATADOG_HOST") {
             settings["host"] = serde_json::Value::String(host);
+        }
+        if let Ok(site) = std::env::var("DATADOG_SITE") {
+            settings["site"] = serde_json::Value::String(site);
         }
         let output = DatadogOutput::from_config(&settings, None).expect("config");
         let event = Event::new("ferro-stash datadog live smoke test");

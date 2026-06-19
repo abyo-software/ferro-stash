@@ -9,6 +9,11 @@ is cut. Pre-1.0 releases may introduce breaking changes between minor tags.
 
 ### Added
 
+- **DataDog output `site` shorthand** (`us1`/`us3`/`us5`/`eu`/`ap1`/`us1-fed`)
+  maps to the correct Log Intake host, so operators no longer need the full
+  intake hostname. An explicit `host` still wins (proxy override); an unknown
+  `site` is a loud config error (a typo silently defaulting to US1 otherwise
+  yields a confusing "API key is invalid" against the wrong region).
 - **S3 input now supports `endpoint` / `force_path_style`** for S3-compatible
   object stores (MinIO, LocalStack, Ceph, …), matching the S3 output. Previously
   only the output could target non-AWS stores; the input was AWS-only. This also
