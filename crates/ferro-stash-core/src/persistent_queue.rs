@@ -161,6 +161,14 @@ impl PersistentQueue {
         })
     }
 
+    /// Sum the on-disk sizes of every current segment file (`segment_*.seg`
+    /// and `segment_*.seg.zst`) in `path`.
+    ///
+    /// This is the single source of truth for `total_bytes`: a `stat` per file
+    /// (no content read), so it is cheap to call after operations that change
+    /// the on-disk segment set. It is used both on reopen (when there is no
+    /// live writer) and — via [`Self::recompute_total_bytes`] — after
+    /// `rotate_segment`/`gc` to keep `total_bytes` authoritative.
     fn calculate_total_size(path: &str) -> u64 {
         fs::read_dir(path)
             .map(|entries| {
@@ -176,6 +184,36 @@ impl PersistentQueue {
                     .sum()
             })
             .unwrap_or(0)
+    }
+
+    /// Recompute `total_bytes` from the actual on-disk segment files, making it
+    /// authoritative.
+    ///
+    /// Call this after any operation that changes the on-disk segment set
+    /// (`rotate_segment`, which compresses `.seg` → `.seg.zst`, and `gc`, which
+    /// deletes consumed segments). The per-`enqueue` increment is only a
+    /// fast-path estimate between recomputes; recomputing here is what prevents
+    /// accounting drift — most importantly the compression drift where a
+    /// segment is enqueued by its uncompressed size but reclaimed by its
+    /// (smaller) compressed size, leaving the difference stuck in `total_bytes`
+    /// until the next restart. Once that drift reaches `max_bytes`, `enqueue`
+    /// wrongly reports "persistent queue full" and the producer silently falls
+    /// back to the in-memory channel, defeating the PQ's crash-durability
+    /// guarantee (same failure class as the round-23 gc-wiring bug).
+    ///
+    /// The active write segment's `BufWriter` may hold bytes not yet visible to
+    /// `fs::metadata`, so it is flushed first; after the flush the on-disk image
+    /// matches what reopen would see, so [`Self::calculate_total_size`] yields
+    /// the same value reopen computes — `total_bytes == sum of on-disk segment
+    /// sizes`.
+    fn recompute_total_bytes(&mut self) -> Result<()> {
+        if let Some(ref mut writer) = self.current_segment {
+            writer
+                .flush()
+                .map_err(|e| FerroStashError::Pipeline(format!("PQ flush error: {e}")))?;
+        }
+        self.total_bytes = Self::calculate_total_size(&self.config.path);
+        Ok(())
     }
 
     fn recover_segment_state(path: &str) -> (u64, u64) {
@@ -385,6 +423,14 @@ impl PersistentQueue {
             .map_err(|e| FerroStashError::Pipeline(format!("PQ segment create error: {e}")))?;
         self.current_segment = Some(BufWriter::new(file));
 
+        // The on-disk segment set just changed: the rotated segment may have
+        // been compressed (its on-disk size shrank), and a fresh empty active
+        // segment was created. Recompute `total_bytes` from disk so it reflects
+        // real usage and the uncompressed-vs-compressed delta does not drift
+        // upward (see `recompute_total_bytes`). The freshly-opened active
+        // segment is empty, so no BufWriter bytes are lost by recomputing here.
+        self.recompute_total_bytes()?;
+
         Ok(())
     }
 
@@ -437,12 +483,19 @@ impl PersistentQueue {
             // recoverable (see `test_pq_corruption_recovery`) and there may be
             // valid un-read entries we must not lose.
             if self.segment_fully_consumed(&seg_path) {
-                let size = fs::metadata(&seg_path).map(|m| m.len()).unwrap_or(0);
                 let _ = fs::remove_file(&seg_path);
-                self.total_bytes = self.total_bytes.saturating_sub(size);
                 debug!(path = %seg_path.display(), "consumed segment removed");
             }
         }
+        // Recompute `total_bytes` from the surviving on-disk segments rather
+        // than subtracting each deleted file's size. The per-file subtraction
+        // was only ever correct for uncompressed segments; with compression
+        // enabled the enqueue increment (uncompressed) and the delete decrement
+        // (compressed) disagree, so the difference accumulated in `total_bytes`
+        // and eventually wedged `enqueue` at `max_bytes` mid-run. Recomputing
+        // from disk makes `total_bytes` authoritative and closes that drift
+        // class for good (see `recompute_total_bytes`).
+        self.recompute_total_bytes()?;
         Ok(())
     }
 
@@ -1797,5 +1850,101 @@ mod tests {
             corrupted.exists(),
             "conservative policy keeps a corrupt segment even when fully-read (safe)"
         );
+    }
+
+    // ---- Compression accounting-drift regression tests (DD round-25) ----
+
+    /// Sums the actual on-disk sizes of all current `segment_*` files. This is
+    /// the ground truth `total_bytes` must agree with after rotate/gc.
+    fn on_disk_segment_bytes(path: &str) -> u64 {
+        fs::read_dir(path)
+            .map(|entries| {
+                entries
+                    .filter_map(std::result::Result::ok)
+                    .filter(|e| {
+                        let name = e.file_name().to_string_lossy().to_string();
+                        name.starts_with("segment_")
+                            && (name.ends_with(".seg") || name.ends_with(".seg.zst"))
+                    })
+                    .filter_map(|e| e.metadata().ok())
+                    .map(|m| m.len())
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn test_pq_compression_does_not_drift_total_bytes_and_does_not_wedge() {
+        // DD round-25 regression: with COMPRESSION enabled, `enqueue` adds the
+        // UNCOMPRESSED line size to `total_bytes` while `rotate_segment`
+        // compresses the segment on disk. Before the fix, rotate only LOGGED the
+        // savings and gc subtracted only the COMPRESSED size, so every consumed
+        // compressed segment left `(uncompressed - compressed)` stuck in
+        // `total_bytes`. Over a long run that drift reaches `max_bytes` even
+        // though the on-disk segments were reclaimed, and `enqueue` wrongly
+        // returns "persistent queue full" — silently defeating PQ durability
+        // (same class as the round-23 gc-wiring bug).
+        //
+        // The fix recomputes `total_bytes` from the on-disk segment sizes after
+        // rotate/gc, so it stays equal to real disk usage and never wedges.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_string_lossy().to_string();
+        let config = PqConfig {
+            path: path.clone(),
+            segment_size: 4, // small segments => frequent rotation + compression
+            // Small cap: cumulative UNCOMPRESSED throughput will far exceed it,
+            // so the pre-fix drift would wedge `enqueue` well before the loop
+            // ends even though events are being drained and reclaimed.
+            max_bytes: 8_192,
+            compression: PqCompression::Size, // max compression => max drift
+            checkpoint_interval: 1,
+        };
+        let mut pq = PersistentQueue::open(config).expect("open");
+
+        // Highly compressible payload (long run of repeated bytes) so the
+        // uncompressed/compressed gap per segment is large.
+        let pad = "A".repeat(400);
+
+        // Push + drain many events. Cumulative uncompressed bytes (~2000 *
+        // ~430B ≈ 860KB) dwarf the 8KB cap; this only stays under the cap if
+        // reclamation accounting is authoritative.
+        for i in 0..2_000 {
+            pq.enqueue(&format!(r#"{{"msg":"compressible-{i}","pad":"{pad}"}}"#))
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "enqueue {i} wedged at max_bytes despite consumption \
+                         (compression accounting drift): {e}"
+                    )
+                });
+            let _ = pq.dequeue(1).expect("dequeue");
+            if i % 4 == 0 {
+                pq.gc().expect("gc");
+            }
+        }
+
+        // Final drain + gc. The queue is empty; only the (empty) active write
+        // segment should remain on disk.
+        pq.gc().expect("final gc");
+        assert_eq!(pq.pending(), 0, "all events should be consumed");
+
+        let on_disk = on_disk_segment_bytes(&path);
+        assert_eq!(
+            pq.total_bytes(),
+            on_disk,
+            "total_bytes ({}) must equal actual on-disk segment bytes ({on_disk}) after gc",
+            pq.total_bytes()
+        );
+        // After draining everything, the active segment is the fresh empty one
+        // (it never compresses), so total_bytes returns to ~0 — NOT the
+        // cumulative uncompressed-minus-compressed residue.
+        assert!(
+            pq.total_bytes() < 4_096,
+            "total_bytes ({}) must collapse back to ~active-segment size after \
+             draining, not accumulate compression drift",
+            pq.total_bytes()
+        );
+        // And the producer must still be able to enqueue (not wedged).
+        pq.enqueue(r#"{"msg":"post-drain still accepts writes"}"#)
+            .expect("enqueue must still succeed after a long compressed run");
     }
 }
