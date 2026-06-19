@@ -31,6 +31,12 @@ pub struct QueueConfig {
     /// Maximum size in bytes.
     #[serde(default = "default_queue_max_bytes")]
     pub max_bytes: u64,
+    /// `fsync` every append and checkpoint for power-loss durability. Default
+    /// false: without it the queue is durable to a process crash but not a power
+    /// loss / kernel panic (the right trade for most pipelines). Enabling it
+    /// costs a disk sync per append.
+    #[serde(default)]
+    pub fsync: bool,
 }
 
 fn default_queue_type() -> String {
@@ -49,6 +55,7 @@ impl Default for QueueConfig {
             queue_type: default_queue_type(),
             path: default_queue_path(),
             max_bytes: default_queue_max_bytes(),
+            fsync: false,
         }
     }
 }
@@ -65,6 +72,11 @@ pub struct DlqConfigSettings {
     /// Maximum size in bytes.
     #[serde(default = "default_dlq_max_bytes")]
     pub max_bytes: u64,
+    /// `fsync` each captured record for power-loss durability (default false).
+    /// Match this to `queue.fsync` when delivery failures are acked on DLQ
+    /// capture and the host can lose power.
+    #[serde(default)]
+    pub fsync: bool,
 }
 
 fn default_dlq_path() -> String {
@@ -80,6 +92,7 @@ impl Default for DlqConfigSettings {
             enable: false,
             path: default_dlq_path(),
             max_bytes: default_dlq_max_bytes(),
+            fsync: false,
         }
     }
 }

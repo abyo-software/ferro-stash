@@ -36,6 +36,13 @@ pub struct DlqConfig {
     /// Flush interval in events.
     #[serde(default = "default_dlq_flush_interval")]
     pub flush_interval: usize,
+    /// `fsync` each captured record to disk (power-loss durable). Off by default
+    /// (process-crash durable via `flush`). Match this to the persistent queue's
+    /// `fsync` when delivery failures are acked on DLQ capture and the host can
+    /// lose power — otherwise a power loss could drop a DLQ record whose source
+    /// queue entry was already acknowledged.
+    #[serde(default)]
+    pub fsync: bool,
 }
 
 fn default_dlq_max_bytes() -> u64 {
@@ -51,6 +58,7 @@ impl Default for DlqConfig {
             path: "data/dead_letter_queue".to_string(),
             max_bytes: default_dlq_max_bytes(),
             flush_interval: default_dlq_flush_interval(),
+            fsync: false,
         }
     }
 }
@@ -190,6 +198,14 @@ impl DeadLetterQueue {
             writer
                 .flush()
                 .map_err(|e| FerroStashError::Pipeline(format!("DLQ flush error: {e}")))?;
+            // Power-loss durability: fsync the record so `Ok(true)` survives a
+            // power loss, not just a process crash. Gated on `fsync`.
+            if self.config.fsync {
+                writer
+                    .get_ref()
+                    .sync_data()
+                    .map_err(|e| FerroStashError::Pipeline(format!("DLQ fsync error: {e}")))?;
+            }
             return Ok(true);
         }
 

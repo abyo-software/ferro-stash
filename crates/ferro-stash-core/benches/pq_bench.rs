@@ -28,6 +28,7 @@ fn bench_pq_write(c: &mut Criterion) {
             segment_size: 100_000,
             compression: PqCompression::None,
             checkpoint_interval: 10_000,
+            fsync: false,
         };
         let mut pq = PersistentQueue::open(config).expect("open pq");
         let mut i = 0usize;
@@ -46,6 +47,7 @@ fn bench_pq_write(c: &mut Criterion) {
             segment_size: 100_000,
             compression: PqCompression::Speed,
             checkpoint_interval: 10_000,
+            fsync: false,
         };
         let mut pq = PersistentQueue::open(config).expect("open pq");
         let mut i = 0usize;
@@ -75,6 +77,7 @@ fn bench_pq_roundtrip(c: &mut Criterion) {
                 segment_size: 100_000,
                 compression: PqCompression::None,
                 checkpoint_interval: 10_000,
+                fsync: false,
             };
             let mut pq = PersistentQueue::open(config).expect("open pq");
 

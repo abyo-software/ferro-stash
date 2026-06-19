@@ -435,10 +435,14 @@ Data sources → FerroStash → FerroSearch → Applications
     set `pipeline.batch.delay` high enough to keep object sizes reasonable. A
     crash between a successful flush and the checkpoint just re-delivers
     (duplicate), never loses.
-  - **Durability scope: process crash, not power loss.** The PQ checkpoint/
-    segments and the DLQ are flushed to the OS (page cache), not `fsync`'d, so
-    the at-least-once guarantee covers a process crash/restart, not a power
-    loss or kernel panic.
+  - **Durability scope: process crash by default; power loss with `fsync`.**
+    By default the PQ segments/checkpoint and the DLQ are flushed to the OS
+    (page cache), not `fsync`'d — so the at-least-once guarantee covers a
+    process crash/restart but not a power loss / kernel panic. Set
+    `queue.fsync: true` (and `dead_letter_queue.fsync: true`) to fsync every
+    append and an atomic, fsync'd checkpoint (temp→fsync→rename→dir-fsync), at a
+    significant throughput cost (a disk sync per append) — use it when the host
+    can lose power and committed events must survive.
   - **Failure handling.** A failed delivery (or filter error) is acked only
     if it is durably captured in the DLQ; if there is no DLQ, the DLQ is full,
     or the DLQ write fails, the entry is left un-acked and replays. A

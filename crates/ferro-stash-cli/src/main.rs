@@ -223,6 +223,7 @@ fn build_pipeline_internal(
             ferro_stash_core::persistent_queue::PqConfig {
                 path: config.queue.path.clone(),
                 max_bytes: config.queue.max_bytes,
+                fsync: config.queue.fsync,
                 ..ferro_stash_core::persistent_queue::PqConfig::default()
             },
         )
@@ -237,6 +238,7 @@ fn build_pipeline_internal(
             Some(ferro_stash_core::dead_letter_queue::DlqConfig {
                 path: config.dead_letter_queue.path.clone(),
                 max_bytes: config.dead_letter_queue.max_bytes,
+                fsync: config.dead_letter_queue.fsync,
                 ..ferro_stash_core::dead_letter_queue::DlqConfig::default()
             })
         } else {

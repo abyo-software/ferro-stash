@@ -9,6 +9,13 @@ is cut. Pre-1.0 releases may introduce breaking changes between minor tags.
 
 ### Added
 
+- **Opt-in power-loss durability via `fsync`** for the persistent queue and
+  DLQ (`queue.fsync` / `dead_letter_queue.fsync`, default false). When enabled,
+  the PQ fsyncs every segment append, fsyncs the parent directory on segment
+  rotation (durable link), and writes the checkpoint atomically (temp → fsync →
+  rename → dir fsync); the DLQ fsyncs each captured record. Off by default the
+  queue remains durable to a process crash (flush) but not a power loss; on, it
+  survives power loss at a significant throughput cost (a disk sync per append).
 - **DataDog output `site` shorthand** (`us1`/`us3`/`us5`/`eu`/`ap1`/`us1-fed`)
   maps to the correct Log Intake host, so operators no longer need the full
   intake hostname. An explicit `host` still wins (proxy override); an unknown

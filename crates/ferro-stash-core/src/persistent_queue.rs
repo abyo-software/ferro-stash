@@ -70,6 +70,14 @@ pub struct PqConfig {
     /// Checkpoint interval (events).
     #[serde(default = "default_checkpoint_interval")]
     pub checkpoint_interval: usize,
+    /// `fsync` every segment append and every checkpoint to disk (power-loss
+    /// durable). Off by default: a plain `flush` makes the queue durable to a
+    /// *process* crash but not a power loss / kernel panic, which is the right
+    /// trade for most pipelines. Turn it on when the host can lose power and you
+    /// need committed events to survive — at a significant throughput cost
+    /// (a disk sync per append).
+    #[serde(default)]
+    pub fsync: bool,
 }
 
 fn default_max_bytes() -> u64 {
@@ -90,8 +98,22 @@ impl Default for PqConfig {
             segment_size: default_segment_size(),
             compression: PqCompression::None,
             checkpoint_interval: default_checkpoint_interval(),
+            fsync: false,
         }
     }
+}
+
+/// `fsync` a directory so a newly-created or renamed entry within it is durably
+/// linked (POSIX: the file's data being fsync'd does not guarantee its directory
+/// entry survives a power loss until the directory itself is fsync'd). Best
+/// effort — a platform that cannot open a directory as a file simply skips it.
+fn sync_dir(dir: &str) -> Result<()> {
+    if let Ok(handle) = File::open(dir) {
+        handle
+            .sync_all()
+            .map_err(|e| FerroStashError::Pipeline(format!("PQ dir fsync error: {e}")))?;
+    }
+    Ok(())
 }
 
 /// A serialized event in the queue.
@@ -324,6 +346,20 @@ impl PersistentQueue {
             writeln!(writer, "{line}")
                 .map_err(|e| FerroStashError::Pipeline(format!("PQ write error: {e}")))?;
             self.total_bytes += line.len() as u64 + 1;
+            // Power-loss durability: push the append out of the BufWriter and
+            // fsync the segment so the committed event survives a power loss, not
+            // just a process crash. Gated on `fsync` (a disk sync per append is
+            // expensive); `sync_data` (not `sync_all`) skips the inode-metadata
+            // sync since the size is recovered by re-reading the segment.
+            if self.config.fsync {
+                writer
+                    .flush()
+                    .map_err(|e| FerroStashError::Pipeline(format!("PQ flush error: {e}")))?;
+                writer
+                    .get_ref()
+                    .sync_data()
+                    .map_err(|e| FerroStashError::Pipeline(format!("PQ fsync error: {e}")))?;
+            }
         }
 
         self.write_seq += 1;
@@ -479,6 +515,14 @@ impl PersistentQueue {
             .map_err(|e| FerroStashError::Pipeline(format!("PQ segment create error: {e}")))?;
         self.current_segment = Some(BufWriter::new(file));
 
+        // Durably link the freshly-created segment file (its directory entry) so
+        // a power loss right after the first append cannot leave the committed
+        // event in an unlinked file. Only under `fsync` (a dir sync per rotation
+        // is cheap relative to per-append syncs but still pointless otherwise).
+        if self.config.fsync {
+            sync_dir(&self.config.path)?;
+        }
+
         // The on-disk segment set just changed: the rotated segment may have
         // been compressed (its on-disk size shrank), and a fresh empty active
         // segment was created. Recompute `total_bytes` from disk so it reflects
@@ -603,11 +647,34 @@ impl PersistentQueue {
             "segment_index": self.segment_index,
         });
         let path = Path::new(&self.config.path).join("checkpoint.json");
-        fs::write(
-            &path,
-            serde_json::to_string_pretty(&checkpoint).unwrap_or_default(),
-        )
-        .map_err(|e| FerroStashError::Pipeline(format!("checkpoint write error: {e}")))?;
+        let body = serde_json::to_string_pretty(&checkpoint).unwrap_or_default();
+        if self.config.fsync {
+            // Atomic + durable: write a temp file, fsync it, rename over the
+            // checkpoint (atomic on POSIX), then fsync the directory so the
+            // rename itself is durable. A power loss thus leaves either the old or
+            // the new checkpoint — never a torn one — and the survivor is on disk.
+            let tmp = Path::new(&self.config.path).join("checkpoint.json.tmp");
+            {
+                let mut f = OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&tmp)
+                    .map_err(|e| {
+                        FerroStashError::Pipeline(format!("checkpoint tmp open error: {e}"))
+                    })?;
+                f.write_all(body.as_bytes())
+                    .map_err(|e| FerroStashError::Pipeline(format!("checkpoint write error: {e}")))?;
+                f.sync_all()
+                    .map_err(|e| FerroStashError::Pipeline(format!("checkpoint fsync error: {e}")))?;
+            }
+            fs::rename(&tmp, &path)
+                .map_err(|e| FerroStashError::Pipeline(format!("checkpoint rename error: {e}")))?;
+            sync_dir(&self.config.path)?;
+        } else {
+            fs::write(&path, &body)
+                .map_err(|e| FerroStashError::Pipeline(format!("checkpoint write error: {e}")))?;
+        }
         Ok(())
     }
 
@@ -2037,6 +2104,7 @@ mod tests {
             max_bytes: 8_192,
             compression: PqCompression::Size, // max compression => max drift
             checkpoint_interval: 1,
+            fsync: false,
         };
         let mut pq = PersistentQueue::open(config).expect("open");
 
@@ -2225,5 +2293,46 @@ mod tests {
             assert_eq!(ev.message(), Some(format!("e{expected_seq}").as_str()));
         }
         assert!(pq.pop_with_seq().expect("pop").is_none(), "drained");
+    }
+
+    #[test]
+    fn test_pq_fsync_mode_roundtrips_durably() {
+        // With `fsync` enabled, enqueue fsyncs each segment append, and the
+        // checkpoint is written atomically (temp -> fsync -> rename -> dir fsync).
+        // Exercise the whole fsync path and confirm the durable state is correct
+        // across a reopen (unit tests can't cut power, but this proves the fsync
+        // code paths produce a consistent, recoverable queue — no torn checkpoint,
+        // segments readable).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_string_lossy().to_string();
+        let config = PqConfig {
+            path: path.clone(),
+            segment_size: 4, // force rotations (exercises the dir fsync on rotate)
+            checkpoint_interval: 1,
+            fsync: true,
+            ..Default::default()
+        };
+        {
+            let mut pq = PersistentQueue::open(config.clone()).expect("open fsync");
+            for i in 0..10 {
+                pq.enqueue(&format!(r#"{{"msg":"fsync-{i}"}}"#))
+                    .expect("enqueue fsync");
+            }
+            let popped = pq.dequeue(10).expect("dequeue");
+            assert_eq!(popped.len(), 10);
+            // Acknowledge 6; the atomic+fsync checkpoint must persist ack_seq=6.
+            pq.ack(6).expect("ack");
+            pq.close().expect("close");
+        }
+        // Reopen: the durable checkpoint (written via the atomic fsync path) must
+        // be intact, so exactly the 4 un-acked tail entries replay.
+        let mut pq = PersistentQueue::open(config).expect("reopen fsync");
+        let remaining = pq.dequeue(100).expect("dequeue after reopen");
+        assert_eq!(
+            remaining.len(),
+            4,
+            "fsync-mode atomic checkpoint must recover ack_seq=6 (4 entries replay)"
+        );
+        assert!(remaining[0].contains("fsync-6"));
     }
 }
