@@ -9,6 +9,17 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # sccache: cache rustc codegen across jobs/runs/runner-instances so a cold
+  # target (e.g. after the runner's disk-pressure cleanup) or a parallel job on
+  # a different self-hosted instance reuses compiled artifacts instead of
+  # rebuilding from scratch. `CARGO_INCREMENTAL: 0` is REQUIRED — sccache refuses
+  # to cache incrementally-compiled crates, so without it the cache stays empty.
+  # The cache dir is shared+bounded; the runner's ci-disk-guard prunes under
+  # pressure, and SCCACHE_CACHE_SIZE caps it independently.
+  RUSTC_WRAPPER: sccache
+  SCCACHE_DIR: /home/runner/sccache-cache
+  SCCACHE_CACHE_SIZE: 12G
+  CARGO_INCREMENTAL: 0
   # Note: `RUSTFLAGS: -Dwarnings` intentionally NOT set here. It would
   # propagate to path-dep builds (artichoke-extended) which we don't
   # control. Workspace-level strictness is enforced via
