@@ -139,7 +139,8 @@ impl PersistentQueue {
         // in-memory pop cursor `read_seq` is reset to `ack_seq` so any entry that
         // was popped but not durably acknowledged replays on reopen.
         let checkpoint_path = Path::new(&config.path).join("checkpoint.json");
-        let (checkpoint_write_seq, ack_seq, checkpoint_segment_index) = if checkpoint_path.exists() {
+        let (checkpoint_write_seq, ack_seq, checkpoint_segment_index) = if checkpoint_path.exists()
+        {
             let content = fs::read_to_string(&checkpoint_path).unwrap_or_default();
             if let Ok(cp) = serde_json::from_str::<serde_json::Value>(&content) {
                 (
@@ -524,8 +525,8 @@ impl PersistentQueue {
     /// trailing line; a last-line-only check would mis-read that as
     /// fully-consumed and drop the recoverable data, so the scan is mandatory.
     pub fn gc(&mut self) -> Result<()> {
-        let active_segment = Path::new(&self.config.path)
-            .join(format!("segment_{:08}.seg", self.segment_index));
+        let active_segment =
+            Path::new(&self.config.path).join(format!("segment_{:08}.seg", self.segment_index));
         let segments = self.list_segments()?;
         for seg_path in segments {
             // Never reclaim the active (currently-written) segment.
@@ -1449,9 +1450,7 @@ mod tests {
             .map(|entries| {
                 entries
                     .filter_map(std::result::Result::ok)
-                    .filter(|e| {
-                        e.file_name().to_string_lossy().starts_with("segment_")
-                    })
+                    .filter(|e| e.file_name().to_string_lossy().starts_with("segment_"))
                     .count()
             })
             .unwrap_or(0)
@@ -1717,7 +1716,10 @@ mod tests {
             })
             .collect();
         segs.sort();
-        let target = segs.first().cloned().expect("at least one non-active segment");
+        let target = segs
+            .first()
+            .cloned()
+            .expect("at least one non-active segment");
         let mut f = OpenOptions::new()
             .append(true)
             .open(&target)
@@ -2216,7 +2218,10 @@ mod tests {
         }
         for expected_seq in 0..5 {
             let (seq, ev) = pq.pop_with_seq().expect("pop").expect("event");
-            assert_eq!(seq, expected_seq, "sequence must be contiguous and in order");
+            assert_eq!(
+                seq, expected_seq,
+                "sequence must be contiguous and in order"
+            );
             assert_eq!(ev.message(), Some(format!("e{expected_seq}").as_str()));
         }
         assert!(pq.pop_with_seq().expect("pop").is_none(), "drained");

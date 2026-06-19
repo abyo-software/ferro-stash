@@ -287,10 +287,8 @@ impl ElasticsearchOutput {
                     let mut update_body = serde_json::Map::new();
                     update_body.insert("doc".to_string(), event.to_json());
                     if self.doc_as_upsert {
-                        update_body.insert(
-                            "doc_as_upsert".to_string(),
-                            serde_json::Value::Bool(true),
-                        );
+                        update_body
+                            .insert("doc_as_upsert".to_string(), serde_json::Value::Bool(true));
                     }
                     let update_obj = serde_json::Value::Object(update_body);
                     body.push_str(&serde_json::to_string(&update_obj).unwrap_or_default());
@@ -1478,8 +1476,15 @@ mod tests {
 
         // Two lines: action metadata + source. The source line is the 2nd.
         let lines: Vec<&str> = body.lines().collect();
-        assert_eq!(lines.len(), 2, "update emits an action + a source line: {body}");
-        assert!(lines[0].contains(r#""update""#), "action line must be update: {body}");
+        assert_eq!(
+            lines.len(),
+            2,
+            "update emits an action + a source line: {body}"
+        );
+        assert!(
+            lines[0].contains(r#""update""#),
+            "action line must be update: {body}"
+        );
 
         let source: serde_json::Value =
             serde_json::from_str(lines[1]).expect("source line must be valid JSON");
@@ -1525,15 +1530,24 @@ mod tests {
         let body = output.build_bulk_body(&[event]);
 
         let lines: Vec<&str> = body.lines().collect();
-        assert_eq!(lines.len(), 2, "update emits an action + a source line: {body}");
+        assert_eq!(
+            lines.len(),
+            2,
+            "update emits an action + a source line: {body}"
+        );
         let source: serde_json::Value =
             serde_json::from_str(lines[1]).expect("source line must be valid JSON");
         assert!(
-            source.get("doc").and_then(serde_json::Value::as_object).is_some(),
+            source
+                .get("doc")
+                .and_then(serde_json::Value::as_object)
+                .is_some(),
             "update source must still wrap the event under `doc`: {body}"
         );
         assert_eq!(
-            source.get("doc_as_upsert").and_then(serde_json::Value::as_bool),
+            source
+                .get("doc_as_upsert")
+                .and_then(serde_json::Value::as_bool),
             Some(true),
             "doc_as_upsert => true must emit `\"doc_as_upsert\": true`: {body}"
         );
@@ -1579,7 +1593,11 @@ mod tests {
         let output = ElasticsearchOutput::from_config(&settings, None).expect("config");
         let body = output.build_bulk_body(&[Event::new("hello")]);
         let lines: Vec<&str> = body.lines().collect();
-        assert_eq!(lines.len(), 2, "index emits an action + a source line: {body}");
+        assert_eq!(
+            lines.len(),
+            2,
+            "index emits an action + a source line: {body}"
+        );
         let source: serde_json::Value =
             serde_json::from_str(lines[1]).expect("source line must be valid JSON");
         // The raw event (message) is at the top level; there is no `doc` wrapper.

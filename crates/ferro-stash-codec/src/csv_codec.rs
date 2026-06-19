@@ -99,10 +99,7 @@ impl CsvCodec {
         faithful.unwrap_or_else(|| {
             // Fallback: join fields with the configured separator.
             let sep = String::from_utf8_lossy(&[self.separator]).into_owned();
-            record
-                .iter()
-                .collect::<Vec<_>>()
-                .join(&sep)
+            record.iter().collect::<Vec<_>>().join(&sep)
         })
     }
 }
@@ -269,9 +266,7 @@ mod tests {
             columns: vec!["name".into(), "age".into()],
             ..Default::default()
         };
-        let events = codec
-            .decode(b"Alice,30\nBob,25\nCarol,40")
-            .expect("decode");
+        let events = codec.decode(b"Alice,30\nBob,25\nCarol,40").expect("decode");
         assert_eq!(events.len(), 3, "expected one event per record");
 
         assert_eq!(
@@ -299,9 +294,7 @@ mod tests {
             ..Default::default()
         };
         // Second field contains a comma, so it was quoted on input.
-        let events = codec
-            .decode(b"plain,\"has,comma\"")
-            .expect("decode");
+        let events = codec.decode(b"plain,\"has,comma\"").expect("decode");
         assert_eq!(events.len(), 1);
         assert_eq!(
             events[0].get("a"),

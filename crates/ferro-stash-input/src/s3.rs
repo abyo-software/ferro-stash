@@ -160,13 +160,8 @@ impl S3Input {
 
         match (&self.config.access_key_id, &self.config.secret_access_key) {
             (Some(ak), Some(sk)) => {
-                let creds = Credentials::new(
-                    ak.clone(),
-                    sk.clone(),
-                    None,
-                    None,
-                    "ferro-stash-s3-input",
-                );
+                let creds =
+                    Credentials::new(ak.clone(), sk.clone(), None, None, "ferro-stash-s3-input");
                 let conf = aws_sdk_s3::config::Builder::new()
                     .region(region)
                     .credentials_provider(creds)
@@ -413,9 +408,10 @@ impl S3Input {
             // Stamp S3 metadata into the event's metadata struct so it is
             // available in-pipeline as `[@metadata][s3]` but never serialized to
             // the output by `Event::to_json`.
-            event
-                .metadata
-                .set("s3".to_string(), s3_metadata(&self.config.bucket, Some(key)));
+            event.metadata.set(
+                "s3".to_string(),
+                s3_metadata(&self.config.bucket, Some(key)),
+            );
             if sender.send(event).await.is_err() {
                 return FetchResult::ChannelClosed;
             }
@@ -456,11 +452,7 @@ impl S3Input {
     /// here must never cause re-emission (the key is already recorded in `seen`
     /// before this is called). The SDK error is rendered with
     /// [`DisplayErrorContext`] for the full source chain.
-    async fn delete_object(
-        &self,
-        client: &Client,
-        key: &str,
-    ) -> std::result::Result<(), String> {
+    async fn delete_object(&self, client: &Client, key: &str) -> std::result::Result<(), String> {
         client
             .delete_object()
             .bucket(&self.config.bucket)
@@ -484,7 +476,10 @@ fn s3_metadata(bucket: &str, key: Option<&str>) -> EventValue {
         serde_json::Value::String(bucket.to_string()),
     );
     if let Some(key) = key {
-        obj.insert("key".to_string(), serde_json::Value::String(key.to_string()));
+        obj.insert(
+            "key".to_string(),
+            serde_json::Value::String(key.to_string()),
+        );
     }
     EventValue::from(serde_json::Value::Object(obj))
 }
@@ -793,7 +788,10 @@ mod tests {
         if !(key.ends_with('/') || seen.contains(&key)) {
             re_emitted += 1;
         }
-        assert_eq!(re_emitted, 0, "oversized-and-seen object must not be retried");
+        assert_eq!(
+            re_emitted, 0,
+            "oversized-and-seen object must not be retried"
+        );
     }
 
     #[test]

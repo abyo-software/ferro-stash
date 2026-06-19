@@ -812,10 +812,7 @@ mod tests {
         let attack: Vec<u8> = std::iter::repeat(b'{').take(32).collect();
         let err = codec.decode(&attack).expect_err("32 `{` must reject");
         let msg = format!("{err}");
-        assert!(
-            msg.contains("container-open"),
-            "unexpected error: {msg}"
-        );
+        assert!(msg.contains("container-open"), "unexpected error: {msg}");
     }
 
     /// Consecutive-run cap closes boundary-learning: even if total opens
@@ -900,7 +897,8 @@ mod tests {
         let attack: Vec<u8> = b"{{{{{{X\xff5\t{\x9f\n\xc4\xc4}{{{{{{{{{{{\
                                 \xf5\x9f\n\xaf\xfd\x00\x00\x9f\n\xaf\xfd\
                                 \x00\x00\x00\x00\x01{{k{{X5\t{\xff\x9f\n\
-                                \xc4\xc4}{{{{{{".to_vec();
+                                \xc4\xc4}{{{{{{"
+            .to_vec();
         let start = std::time::Instant::now();
         let err = codec
             .decode(&attack)
@@ -998,6 +996,9 @@ mod tests {
         // Legitimate string key with map value still parses.
         let legit = r#"{"k" {:nested true}}"#;
         let ok = codec.decode(legit.as_bytes());
-        assert!(ok.is_ok(), "string key with map value must parse (got {ok:?})");
+        assert!(
+            ok.is_ok(),
+            "string key with map value must parse (got {ok:?})"
+        );
     }
 }

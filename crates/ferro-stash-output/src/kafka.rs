@@ -190,10 +190,7 @@ impl KafkaOutput {
                         "compression.type",
                         self.config.compression_type.rdkafka_value(),
                     )
-                    .set(
-                        "message.send.max.retries",
-                        self.config.retries.to_string(),
-                    )
+                    .set("message.send.max.retries", self.config.retries.to_string())
                     // `batch_size` mirrors librdkafka's batch.size (bytes).
                     .set("batch.size", self.config.batch_size.to_string());
 
@@ -208,10 +205,12 @@ impl KafkaOutput {
 
     /// Serialize an event to bytes via the configured codec.
     fn encode(&self, event: &Event) -> Result<Vec<u8>> {
-        self.codec.encode(event).map_err(|e| FerroStashError::Output {
-            plugin: "kafka".to_string(),
-            message: format!("codec encode error: {e}"),
-        })
+        self.codec
+            .encode(event)
+            .map_err(|e| FerroStashError::Output {
+                plugin: "kafka".to_string(),
+                message: format!("codec encode error: {e}"),
+            })
     }
 
     /// Resolve the partition key for an event from the configured field reference.
@@ -453,7 +452,10 @@ mod tests {
             "codec": { "_plugin": "json", "pretty": true },
         });
         let output = KafkaOutput::from_config(&settings, None).expect("config");
-        assert_eq!(output.config.codec, "json", "descriptor codec name resolved");
+        assert_eq!(
+            output.config.codec, "json",
+            "descriptor codec name resolved"
+        );
 
         // The built codec serializes as JSON (descriptor honored end-to-end).
         let bytes = output.encode(&Event::new("hi")).expect("encode");
@@ -535,7 +537,10 @@ mod tests {
         assert_eq!(records.len(), 5, "every record must be attempted");
         for (i, (payload, key)) in records.iter().enumerate() {
             let text = String::from_utf8_lossy(payload);
-            assert!(text.contains(&format!("msg-{i}")), "record {i} body: {text}");
+            assert!(
+                text.contains(&format!("msg-{i}")),
+                "record {i} body: {text}"
+            );
             assert_eq!(key.as_deref(), Some(format!("user-{i}").as_str()));
         }
     }

@@ -370,7 +370,10 @@ impl NetflowCodec {
                 Some(n) => n,
                 None => return,
             };
-            if offset.checked_add(needed).is_none_or(|end| end > data.len()) {
+            if offset
+                .checked_add(needed)
+                .is_none_or(|end| end > data.len())
+            {
                 // Field defs run past the end of the buffer — the declared
                 // count is untrustworthy. Do not allocate; stop parsing.
                 tracing::warn!(
@@ -840,10 +843,7 @@ mod tests {
         );
         codec.decode(&over_cap).expect("decode");
         let templates = codec.templates.lock().expect("lock");
-        assert!(
-            !templates.contains_key(&402),
-            "over-cap template rejected"
-        );
+        assert!(!templates.contains_key(&402), "over-cap template rejected");
     }
 
     /// FINDING 1 (b): the persistent template cache must not grow past
@@ -917,6 +917,9 @@ mod tests {
             Some(&EventValue::String("10.0.0.2".into()))
         );
         // Each event still reports the header's claimed count.
-        assert_eq!(events[0].get("flow_count"), Some(&EventValue::Integer(65535)));
+        assert_eq!(
+            events[0].get("flow_count"),
+            Some(&EventValue::Integer(65535))
+        );
     }
 }

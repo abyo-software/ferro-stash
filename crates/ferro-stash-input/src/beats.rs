@@ -305,8 +305,8 @@ async fn handle_beats_connection(
                 // produce; if the limit is hit we cannot trust the stream and
                 // drop the connection. We read one byte past the cap to detect
                 // overrun (a fully-consumed cap-sized stream is ambiguous).
-                let mut decoder =
-                    flate2::read::ZlibDecoder::new(&compressed[..]).take(MAX_DECOMPRESSED_BYTES as u64 + 1);
+                let mut decoder = flate2::read::ZlibDecoder::new(&compressed[..])
+                    .take(MAX_DECOMPRESSED_BYTES as u64 + 1);
                 let mut decompressed = Vec::new();
                 decoder
                     .read_to_end(&mut decompressed)
@@ -705,8 +705,7 @@ mod tests {
         );
 
         // Mirror the C-frame decode: decoder.take(cap + 1).read_to_end(...).
-        let mut decoder =
-            flate2::read::ZlibDecoder::new(&compressed[..]).take(test_cap as u64 + 1);
+        let mut decoder = flate2::read::ZlibDecoder::new(&compressed[..]).take(test_cap as u64 + 1);
         let mut decompressed = Vec::new();
         decoder.read_to_end(&mut decompressed).expect("decode");
 

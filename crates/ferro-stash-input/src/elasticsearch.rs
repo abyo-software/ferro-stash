@@ -760,10 +760,7 @@ impl InputPlugin for ElasticsearchInput {
         // degenerate schedule (e.g. "0" or "*/0 * * * *") cannot pass a zero
         // `Duration` to `tokio::time::interval`, which would PANIC the task on
         // its first tick. (DD round-6 Finding #2.)
-        let interval_secs = self
-            .schedule
-            .as_deref()
-            .map_or(300, schedule_interval_secs);
+        let interval_secs = self.schedule.as_deref().map_or(300, schedule_interval_secs);
 
         let mut timer = tokio::time::interval(Duration::from_secs(interval_secs));
 
@@ -928,7 +925,7 @@ mod tests {
         assert_eq!(schedule_interval_secs("*/5 * * * *"), 300); // 5 minutes
         assert_eq!(schedule_interval_secs("30"), 30); // 30 seconds
         assert_eq!(schedule_interval_secs("*/1 * * * *"), 60); // 1 minute
-        // Unparseable falls back to the 5-minute default.
+                                                               // Unparseable falls back to the 5-minute default.
         assert_eq!(schedule_interval_secs("not-a-schedule"), 300);
     }
 
@@ -948,8 +945,9 @@ mod tests {
         // interval is a config error, not a first-tick panic.
         for sched in ["0", "*/0 * * * *", "*/0"] {
             let settings = serde_json::json!({ "schedule": sched });
-            let err = ElasticsearchInput::from_config(&settings)
-                .expect_err(&format!("schedule {sched:?} must be rejected at config time"));
+            let err = ElasticsearchInput::from_config(&settings).expect_err(&format!(
+                "schedule {sched:?} must be rejected at config time"
+            ));
             assert!(
                 matches!(err, FerroStashError::Input { ref plugin, .. } if plugin == "elasticsearch"),
                 "expected elasticsearch Input error for {sched:?}, got: {err:?}"
@@ -1347,8 +1345,8 @@ mod tests {
     /// Binding first (like the sibling `spawn_mock_es`) avoids starving the
     /// current-thread test runtime — a blocking `recv()` for the address would
     /// never let the spawned server run.
-    async fn spawn_mock_es_pit_then_search_error()
-    -> (String, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    async fn spawn_mock_es_pit_then_search_error(
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicBool>) {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
         let pit_closed = Arc::new(AtomicBool::new(false));
@@ -1378,7 +1376,10 @@ mod tests {
                     {
                         // The close we are asserting on.
                         pit_closed_conn.store(true, Ordering::SeqCst);
-                        ("HTTP/1.1 200 OK", r#"{"succeeded":true,"num_freed":1}"#.to_string())
+                        (
+                            "HTTP/1.1 200 OK",
+                            r#"{"succeeded":true,"num_freed":1}"#.to_string(),
+                        )
                     } else if request_line.contains("/_pit") {
                         // PIT open: hand back a real id so the search runs in PIT mode.
                         ("HTTP/1.1 200 OK", r#"{"id":"pit-abc123"}"#.to_string())
@@ -1508,8 +1509,7 @@ mod tests {
         // never-delivered document permanently (data loss).
         let hits = tracking_hits(5);
         let failed_at = 3usize; // ts-0,ts-1,ts-2 succeed; ts-3 send fails
-        let cursor =
-            simulate_cursor_advance(&hits, Some("@timestamp"), |i| i < failed_at);
+        let cursor = simulate_cursor_advance(&hits, Some("@timestamp"), |i| i < failed_at);
         assert_eq!(
             cursor.as_deref(),
             Some("ts-2"),
@@ -1589,15 +1589,14 @@ mod tests {
                     };
                     let req = String::from_utf8_lossy(&buf[..n]);
                     let request_line = req.lines().next().unwrap_or("");
-                    let (status_line, resp_body) = if request_line.starts_with("DELETE")
-                        && request_line.contains("/_pit")
-                    {
-                        ("HTTP/1.1 200 OK", r#"{"succeeded":true}"#.to_string())
-                    } else if request_line.contains("/_pit") {
-                        ("HTTP/1.1 200 OK", r#"{"id":"pit-track-1"}"#.to_string())
-                    } else {
-                        ("HTTP/1.1 200 OK", body)
-                    };
+                    let (status_line, resp_body) =
+                        if request_line.starts_with("DELETE") && request_line.contains("/_pit") {
+                            ("HTTP/1.1 200 OK", r#"{"succeeded":true}"#.to_string())
+                        } else if request_line.contains("/_pit") {
+                            ("HTTP/1.1 200 OK", r#"{"id":"pit-track-1"}"#.to_string())
+                        } else {
+                            ("HTTP/1.1 200 OK", body)
+                        };
                     let response = format!(
                         "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
                         resp_body.len()

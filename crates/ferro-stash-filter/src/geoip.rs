@@ -27,8 +27,8 @@ use ferro_stash_core::event::{Event, EventValue};
 use ferro_stash_core::plugin::FilterPlugin;
 
 use indexmap::IndexMap;
-use maxminddb::Reader;
 use maxminddb::geoip2;
+use maxminddb::Reader;
 use tracing::warn;
 
 #[derive(Debug)]
@@ -157,7 +157,10 @@ impl GeoipFilter {
 
         // City
         if let Some(name) = city.city.names.english {
-            out.insert("city_name".to_string(), EventValue::String(name.to_string()));
+            out.insert(
+                "city_name".to_string(),
+                EventValue::String(name.to_string()),
+            );
         }
 
         // Subdivisions (region) — Logstash exposes the first (largest) subdivision

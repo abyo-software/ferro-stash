@@ -174,7 +174,10 @@ impl RedisInput {
     fn open_client(&self) -> Result<redis::Client> {
         redis::Client::open(self.connection_info()).map_err(|e| FerroStashError::Input {
             plugin: "redis".to_string(),
-            message: format!("failed to open Redis client {}:{}: {e}", self.config.host, self.config.port),
+            message: format!(
+                "failed to open Redis client {}:{}: {e}",
+                self.config.host, self.config.port
+            ),
         })
     }
 
@@ -197,9 +200,7 @@ impl RedisInput {
             // Stamp Redis metadata into the event's metadata struct so it is
             // available in-pipeline as `[@metadata][redis]` but never serialized
             // to the output by `Event::to_json`.
-            event
-                .metadata
-                .set("redis".to_string(), redis_metadata(key));
+            event.metadata.set("redis".to_string(), redis_metadata(key));
             if sender.send(event).await.is_err() {
                 return false;
             }

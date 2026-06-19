@@ -185,7 +185,10 @@ impl KafkaInput {
         cc.set("bootstrap.servers", self.config.bootstrap_servers.join(","))
             .set("group.id", &self.config.group_id)
             .set("client.id", &self.config.client_id)
-            .set("auto.offset.reset", self.config.auto_offset_reset.to_string())
+            .set(
+                "auto.offset.reset",
+                self.config.auto_offset_reset.to_string(),
+            )
             .set("enable.auto.commit", "true")
             .set("enable.partition.eof", "false");
         cc
@@ -292,19 +295,23 @@ impl InputPlugin for KafkaInput {
         // --- Real Kafka consumer (rdkafka StreamConsumer) ---
         let codec = self.build_codec()?;
 
-        let consumer: StreamConsumer = self.build_client_config().create().map_err(|e| {
-            FerroStashError::Input {
-                plugin: "kafka".to_string(),
-                message: format!("failed to create Kafka consumer: {e}"),
-            }
-        })?;
+        let consumer: StreamConsumer =
+            self.build_client_config()
+                .create()
+                .map_err(|e| FerroStashError::Input {
+                    plugin: "kafka".to_string(),
+                    message: format!("failed to create Kafka consumer: {e}"),
+                })?;
 
         let topic_refs: Vec<&str> = self.config.topics.iter().map(String::as_str).collect();
         consumer
             .subscribe(&topic_refs)
             .map_err(|e| FerroStashError::Input {
                 plugin: "kafka".to_string(),
-                message: format!("failed to subscribe to topics {:?}: {e}", self.config.topics),
+                message: format!(
+                    "failed to subscribe to topics {:?}: {e}",
+                    self.config.topics
+                ),
             })?;
 
         info!(topics = ?self.config.topics, "Kafka consumer subscribed");
@@ -428,10 +435,7 @@ mod tests {
             "bootstrap_servers": ["b1:9092", "b2:9092"]
         });
         let input = KafkaInput::from_config(&settings).expect("config");
-        assert_eq!(
-            input.config.bootstrap_servers,
-            vec!["b1:9092", "b2:9092"]
-        );
+        assert_eq!(input.config.bootstrap_servers, vec!["b1:9092", "b2:9092"]);
     }
 
     #[test]
@@ -519,23 +523,22 @@ mod tests {
         // Drive `emit_payload` directly to assert real-path metadata placement.
         let codec = create_codec("plain", &serde_json::json!({})).expect("codec");
         let (tx, mut rx) = mpsc::channel(10);
-        let ok = KafkaInput::emit_payload(
-            codec.as_ref(),
-            &tx,
-            b"hi",
-            "my-topic",
-            3,
-            42,
-        )
-        .await;
+        let ok = KafkaInput::emit_payload(codec.as_ref(), &tx, b"hi", "my-topic", 3, 42).await;
         assert!(ok);
         let event = rx.recv().await.expect("event");
         // Output JSON has no @metadata.
-        assert!(!event.to_json().as_object().expect("obj").contains_key("@metadata"));
+        assert!(!event
+            .to_json()
+            .as_object()
+            .expect("obj")
+            .contains_key("@metadata"));
         // Metadata struct carries topic/partition/offset.
         let kafka = event.metadata.get("kafka").expect("kafka metadata");
         let map = kafka.as_object().expect("object");
-        assert_eq!(map.get("topic"), Some(&EventValue::String("my-topic".into())));
+        assert_eq!(
+            map.get("topic"),
+            Some(&EventValue::String("my-topic".into()))
+        );
         assert_eq!(map.get("partition"), Some(&EventValue::Integer(3)));
         assert_eq!(map.get("offset"), Some(&EventValue::Integer(42)));
     }

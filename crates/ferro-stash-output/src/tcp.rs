@@ -154,7 +154,10 @@ mod tests {
         let err = TcpOutput::from_config(&settings, None)
             .expect_err("out-of-range port must be rejected");
         let msg = format!("{err}");
-        assert!(msg.contains("70000"), "error should mention the bad port: {msg}");
+        assert!(
+            msg.contains("70000"),
+            "error should mention the bad port: {msg}"
+        );
     }
 
     #[test]

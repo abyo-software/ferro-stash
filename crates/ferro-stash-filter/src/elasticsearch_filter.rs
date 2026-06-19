@@ -172,12 +172,13 @@ impl ElasticsearchFilter {
         let query_template = if query_template_str.trim().is_empty() {
             default_match_all()
         } else {
-            let parsed = serde_json::from_str::<serde_json::Value>(query_template_str).map_err(
-                |e| FerroStashError::Filter {
-                    plugin: "elasticsearch".to_string(),
-                    message: format!("invalid query_template JSON: {e}"),
-                },
-            )?;
+            let parsed =
+                serde_json::from_str::<serde_json::Value>(query_template_str).map_err(|e| {
+                    FerroStashError::Filter {
+                        plugin: "elasticsearch".to_string(),
+                        message: format!("invalid query_template JSON: {e}"),
+                    }
+                })?;
             // The template must be a JSON object (an ES `_search` body); a
             // bare scalar/array cannot carry a query and would be a config
             // mistake we should not paper over with `match_all`.
@@ -301,10 +302,7 @@ impl ElasticsearchFilter {
     /// Execute a real `_search` against Elasticsearch, returning the
     /// `hits.hits[]._source` documents. Tries each host in order; returns
     /// `None` on total failure (all hosts errored / non-2xx / over-limit body).
-    async fn execute_query(
-        &self,
-        event: &Event,
-    ) -> Option<Vec<IndexMap<String, EventValue>>> {
+    async fn execute_query(&self, event: &Event) -> Option<Vec<IndexMap<String, EventValue>>> {
         self.execute_query_capped(event, MAX_RESPONSE_BYTES).await
     }
 
@@ -511,10 +509,7 @@ impl FilterPlugin for ElasticsearchFilter {
                         results.into_iter().map(EventValue::Object).collect();
 
                     let value = if result_values.len() == 1 {
-                        result_values
-                            .into_iter()
-                            .next()
-                            .unwrap_or(EventValue::Null)
+                        result_values.into_iter().next().unwrap_or(EventValue::Null)
                     } else {
                         EventValue::Array(result_values)
                     };
@@ -565,7 +560,8 @@ mod tests {
         // defaults are injected.
         let body = filter.build_search_body(&event);
         assert_eq!(
-            body.pointer("/term/user").and_then(serde_json::Value::as_str),
+            body.pointer("/term/user")
+                .and_then(serde_json::Value::as_str),
             Some("bob")
         );
         // No raw `%{...}` placeholder leaks into the serialized body.
@@ -595,10 +591,7 @@ mod tests {
         let err = ElasticsearchFilter::from_config(&settings, None)
             .expect_err("empty hosts must be a config error");
         let msg = err.to_string();
-        assert!(
-            msg.contains("hosts"),
-            "error should mention hosts: {msg}"
-        );
+        assert!(msg.contains("hosts"), "error should mention hosts: {msg}");
 
         // An array of only non-strings collapses to zero hosts after filtering.
         let settings = serde_json::json!({ "hosts": [123, true, null] });
@@ -632,19 +625,28 @@ mod tests {
         let settings = serde_json::json!({ "hosts": "   " });
         let err = ElasticsearchFilter::from_config(&settings, None)
             .expect_err("whitespace-only scalar host must be a config error");
-        assert!(err.to_string().contains("hosts"), "error should mention hosts");
+        assert!(
+            err.to_string().contains("hosts"),
+            "error should mention hosts"
+        );
 
         // `hosts => ""` (scalar, empty)
         let settings = serde_json::json!({ "hosts": "" });
         let err = ElasticsearchFilter::from_config(&settings, None)
             .expect_err("empty scalar host must be a config error");
-        assert!(err.to_string().contains("hosts"), "error should mention hosts");
+        assert!(
+            err.to_string().contains("hosts"),
+            "error should mention hosts"
+        );
 
         // A mix of blank and whitespace-only array entries also collapses to zero.
         let settings = serde_json::json!({ "hosts": ["", "  ", "\t"] });
         let err = ElasticsearchFilter::from_config(&settings, None)
             .expect_err("array of only blank hosts must be a config error");
-        assert!(err.to_string().contains("hosts"), "error should mention hosts");
+        assert!(
+            err.to_string().contains("hosts"),
+            "error should mention hosts"
+        );
     }
 
     /// A usable host alongside blank entries survives: blanks are dropped, the
@@ -673,7 +675,10 @@ mod tests {
         let filter = ElasticsearchFilter::from_config(&settings, None).expect("config");
         let body = filter.build_search_body(&Event::new("test"));
         assert!(body.get("query").and_then(|q| q.get("match_all")).is_some());
-        assert_eq!(body.get("size").and_then(serde_json::Value::as_u64), Some(5));
+        assert_eq!(
+            body.get("size").and_then(serde_json::Value::as_u64),
+            Some(5)
+        );
     }
 
     #[test]
@@ -689,7 +694,10 @@ mod tests {
             Some("bob")
         );
         // size injected from default result_size (1)
-        assert_eq!(body.get("size").and_then(serde_json::Value::as_u64), Some(1));
+        assert_eq!(
+            body.get("size").and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
     }
 
     // ----- Injection-safety regression tests -----
@@ -744,10 +752,7 @@ mod tests {
         });
         let filter = ElasticsearchFilter::from_config(&settings, None).expect("config");
         let mut event = Event::new("test");
-        event.set(
-            "payload",
-            EventValue::String("a{b}c\\d\ne".into()),
-        );
+        event.set("payload", EventValue::String("a{b}c\\d\ne".into()));
         let body = filter.build_search_body(&event);
         assert_eq!(
             body.pointer("/query/match/raw")
@@ -756,8 +761,7 @@ mod tests {
         );
         // Round-trips through serialization unbroken.
         let serialized = serde_json::to_string(&body).expect("serialize");
-        let reparsed: serde_json::Value =
-            serde_json::from_str(&serialized).expect("valid JSON");
+        let reparsed: serde_json::Value = serde_json::from_str(&serialized).expect("valid JSON");
         assert_eq!(
             reparsed
                 .pointer("/query/match/raw")
@@ -1166,8 +1170,7 @@ mod tests {
     /// the configured `term` structure, and contains NO injected `match_all`.
     #[tokio::test]
     async fn test_injection_payload_escaped_on_the_wire() {
-        let (host, rx) =
-            spawn_mock_es_capture(r#"{"hits":{"hits":[{"_source":{"ok":true}}]}}"#);
+        let (host, rx) = spawn_mock_es_capture(r#"{"hits":{"hits":[{"_source":{"ok":true}}]}}"#);
         let settings = serde_json::json!({
             "hosts": [host],
             "index": "users",
@@ -1201,9 +1204,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_elasticsearch_real_search_field_mapping() {
-        let host = spawn_mock_es(
-            r#"{"hits":{"hits":[{"_source":{"name":"Alice","role":"admin"}}]}}"#,
-        );
+        let host =
+            spawn_mock_es(r#"{"hits":{"hits":[{"_source":{"name":"Alice","role":"admin"}}]}}"#);
         let settings = serde_json::json!({
             "hosts": [host],
             "index": "users",
@@ -1234,7 +1236,10 @@ mod tests {
         if let Some(EventValue::Object(obj)) = result[0].get("es_result") {
             assert_eq!(obj.get("city"), Some(&EventValue::String("Paris".into())));
         } else {
-            panic!("expected es_result object: {:?}", result[0].get("es_result"));
+            panic!(
+                "expected es_result object: {:?}",
+                result[0].get("es_result")
+            );
         }
     }
 

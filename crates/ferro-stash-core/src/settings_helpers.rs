@@ -109,14 +109,23 @@ mod tests {
     #[test]
     fn get_port_absent_uses_default() {
         assert_eq!(serde_json::json!({}).get_port("port", 6379), Ok(6379));
-        assert_eq!(serde_json::json!({"port": null}).get_port("port", 6379), Ok(6379));
+        assert_eq!(
+            serde_json::json!({"port": null}).get_port("port", 6379),
+            Ok(6379)
+        );
     }
 
     #[test]
     fn get_port_valid_in_range() {
-        assert_eq!(serde_json::json!({"port": 9200}).get_port("port", 1), Ok(9200));
+        assert_eq!(
+            serde_json::json!({"port": 9200}).get_port("port", 1),
+            Ok(9200)
+        );
         // Logstash DSL string form.
-        assert_eq!(serde_json::json!({"port": "6390"}).get_port("port", 1), Ok(6390));
+        assert_eq!(
+            serde_json::json!({"port": "6390"}).get_port("port", 1),
+            Ok(6390)
+        );
     }
 
     #[test]
@@ -138,7 +147,9 @@ mod tests {
     fn get_u32_absent_default_valid_and_overflow() {
         assert_eq!(serde_json::json!({}).get_u32("db", 0), Ok(0));
         assert_eq!(serde_json::json!({"db": 5}).get_u32("db", 0), Ok(5));
-        assert!(serde_json::json!({"db": 4_294_967_296u64}).get_u32("db", 0).is_err());
+        assert!(serde_json::json!({"db": 4_294_967_296u64})
+            .get_u32("db", 0)
+            .is_err());
         assert!(serde_json::json!({"db": "x"}).get_u32("db", 0).is_err());
     }
 

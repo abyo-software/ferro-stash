@@ -227,10 +227,12 @@ impl RedisOutput {
 
     /// Serialize an event to bytes via the configured codec.
     fn encode(&self, event: &Event) -> Result<Vec<u8>> {
-        self.codec.encode(event).map_err(|e| FerroStashError::Output {
-            plugin: "redis".to_string(),
-            message: format!("codec encode error: {e}"),
-        })
+        self.codec
+            .encode(event)
+            .map_err(|e| FerroStashError::Output {
+                plugin: "redis".to_string(),
+                message: format!("codec encode error: {e}"),
+            })
     }
 }
 
@@ -365,7 +367,10 @@ mod tests {
         let err = RedisOutput::from_config(&settings, None)
             .expect_err("out-of-range port must be rejected");
         let msg = format!("{err}");
-        assert!(msg.contains("70000"), "error should mention the bad port: {msg}");
+        assert!(
+            msg.contains("70000"),
+            "error should mention the bad port: {msg}"
+        );
     }
 
     #[test]
@@ -377,7 +382,10 @@ mod tests {
         let err = RedisOutput::from_config(&settings, None)
             .expect_err("out-of-range db must be rejected");
         let msg = format!("{err}");
-        assert!(msg.contains("db"), "error should mention the db setting: {msg}");
+        assert!(
+            msg.contains("db"),
+            "error should mention the db setting: {msg}"
+        );
     }
 
     #[test]
@@ -397,7 +405,10 @@ mod tests {
             "codec": { "_plugin": "plain" },
         });
         let output = RedisOutput::from_config(&settings, None).expect("config");
-        assert_eq!(output.config.codec, "plain", "descriptor codec name resolved");
+        assert_eq!(
+            output.config.codec, "plain",
+            "descriptor codec name resolved"
+        );
 
         // The built codec serializes as plain text (no JSON keys), proving the
         // descriptor form was honored end-to-end rather than defaulting to json.
@@ -428,9 +439,15 @@ mod tests {
             !config_dbg.contains("super-secret-pw"),
             "config Debug leaked the password: {config_dbg}"
         );
-        assert!(config_dbg.contains("***"), "config Debug must mark redaction");
+        assert!(
+            config_dbg.contains("***"),
+            "config Debug must mark redaction"
+        );
         // Non-secret fields are still visible for diagnostics.
-        assert!(config_dbg.contains("redis.prod"), "host should remain visible");
+        assert!(
+            config_dbg.contains("redis.prod"),
+            "host should remain visible"
+        );
 
         // The wrapper's Debug (which prints the config) must also not leak it.
         let output_dbg = format!("{output:?}");
@@ -470,9 +487,10 @@ mod tests {
             .parse::<redis::ConnectionInfo>()
             .expect("valid REDIS_URL");
         let (host, port) = match info.addr {
-            redis::ConnectionAddr::Tcp(h, p) | redis::ConnectionAddr::TcpTls { host: h, port: p, .. } => {
-                (h, p)
-            }
+            redis::ConnectionAddr::Tcp(h, p)
+            | redis::ConnectionAddr::TcpTls {
+                host: h, port: p, ..
+            } => (h, p),
             redis::ConnectionAddr::Unix(_) => panic!("unix sockets not supported by this test"),
         };
         let mut settings = serde_json::json!({

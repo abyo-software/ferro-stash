@@ -1362,7 +1362,10 @@ mod tests {
         let (controller, signal) = ShutdownController::new();
         controller.shutdown();
         let result = pipeline.run(signal).await;
-        assert!(result.is_ok(), "zero buffer_size must not panic the pipeline");
+        assert!(
+            result.is_ok(),
+            "zero buffer_size must not panic the pipeline"
+        );
     }
 
     #[tokio::test]
@@ -1406,7 +1409,10 @@ mod tests {
         while rx.recv().await.is_some() {
             received += 1;
         }
-        assert_eq!(received, 25, "drainer must forward every PQ event before exit");
+        assert_eq!(
+            received, 25,
+            "drainer must forward every PQ event before exit"
+        );
     }
 
     #[tokio::test]
@@ -1440,11 +1446,8 @@ mod tests {
         let (_controller, signal) = ShutdownController::new();
         // No shutdown is triggered: termination must come solely from inputs-done
         // + drainer drain-then-exit, NOT from an external shutdown signal.
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(15),
-            pipeline.run(signal),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(15), pipeline.run(signal)).await;
 
         let run_result = result.expect("auto-exit + PQ pipeline must terminate without shutdown");
         assert!(run_result.is_ok(), "pipeline run should succeed");
@@ -1548,7 +1551,8 @@ mod tests {
             }
             let (_controller, signal) = ShutdownController::new();
             let result =
-                tokio::time::timeout(std::time::Duration::from_secs(15), pipeline.run(signal)).await;
+                tokio::time::timeout(std::time::Duration::from_secs(15), pipeline.run(signal))
+                    .await;
             assert!(
                 result.expect("pipeline must terminate").is_ok(),
                 "pipeline run should succeed"

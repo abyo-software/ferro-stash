@@ -527,8 +527,10 @@ mod tests {
         let joined = received.join("\n");
         for (msg, id) in [("alpha", "1"), ("bravo", "2"), ("charlie", "3")] {
             assert!(
-                received.iter().any(|b| b.contains(&format!("message={msg}"))
-                    && b.contains(&format!("id={id}"))),
+                received
+                    .iter()
+                    .any(|b| b.contains(&format!("message={msg}"))
+                        && b.contains(&format!("id={id}"))),
                 "expected a form body containing message={msg} and id={id}; got: {joined}"
             );
         }

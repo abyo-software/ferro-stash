@@ -416,7 +416,8 @@ mod tests {
 
         // The event-derived timestamp must win, not the user's 1999 string.
         assert_eq!(
-            parsed[0]["timestamp"], event.timestamp.to_rfc3339(),
+            parsed[0]["timestamp"],
+            event.timestamp.to_rfc3339(),
             "event timestamp must win over a user `timestamp` field"
         );
         assert_ne!(parsed[0]["timestamp"], "1999-01-01T00:00:00Z");
@@ -445,7 +446,10 @@ mod tests {
             !config_dbg.contains("super-secret-key"),
             "config Debug leaked the api_key: {config_dbg}"
         );
-        assert!(config_dbg.contains("***"), "config Debug must mark redaction");
+        assert!(
+            config_dbg.contains("***"),
+            "config Debug must mark redaction"
+        );
         // Non-secret fields stay visible for diagnostics.
         assert!(
             config_dbg.contains("intake.example.com"),
@@ -498,7 +502,11 @@ mod tests {
     /// captured-api-key).
     async fn spawn_mock_intake(
         status: StatusCode,
-    ) -> (String, Arc<AtomicUsize>, Arc<std::sync::Mutex<Option<String>>>) {
+    ) -> (
+        String,
+        Arc<AtomicUsize>,
+        Arc<std::sync::Mutex<Option<String>>>,
+    ) {
         let requests = Arc::new(AtomicUsize::new(0));
         let api_key = Arc::new(std::sync::Mutex::new(None));
         let req_handle = Arc::clone(&requests);

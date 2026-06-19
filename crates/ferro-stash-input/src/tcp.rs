@@ -65,7 +65,7 @@ where
         match available.iter().position(|&b| b == b'\n') {
             Some(idx) => {
                 let take = idx + 1; // include the '\n'
-                // Adding this chunk-up-to-newline must not exceed the cap.
+                                    // Adding this chunk-up-to-newline must not exceed the cap.
                 if buf.len() + take > cap {
                     reader.consume(take);
                     return Ok(LineRead::Overflow);

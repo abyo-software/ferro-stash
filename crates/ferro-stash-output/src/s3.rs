@@ -125,8 +125,8 @@ impl S3Output {
         let access_key_id = settings.get_string("access_key_id");
         let secret_access_key = settings.get_string("secret_access_key");
         let time_file = settings.get_u64("time_file").unwrap_or(900); // 15 min default
-        // Resolve the codec name from both DSL forms so the recorded name matches
-        // the codec that is actually built below.
+                                                                      // Resolve the codec name from both DSL forms so the recorded name matches
+                                                                      // the codec that is actually built below.
         let (codec, _) = resolve_codec(settings, "plain");
         let encoding = settings
             .get_string("encoding")
@@ -260,11 +260,7 @@ impl S3Output {
 
         // Gzip-encoded objects get a `.gz` suffix and content metadata.
         let (object_key, content_encoding, content_type) = if self.config.encoding == "gzip" {
-            (
-                format!("{key}.gz"),
-                Some("gzip"),
-                "application/gzip",
-            )
+            (format!("{key}.gz"), Some("gzip"), "application/gzip")
         } else {
             (key.to_string(), None, "text/plain")
         };
@@ -615,7 +611,10 @@ mod tests {
             !config_dbg.contains("super-secret-sak"),
             "config Debug leaked the secret_access_key: {config_dbg}"
         );
-        assert!(config_dbg.contains("***"), "config Debug must mark redaction");
+        assert!(
+            config_dbg.contains("***"),
+            "config Debug must mark redaction"
+        );
         // Non-secret fields stay visible for diagnostics.
         assert!(config_dbg.contains("prod"), "bucket should remain visible");
 
@@ -749,7 +748,10 @@ mod tests {
         assert_eq!(objects.len(), 1, "expected one PutObject");
         let (path, enc, body) = &objects[0];
         assert!(path.starts_with("test-bucket/logs/"), "path was {path}");
-        assert!(enc.is_none(), "plain encoding should set no content-encoding");
+        assert!(
+            enc.is_none(),
+            "plain encoding should set no content-encoding"
+        );
         assert!(String::from_utf8_lossy(body).contains("flush-me"));
     }
 
@@ -780,7 +782,10 @@ mod tests {
         let objects = captured.lock().expect("lock");
         assert_eq!(objects.len(), 1);
         let (path, enc, body) = &objects[0];
-        assert!(path.ends_with(".gz"), "gzip key should end with .gz: {path}");
+        assert!(
+            path.ends_with(".gz"),
+            "gzip key should end with .gz: {path}"
+        );
         assert_eq!(enc.as_deref(), Some("gzip"));
         assert_eq!(&body[..2], &[0x1f, 0x8b], "body should be gzip-compressed");
     }
@@ -839,7 +844,10 @@ mod tests {
             result.is_ok(),
             "rotation upload failure must be swallowed (events retained for retry), not surfaced as Err"
         );
-        assert!(attempts.load(Ordering::SeqCst) >= 1, "PutObject was attempted");
+        assert!(
+            attempts.load(Ordering::SeqCst) >= 1,
+            "PutObject was attempted"
+        );
 
         // The event is preserved in the buffer (not lost) and bytes are restored.
         let buf = output.buffer.lock().expect("lock");
@@ -873,24 +881,22 @@ mod tests {
         let fail_handle = Arc::clone(&fail);
         let app = Router::new().route(
             "/:bucket/*key",
-            put(
-                move |_p: Path<(String, String)>, body: Bytes| {
-                    let cap_handle = Arc::clone(&cap_handle);
-                    let att_handle = Arc::clone(&att_handle);
-                    let fail_handle = Arc::clone(&fail_handle);
-                    async move {
-                        att_handle.fetch_add(1, Ordering::SeqCst);
-                        if fail_handle.load(Ordering::SeqCst) {
-                            (StatusCode::INTERNAL_SERVER_ERROR, "boom")
-                        } else {
-                            if let Ok(mut g) = cap_handle.lock() {
-                                g.push(body.to_vec());
-                            }
-                            (StatusCode::OK, "ok")
+            put(move |_p: Path<(String, String)>, body: Bytes| {
+                let cap_handle = Arc::clone(&cap_handle);
+                let att_handle = Arc::clone(&att_handle);
+                let fail_handle = Arc::clone(&fail_handle);
+                async move {
+                    att_handle.fetch_add(1, Ordering::SeqCst);
+                    if fail_handle.load(Ordering::SeqCst) {
+                        (StatusCode::INTERNAL_SERVER_ERROR, "boom")
+                    } else {
+                        if let Ok(mut g) = cap_handle.lock() {
+                            g.push(body.to_vec());
                         }
+                        (StatusCode::OK, "ok")
                     }
-                },
-            ),
+                }
+            }),
         );
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
@@ -974,7 +980,10 @@ mod tests {
             .await
             .expect("buffer only");
         let result = output.flush().await;
-        assert!(result.is_err(), "flush upload failure must surface an error");
+        assert!(
+            result.is_err(),
+            "flush upload failure must surface an error"
+        );
 
         let buf = output.buffer.lock().expect("lock");
         assert_eq!(buf.len(), 1, "flush failure must retain the event");
@@ -1105,7 +1114,10 @@ mod tests {
             "codec": { "_plugin": "json" },
         });
         let output = S3Output::from_config(&settings, None).expect("config");
-        assert_eq!(output.config.codec, "json", "descriptor codec name resolved");
+        assert_eq!(
+            output.config.codec, "json",
+            "descriptor codec name resolved"
+        );
 
         output
             .output(vec![Event::new("desc-line")])
@@ -1169,10 +1181,7 @@ mod tests {
         expected.push(b'\n');
         expected.extend_from_slice(&enc2);
 
-        output
-            .output(vec![event1, event2])
-            .await
-            .expect("output");
+        output.output(vec![event1, event2]).await.expect("output");
         output.flush().await.expect("flush");
 
         let objects = captured.lock().expect("lock");

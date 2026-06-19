@@ -121,8 +121,9 @@ mod bounded_snippet_tests {
     #[tokio::test]
     async fn stream_reader_stops_after_limit() {
         // A stream of many 1 KiB chunks; only ~limit+1 bytes should be read.
-        let chunks: Vec<Result<bytes::Bytes, std::convert::Infallible>> =
-            (0..10_000).map(|_| Ok(bytes::Bytes::from(vec![b'x'; 1024]))).collect();
+        let chunks: Vec<Result<bytes::Bytes, std::convert::Infallible>> = (0..10_000)
+            .map(|_| Ok(bytes::Bytes::from(vec![b'x'; 1024])))
+            .collect();
         let stream = tokio_stream::iter(chunks);
         let s = super::read_bounded_body_stream(stream, 512).await;
         // Output is the bounded snippet (512 bytes + marker), never the ~10 MB.
@@ -145,14 +146,17 @@ mod bounded_snippet_tests {
             Ok::<_, std::convert::Infallible>(bytes::Bytes::from_static(b"{\"hits\":")),
             Ok(bytes::Bytes::from_static(b"[]}")),
         ]);
-        let body = super::read_capped_body(stream, 1024).await.expect("within limit");
+        let body = super::read_capped_body(stream, 1024)
+            .await
+            .expect("within limit");
         assert_eq!(body, b"{\"hits\":[]}");
     }
 
     #[tokio::test]
     async fn capped_body_over_limit_errors() {
-        let chunks: Vec<Result<bytes::Bytes, std::convert::Infallible>> =
-            (0..1000).map(|_| Ok(bytes::Bytes::from(vec![b'x'; 1024]))).collect();
+        let chunks: Vec<Result<bytes::Bytes, std::convert::Infallible>> = (0..1000)
+            .map(|_| Ok(bytes::Bytes::from(vec![b'x'; 1024])))
+            .collect();
         let stream = tokio_stream::iter(chunks);
         assert!(super::read_capped_body(stream, 4096).await.is_err());
     }
