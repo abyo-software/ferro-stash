@@ -25,6 +25,10 @@ set -euo pipefail
 LINES="${1:-5000000}"
 RUNS="${2:-5}"
 WORKERS="${3:-$(nproc)}"
+# The ruby(mruby) custom filter is ~100x slower than the native path, so the
+# custom group uses a smaller line count (still >> startup for steady-state)
+# to keep wall time sane. Override with CUSTOM_LINES.
+CUSTOM_LINES="${CUSTOM_LINES:-500000}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 PD="${BENCH_DIR:-/tmp/ferro-bench}"
@@ -36,7 +40,7 @@ mkdir -p "$PD"
 
 [ -x "$FS" ] || { echo "FerroStash binary not found: $FS (build: cargo build --release -p ferro-stash --features ruby)"; exit 1; }
 
-gen() { local fmt="$1"; local f="$PD/input_$fmt.log"; [ -f "$f" ] || python3 "$HERE/gen_input.py" "$LINES" --format "$fmt" > "$f"; echo "$f"; }
+gen() { local fmt="$1" n="$2"; local f="$PD/input_${fmt}_${n}.log"; [ -f "$f" ] || python3 "$HERE/gen_input.py" "$n" --format "$fmt" > "$f"; echo "$f"; }
 one_line() { local fmt="$1"; local f="$PD/oneline_$fmt.log"; [ -f "$f" ] || python3 "$HERE/gen_input.py" 1 --format "$fmt" > "$f"; echo "$f"; }
 
 # wall_seconds <logfile-of-time-v>
@@ -61,10 +65,10 @@ fail_row() { # label rc
   echo "  FAILED $1 (rc=$2):"; grep -iE 'error|caused by' "$LOG" 2>/dev/null | head -3
 }
 
-measure() { # label engine conf fmt  -> appends a row to $RESULTS
-  local label="$1" engine="$2" conf="$3" fmt="$4"
+measure() { # label engine conf fmt [lines]  -> appends a row to $RESULTS
+  local label="$1" engine="$2" conf="$3" fmt="$4" n="${5:-$LINES}"
   [ "$engine" = ls ] && [ -z "$LS_HOME" ] && { echo "  skip $label (LS_HOME unset)"; return; }
-  local input; input="$(gen "$fmt")"
+  local input; input="$(gen "$fmt" "$n")"
   # Cold-start: a 1-line run. A non-zero exit here means the config/engine is
   # broken — record FAILED, never a throughput number.
   LOG=$(mktemp); run_once "$engine" "$conf" "$(one_line "$fmt")"
@@ -77,7 +81,7 @@ measure() { # label engine conf fmt  -> appends a row to $RESULTS
     if [ "$r" -gt 0 ]; then secs+=("$(wall_s "$LOG")"); rss+=("$(rss_kb "$LOG")"); fi
     rm -f "$LOG"
   done
-  python3 - "$label" "$LINES" "$start" "${secs[*]}" "${rss[*]}" >> "$RESULTS" <<'PY'
+  python3 - "$label" "$n" "$start" "${secs[*]}" "${rss[*]}" >> "$RESULTS" <<'PY'
 import sys, statistics
 label, lines, start = sys.argv[1], int(sys.argv[2]), float(sys.argv[3])
 secs = [float(x) for x in sys.argv[4].split()]
@@ -100,7 +104,7 @@ PY
 
 echo "FerroStash: $("$FS" --version 2>/dev/null | head -1)"
 [ -n "$LS_HOME" ] && echo "Logstash:   $("$LS_HOME/bin/logstash" --version 2>/dev/null | tail -1)" || echo "Logstash:   (LS_HOME unset — FerroStash-only run)"
-echo "lines=$LINES runs=$RUNS workers=$WORKERS host=$(uname -m) cores=$(nproc)"
+echo "lines=$LINES (custom=$CUSTOM_LINES) runs=$RUNS workers=$WORKERS host=$(uname -m) cores=$(nproc)"
 echo
 
 RESULTS="$PD/results.md"
@@ -115,9 +119,9 @@ for f in grok dissect json kv csv; do
 done
 measure "FS native(grok+mutate)" fs "$CONF/native.fs.conf" accesslog
 measure "LS native(grok+mutate)" ls "$CONF/native.ls.conf" accesslog
-measure "FS custom: script(JIT)" fs "$CONF/custom_script.fs.conf" accesslog
-measure "FS custom: ruby(mruby)" fs "$CONF/custom_ruby.fs.conf"   accesslog
-measure "LS custom: ruby(JRuby)" ls "$CONF/custom_ruby.ls.conf"   accesslog
+measure "FS custom: script(JIT)" fs "$CONF/custom_script.fs.conf" accesslog "$CUSTOM_LINES"
+measure "FS custom: ruby(mruby)" fs "$CONF/custom_ruby.fs.conf"   accesslog "$CUSTOM_LINES"
+measure "LS custom: ruby(JRuby)" ls "$CONF/custom_ruby.ls.conf"   accesslog "$CUSTOM_LINES"
 
 echo; echo "================ RESULTS ================"; cat "$RESULTS"
 echo; echo "(saved to $RESULTS)"

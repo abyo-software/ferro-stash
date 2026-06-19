@@ -49,8 +49,10 @@ eval "$(./bench/setup_logstash.sh 8.17.0)"   # sets LS_HOME
 LS_HOME="$LS_HOME" ./bench/run_bench.sh 5000000 5 "$(nproc)"
 ```
 
-Without `LS_HOME` set, only the FerroStash side runs (useful for FS-only
-regression checks). Results are printed and saved to
+The slow `ruby` (mruby) custom filter uses a smaller line count than the native
+workloads so wall time stays sane — override with `CUSTOM_LINES` (default
+500,000). Without `LS_HOME` set, only the FerroStash side runs (useful for
+FS-only regression checks). Results are printed and saved to
 `$BENCH_DIR/results.md` (default `/tmp/ferro-bench/results.md`).
 
 ## Honesty notes
