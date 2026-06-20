@@ -33,12 +33,26 @@ enum Algorithm {
     Murmur3,
 }
 
-#[derive(Debug)]
 pub struct AnonymizeFilter {
     fields: Vec<String>,
     algorithm: Algorithm,
     key: Option<String>,
     condition: Option<Condition>,
+}
+
+// Manual `Debug` so the HMAC `key` is never rendered in plaintext: a leaked key
+// lets an attacker recompute the HMAC and de-anonymize low-entropy fields. The
+// presence (Some/None) is preserved for diagnostics, but the value is masked —
+// mirroring the redacting Debug impls on the credential-bearing connectors.
+impl std::fmt::Debug for AnonymizeFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AnonymizeFilter")
+            .field("fields", &self.fields)
+            .field("algorithm", &self.algorithm)
+            .field("key", &self.key.as_ref().map(|_| "***"))
+            .field("condition", &self.condition)
+            .finish()
+    }
 }
 
 impl AnonymizeFilter {
@@ -242,6 +256,17 @@ mod tests {
     fn test_anonymize_requires_fields() {
         assert!(AnonymizeFilter::from_config(&serde_json::json!({}), None).is_err());
         assert!(AnonymizeFilter::from_config(&serde_json::json!({ "fields": [] }), None).is_err());
+    }
+
+    #[test]
+    fn debug_redacts_key() {
+        let f = mk(serde_json::json!({ "fields": ["a"], "key": "super-secret-hmac" }));
+        let dbg = format!("{f:?}");
+        assert!(!dbg.contains("super-secret-hmac"), "key leaked: {dbg}");
+        assert!(dbg.contains("***"), "expected masked key: {dbg}");
+        // absent key renders as None, not "***"
+        let f2 = mk(serde_json::json!({ "fields": ["a"] }));
+        assert!(format!("{f2:?}").contains("key: None"));
     }
 
     #[test]
