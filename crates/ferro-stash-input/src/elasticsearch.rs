@@ -243,7 +243,7 @@ impl ElasticsearchInput {
             )
             .await;
         if let Err(e) = close_req.send().await {
-            debug!(error = %e, "failed to close PIT (non-fatal)");
+            debug!(error = %e.without_url(), "failed to close PIT (non-fatal)");
         }
     }
 
@@ -300,7 +300,7 @@ impl ElasticsearchInput {
                 }
             }
             Err(e) => {
-                warn!(error = %e, "failed to open PIT, falling back to plain search");
+                warn!(error = %e.without_url(), "failed to open PIT, falling back to plain search");
                 None
             }
         };
@@ -379,7 +379,7 @@ impl ElasticsearchInput {
 
                 let response = req.send().await.map_err(|e| FerroStashError::Input {
                     plugin: "elasticsearch".to_string(),
-                    message: format!("search error: {e}"),
+                    message: format!("search error: {}", e.without_url()),
                 })?;
 
                 // An ES error response (401/403/404/429/5xx) is still valid JSON
@@ -559,7 +559,7 @@ impl ElasticsearchInput {
 
         let response = req.send().await.map_err(|e| FerroStashError::Input {
             plugin: "elasticsearch".to_string(),
-            message: format!("ES|QL error: {e}"),
+            message: format!("ES|QL error: {}", e.without_url()),
         })?;
 
         // Same hazard as `run_search`: an ES error response is valid JSON with

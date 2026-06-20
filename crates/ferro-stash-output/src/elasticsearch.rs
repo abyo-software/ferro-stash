@@ -623,6 +623,9 @@ impl ElasticsearchOutput {
                     }
                 }
                 Err(e) => {
+                    // without_url(): the reqwest error renders the host URL,
+                    // which can embed an api_key query param.
+                    let e = e.without_url();
                     warn!(error = %e, attempt, "bulk request error");
                     last_err = Some(e.to_string());
                     continue;

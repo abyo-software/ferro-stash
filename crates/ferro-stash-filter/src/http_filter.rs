@@ -210,7 +210,9 @@ impl FilterPlugin for HttpFilter {
         let response = match request.send().await {
             Ok(resp) => resp,
             Err(e) => {
-                warn!(url = %safe_url, error = %e, "http filter: request failed");
+                // `e.without_url()`: a reqwest error renders the request URL on
+                // Display, which re-leaks the secret query params `safe_url` masks.
+                warn!(url = %safe_url, error = %e.without_url(), "http filter: request failed");
                 event.add_tag(&self.tag_on_failure);
                 return Ok(vec![event]);
             }

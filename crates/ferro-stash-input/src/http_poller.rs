@@ -260,7 +260,8 @@ impl InputPlugin for HttpPollerInput {
                     }
                     Err(e) => {
                         // Redact: spec.url can carry userinfo / a signed query param.
-                        warn!(name = %spec.name, url = %ferro_stash_core::redact_url(&spec.url), error = %e, "http_poller request failed")
+                        // `e.without_url()`: the reqwest error also renders the URL.
+                        warn!(name = %spec.name, url = %ferro_stash_core::redact_url(&spec.url), error = %e.without_url(), "http_poller request failed")
                     }
                 }
             }

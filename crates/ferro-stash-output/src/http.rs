@@ -165,7 +165,8 @@ impl HttpOutput {
             let response = match request.body(body.to_string()).send().await {
                 Ok(response) => response,
                 Err(e) => {
-                    last_error = Some(format!("request failed: {e}"));
+                    // without_url(): the reqwest error renders the endpoint URL.
+                    last_error = Some(format!("request failed: {}", e.without_url()));
                     if attempt < self.retry_count {
                         continue;
                     }

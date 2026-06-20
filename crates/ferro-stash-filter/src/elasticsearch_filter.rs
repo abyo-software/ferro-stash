@@ -347,7 +347,7 @@ impl ElasticsearchFilter {
             let response = match request.send().await {
                 Ok(resp) => resp,
                 Err(e) => {
-                    warn!(url = %safe_url, error = %e, "elasticsearch filter: request failed, trying next host");
+                    warn!(url = %safe_url, error = %e.without_url(), "elasticsearch filter: request failed, trying next host");
                     continue;
                 }
             };
