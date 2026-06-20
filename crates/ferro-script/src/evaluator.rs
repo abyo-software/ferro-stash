@@ -26,6 +26,15 @@ use serde_json;
 use crate::parser::{self, BinOp, Expr, Stmt, UnaryOp};
 use crate::types::ScriptValue;
 
+/// Cap on the byte size of a string produced by `replace()`. `replace("", big)`
+/// (or a short `from` with a long `to`) is multiplicative in the two
+/// event-controlled lengths and can OOM the process — an allocator abort is NOT
+/// contained by the script filter's `catch_unwind`.
+const MAX_STR_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+/// Cap on the element count produced by `split()`. `split("")` emits one element
+/// per character and amplifies event size in allocations.
+const MAX_SPLIT_PARTS: usize = 1_048_576;
+
 /// Execution context for a script, providing access to document fields,
 /// source, and user-supplied parameters.
 pub struct ScriptContext {
@@ -716,6 +725,21 @@ fn eval_method(
             if let (Some(ScriptValue::Str(from)), Some(ScriptValue::Str(to))) =
                 (args.first(), args.get(1))
             {
+                // Reject before allocating: an empty/short `from` with a long
+                // `to` makes the output ~ count·to.len() (n×m in two event
+                // sizes), which can OOM the process.
+                let count = if from.is_empty() {
+                    s.chars().count() + 1
+                } else {
+                    s.matches(from.as_str()).count()
+                };
+                let projected =
+                    (s.len() as i128) + (count as i128) * (to.len() as i128 - from.len() as i128);
+                if projected > MAX_STR_OUTPUT_BYTES as i128 {
+                    return Err(FerroError::QueryParseError(
+                        "replace() output exceeds size limit".into(),
+                    ));
+                }
                 Ok(ScriptValue::Str(s.replace(from.as_str(), to.as_str())))
             } else {
                 Err(FerroError::QueryParseError(
@@ -725,10 +749,16 @@ fn eval_method(
         }
         (ScriptValue::Str(s), "split") => {
             if let Some(ScriptValue::Str(sep)) = args.first() {
-                let parts: Vec<ScriptValue> = s
-                    .split(sep.as_str())
-                    .map(|p| ScriptValue::Str(p.to_string()))
-                    .collect();
+                // Bound element count: split("") yields one element per char.
+                let mut parts: Vec<ScriptValue> = Vec::new();
+                for p in s.split(sep.as_str()) {
+                    if parts.len() >= MAX_SPLIT_PARTS {
+                        return Err(FerroError::QueryParseError(
+                            "split() produced too many parts".into(),
+                        ));
+                    }
+                    parts.push(ScriptValue::Str(p.to_string()));
+                }
                 Ok(ScriptValue::Array(parts))
             } else {
                 Err(FerroError::QueryParseError(
@@ -2698,6 +2728,48 @@ mod tests {
         ctx.doc.insert("v".into(), serde_json::json!([3.0, 4.0]));
         let r = evaluate("dotProduct(params.q, 'v')", &mut ctx).unwrap();
         assert_eq!(r, serde_json::json!(11.0)); // 1*3 + 2*4
+    }
+
+    // ── String output-size bounds (round-8: amplification / OOM) ──
+
+    #[test]
+    fn replace_amplification_bounded() {
+        // Empty `from` + long `to` is multiplicative (n×m) — must error, not OOM.
+        let mut ctx = ScriptContext::new();
+        ctx.doc
+            .insert("s".into(), serde_json::json!("a".repeat(100_000)));
+        ctx.doc
+            .insert("to".into(), serde_json::json!("b".repeat(1_000)));
+        let r = evaluate("doc['s'].value.replace('', doc['to'].value)", &mut ctx);
+        assert!(r.is_err(), "replace amplification should be bounded: {r:?}");
+    }
+
+    #[test]
+    fn replace_normal_still_works() {
+        let mut ctx = ScriptContext::new();
+        ctx.doc.insert("s".into(), serde_json::json!("hello world"));
+        let r = evaluate("doc['s'].value.replace('world', 'there')", &mut ctx).unwrap();
+        assert_eq!(r, serde_json::json!("hello there"));
+    }
+
+    #[test]
+    fn split_empty_sep_bounded() {
+        // split("") emits one element per char — bounded by MAX_SPLIT_PARTS.
+        let mut ctx = ScriptContext::new();
+        ctx.doc.insert(
+            "s".into(),
+            serde_json::json!("x".repeat(MAX_SPLIT_PARTS + 10)),
+        );
+        let r = evaluate("doc['s'].value.split('')", &mut ctx);
+        assert!(r.is_err(), "split should be bounded: {r:?}");
+    }
+
+    #[test]
+    fn split_normal_still_works() {
+        let mut ctx = ScriptContext::new();
+        ctx.doc.insert("s".into(), serde_json::json!("a,b,c"));
+        let r = evaluate("doc['s'].value.split(',')", &mut ctx).unwrap();
+        assert_eq!(r, serde_json::json!(["a", "b", "c"]));
     }
 
     #[test]
