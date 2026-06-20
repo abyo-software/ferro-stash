@@ -157,6 +157,18 @@ else
   PID="${PID%@*}"
 fi
 
+# Gated invocations (OFFER_STEP / RELEASE / DELIVERY) act on an existing,
+# already-populated product. Re-running UpdateInformation / AddDimensions /
+# AddRepositories then is pointless and HARMFUL: on a Limited product
+# UpdateInformation enters a slow APPLYING cycle that blocks the gated step for
+# 30-60+ min (and AddRepositories always fails as a duplicate). Skip them.
+GATED=0
+if [ "${OFFER_STEP:-0}" = "1" ] || [ "${RELEASE:-0}" = "1" ] || [ "${DELIVERY:-0}" = "1" ]; then
+  GATED=1
+  echo "Gated step (OFFER_STEP/RELEASE/DELIVERY) - skipping UpdateInformation/AddDimensions/AddRepositories."
+fi
+if [ "$GATED" != "1" ]; then
+
 # Stage the logo if no URL was supplied (UpdateInformation requires one).
 if [ -z "$LOGO_URL" ]; then
   if [ -f "$LOGO_FILE" ]; then
@@ -301,6 +313,8 @@ if RCID=$(mc start-change-set --catalog "$CATALOG" --change-set-name ferrostash-
     --change-set "file:///tmp/cs-ferrostash-ctr-repos.json" --query ChangeSetId --output text 2>/dev/null); then
   wait_done "$RCID" || echo "  (AddRepositories failed/duplicate - continuing; repos may already exist)"
 fi
+
+fi  # end of non-gated reversible pre-steps (GATED skip)
 
 PRODUCT_CODE="$(get_product_code "$PID")"
 echo
