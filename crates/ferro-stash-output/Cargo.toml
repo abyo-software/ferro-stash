@@ -32,6 +32,12 @@ aws-config = { version = "1.8.11", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1.29.0"
 aws-sdk-sqs = "1.40"
 aws-sdk-sns = "1.40"
+# Pinned to match the existing aws-smithy-* lock (avoids a workspace-wide smithy bump).
+aws-sdk-cloudwatch = "=1.116.0"
+# RabbitMQ (AMQP) client; rustls TLS (matches the repo's no-OpenSSL stance).
+lapin = "2"
+# Email (SMTP) client; rustls TLS only (no native-tls), to match the repo's TLS stance.
+lettre = { version = "0.11", default-features = false, features = ["tokio1-rustls-tls", "smtp-transport", "builder"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "any", "postgres", "mysql", "sqlite"] }
 
 [dev-dependencies]

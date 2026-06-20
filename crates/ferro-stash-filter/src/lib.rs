@@ -20,6 +20,7 @@ pub mod http_filter;
 pub mod json_encode;
 pub mod json_filter;
 pub mod kv;
+pub mod memcached;
 pub mod metrics;
 pub mod mutate;
 pub mod prune;
@@ -109,6 +110,9 @@ pub fn create_filter(
             settings, condition,
         )?),
         "anonymize" => Box::new(anonymize::AnonymizeFilter::from_config(
+            settings, condition,
+        )?),
+        "memcached" => Box::new(memcached::MemcachedFilter::from_config(
             settings, condition,
         )?),
         _ => {
@@ -246,6 +250,14 @@ mod tests {
         let filter = create_filter("http", &settings, None);
         assert!(filter.is_ok());
         assert_eq!(filter.expect("http filter").name(), "http");
+    }
+
+    #[test]
+    fn test_create_memcached_filter() {
+        let settings = serde_json::json!({ "hosts": ["localhost:11211"] });
+        let filter = create_filter("memcached", &settings, None);
+        assert!(filter.is_ok());
+        assert_eq!(filter.expect("memcached filter").name(), "memcached");
     }
 
     #[test]

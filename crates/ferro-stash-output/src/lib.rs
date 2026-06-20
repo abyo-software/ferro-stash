@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Output plugins for `FerroStash`.
 
+pub mod cloudwatch;
 pub mod csv;
 pub mod datadog;
 pub mod elasticsearch;
+pub mod email;
 pub mod file;
 pub mod graphite;
 pub mod http;
@@ -11,6 +13,7 @@ pub mod jdbc;
 pub mod kafka;
 pub mod null;
 pub mod pipeline;
+pub mod rabbitmq;
 pub mod redis;
 pub mod s3;
 pub mod sns;
@@ -82,6 +85,15 @@ pub fn create_output_with_bus(
         "s3" => Ok(Box::new(s3::S3Output::from_config(settings, condition)?)),
         "sqs" => Ok(Box::new(sqs::SqsOutput::from_config(settings, condition)?)),
         "sns" => Ok(Box::new(sns::SnsOutput::from_config(settings, condition)?)),
+        "rabbitmq" => Ok(Box::new(rabbitmq::RabbitmqOutput::from_config(
+            settings, condition,
+        )?)),
+        "email" => Ok(Box::new(email::EmailOutput::from_config(
+            settings, condition,
+        )?)),
+        "cloudwatch" => Ok(Box::new(cloudwatch::CloudwatchOutput::from_config(
+            settings, condition,
+        )?)),
         "datadog" => Ok(Box::new(datadog::DatadogOutput::from_config(
             settings, condition,
         )?)),
@@ -188,6 +200,30 @@ mod tests {
         let output = create_output("graphite", &settings, None);
         assert!(output.is_ok());
         assert_eq!(output.expect("graphite output").name(), "graphite");
+    }
+
+    #[test]
+    fn test_create_rabbitmq_output() {
+        let settings = serde_json::json!({ "exchange": "ex", "key": "rk" });
+        let output = create_output("rabbitmq", &settings, None);
+        assert!(output.is_ok());
+        assert_eq!(output.expect("rabbitmq output").name(), "rabbitmq");
+    }
+
+    #[test]
+    fn test_create_email_output() {
+        let settings = serde_json::json!({ "to": "ops@example.com" });
+        let output = create_output("email", &settings, None);
+        assert!(output.is_ok());
+        assert_eq!(output.expect("email output").name(), "email");
+    }
+
+    #[test]
+    fn test_create_cloudwatch_output() {
+        let settings = serde_json::json!({ "namespace": "MyApp" });
+        let output = create_output("cloudwatch", &settings, None);
+        assert!(output.is_ok());
+        assert_eq!(output.expect("cloudwatch output").name(), "cloudwatch");
     }
 
     #[test]

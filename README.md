@@ -129,9 +129,9 @@ The JRuby custom-logic figure is corroborated across runs (~143–147k); see
 ## Logstash compatibility scope
 
 FerroStash targets the **production-common subset** of Logstash, not its
-full plugin catalogue. It implements **~77% of the plugins bundled with
-Logstash 9.4.2** (86 / 111) — **codecs 100%, filters 89%, inputs 59%, outputs 70%** — weighted toward the parse/filter hot path; the long tail of connectors
-(AWS CloudWatch, RabbitMQ, …) is the main gap. A
+full plugin catalogue. It implements **~83% of the plugins bundled with
+Logstash 9.4.2** (92 / 111) — **codecs 100%, filters 91%, inputs 65%, outputs 83%** — weighted toward the parse/filter hot path; the long tail of connectors
+(enterprise messaging / SNMP, …) is the main gap. A
 config that uses a missing plugin **fails fast** at load, so check the full
 **[compatibility matrix](docs/COMPATIBILITY.md)** before migrating. The
 default event shape (`@timestamp`, tags, bracket-notation field
@@ -204,7 +204,7 @@ available, not in CI. See the Notes column and
 [Honest limitations](#honest-limitations) for exactly what each smoke
 test exercises and the per-plugin feature residuals.
 
-### Input plugins (20 registered)
+### Input plugins (22 registered)
 
 | Plugin | Status | Notes |
 |--------|--------|-------|
@@ -225,8 +225,10 @@ test exercises and the per-plugin feature residuals.
 | `kafka` | real (live-validated) | `rdkafka` async `StreamConsumer`: subscribe, recv loop, codec decode, auto offset commit. Live round-trip validated against real Apache Kafka 3.9.1 (and redpanda) via an `#[ignore]` smoke test (`KAFKA_BROKERS`); not run in CI. `consumer_threads`/`max_poll_records` parsed but not yet wired; no SASL/SSL passthrough; auto-commit only |
 | `redis` | real (live-validated) | async client: `BLPOP` (list), `SUBSCRIBE`/`PSUBSCRIBE` (channel/pattern), `AUTH` + `SELECT`. Password-only AUTH (no username/ACL), no TLS (`rediss://`), pub/sub `key` is a single channel/pattern |
 | `s3` | real (live-validated) | `aws-sdk-s3`: paginated `ListObjectsV2` + `GetObject` poll, in-memory seen-key dedup, optional `delete_after_read`. Seen-key set is not persisted (reprocesses non-deleted objects after restart — no sincedb); no SQS-notification mode |
+| `rabbitmq` | real (compile/unit-validated) | `lapin` AMQP: `queue_declare` (+ optional `exchange`/`key` bind), `basic_consume`, codec decode, `basic_ack` (when `ack`). `host`/`port`/`vhost`/`user`/`password`/`durable`. rustls TLS stance. No TLS (`amqps`)/x-args/prefetch tuning yet. Unit-tested; `#[ignore]` live smoke (`RABBITMQ_URL`) |
+| `cloudwatch` | real (compile/unit-validated) | `aws-sdk-cloudwatch` `GetMetricStatistics` polled every `interval`s over `[now-interval, now]`, one event per datapoint (`metric`/`namespace`/statistic values/`unit`). `namespace` (required), `metric_names`(alias `metrics`), `period`, `statistics`. No dimension filtering / `GetMetricData` discovery yet. Unit-tested; `#[ignore]` live smoke |
 
-### Filter plugins (34 registered)
+### Filter plugins (35 registered)
 
 | Plugin | Status | Notes |
 |--------|--------|-------|
@@ -264,8 +266,9 @@ test exercises and the per-plugin feature residuals.
 | `geoip` | real (live-validated) | `maxminddb` lookups against a configured `.mmdb` (`database` field), full Logstash-style subfields. Falls back to private/loopback/public classification when no `database` is set. Validated against a real GeoLite2-City database |
 | `dns` | real (live-validated) | `hickory-resolver` forward (A/AAAA) and reverse (PTR) lookups, custom `nameserver`, `Replace`/`Append` action. Validated against `8.8.8.8` |
 | `elasticsearch` | real (live-validated) | `reqwest` `_search` with host failover, query-template `%{field}` sprintf, hits→field mapping. Live-validated against real Elasticsearch 8.15.3 (a seeded hit is mapped into the target field) via an `#[ignore]` smoke test (`ES_URL`); not run in CI |
+| `memcached` | real (compile/unit-validated) | sync `memcache` client (multi-host `hosts`, consistent hashing) via `tokio::task::spawn_blocking`: `get` (key→field) and `set` (field→key) maps with `%{field}`-aware keys, `namespace` prefix, `ttl`. Plaintext only (OpenSSL `tls` feature disabled to stay rustls-only). Unit-tested; `#[ignore]` live smoke (`MEMCACHED_HOST`) |
 
-### Output plugins (17 registered)
+### Output plugins (20 registered)
 
 | Plugin | Status | Notes |
 |--------|--------|-------|
@@ -283,6 +286,9 @@ test exercises and the per-plugin feature residuals.
 | `redis` | real (live-validated) | async `ConnectionManager`: `RPUSH` (list) / `PUBLISH` (channel). Password-only AUTH (no username/ACL), no TLS (`rediss://`), `key` is a single channel |
 | `s3` | real (live-validated) | `aws-sdk-s3` `PutObject` on rotation/flush (+gzip when `encoding => "gzip"`). New `endpoint` / `force_path_style` fields for MinIO/LocalStack/S3-compatible stores. Single `PutObject` (no multipart upload) in v1. Live-validated against real AWS S3 (write/list/read-back) and MinIO via an `#[ignore]` smoke test |
 | `datadog` | real (live-validated) | `reqwest` POST to `/api/v2/logs` (`DD-API-KEY`, batched, retry/backoff). Live-validated against the real DataDog Log Intake (AP1) via an `#[ignore]` smoke test; a `site` shorthand selects the region |
+| `rabbitmq` | real (compile/unit-validated) | `lapin` AMQP `basic_publish` to `exchange` with a `%{field}`-aware routing `key`; codec-encoded body; `persistent` delivery mode; lazy connection/channel. rustls TLS stance. No TLS (`amqps`)/publisher-confirm batching tuning yet. Unit-tested; `#[ignore]` live smoke (`RABBITMQ_URL`) |
+| `email` | real (compile/unit-validated) | `lettre` SMTP, one message per event; `to`/`subject`/`body`/`htmlbody` are `%{field}`-aware (both body + htmlbody → multipart/alternative). With `username`/`password` → STARTTLS + SMTP AUTH (rustls); otherwise plaintext. Default `from` `logstash@ferro-stash`. Unit-tested; `#[ignore]` live smoke (`SMTP_HOST`) |
+| `cloudwatch` | real (compile/unit-validated) | `aws-sdk-cloudwatch` `PutMetricData` (batched ≤20); `metricname`/`value`/`unit`/`dimensions` derived per event via `%{field}` lookups; events with empty/unresolved name or non-numeric value are skipped. Unit-tested; `#[ignore]` live smoke (LocalStack/AWS) |
 
 ### Codecs (21 registered)
 

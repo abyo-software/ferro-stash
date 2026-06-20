@@ -42,6 +42,9 @@ hex = { workspace = true }
 reqwest = { workspace = true }
 maxminddb = "0.28.1"
 hickory-resolver = "0.26.1"
+# Synchronous memcached client (driven via spawn_blocking); default-features off
+# to drop the OpenSSL `tls` feature and stay rustls-only / plaintext memcached.
+memcache = { version = "0.19", default-features = false }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

@@ -37,6 +37,10 @@ redis = { version = "0.32.2", features = ["tokio-comp", "connection-manager"] }
 aws-config = { version = "1.8.11", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1.29.0"
 aws-sdk-sqs = "1.40"
+# Pinned to match the existing aws-smithy-* lock (avoids a workspace-wide smithy bump).
+aws-sdk-cloudwatch = "=1.116.0"
+# RabbitMQ (AMQP) client; rustls TLS (matches the repo's no-OpenSSL stance).
+lapin = "2"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "any", "postgres", "mysql", "sqlite"] }
 
 [dev-dependencies]

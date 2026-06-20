@@ -2,6 +2,7 @@
 //! Input plugins for `FerroStash`.
 
 pub mod beats;
+pub mod cloudwatch;
 pub mod dead_letter_queue;
 pub mod elasticsearch;
 pub mod file;
@@ -14,6 +15,7 @@ pub mod http_poller;
 pub mod jdbc;
 pub mod kafka;
 pub mod pipeline;
+pub mod rabbitmq;
 pub mod redis;
 pub mod s3;
 pub mod sqs;
@@ -63,6 +65,10 @@ pub fn create_input_with_bus(
         "redis" => Ok(Box::new(redis::RedisInput::from_config(settings)?)),
         "s3" => Ok(Box::new(s3::S3Input::from_config(settings)?)),
         "sqs" => Ok(Box::new(sqs::SqsInput::from_config(settings)?)),
+        "rabbitmq" => Ok(Box::new(rabbitmq::RabbitmqInput::from_config(settings)?)),
+        "cloudwatch" => Ok(Box::new(cloudwatch::CloudwatchInput::from_config(
+            settings,
+        )?)),
         "dead_letter_queue" => Ok(Box::new(dead_letter_queue::DlqInput::from_config(
             settings,
         )?)),
@@ -171,6 +177,22 @@ mod tests {
         let input = create_input("graphite", &settings);
         assert!(input.is_ok());
         assert_eq!(input.expect("graphite input").name(), "graphite");
+    }
+
+    #[test]
+    fn test_create_rabbitmq_input() {
+        let settings = serde_json::json!({ "queue": "logs" });
+        let input = create_input("rabbitmq", &settings);
+        assert!(input.is_ok());
+        assert_eq!(input.expect("rabbitmq input").name(), "rabbitmq");
+    }
+
+    #[test]
+    fn test_create_cloudwatch_input() {
+        let settings = serde_json::json!({ "namespace": "AWS/EC2" });
+        let input = create_input("cloudwatch", &settings);
+        assert!(input.is_ok());
+        assert_eq!(input.expect("cloudwatch input").name(), "cloudwatch");
     }
 
     #[test]
