@@ -5,7 +5,9 @@ pub mod beats;
 pub mod dead_letter_queue;
 pub mod elasticsearch;
 pub mod file;
+pub mod gelf;
 pub mod generator;
+pub mod graphite;
 pub mod heartbeat;
 pub mod http;
 pub mod http_poller;
@@ -44,10 +46,14 @@ pub fn create_input_with_bus(
         "tcp" => Ok(Box::new(tcp::TcpInput::from_config(settings)?)),
         "udp" => Ok(Box::new(udp::UdpInput::from_config(settings)?)),
         "http" => Ok(Box::new(http::HttpInput::from_config(settings)?)),
-        "http_poller" => Ok(Box::new(http_poller::HttpPollerInput::from_config(settings)?)),
+        "http_poller" => Ok(Box::new(http_poller::HttpPollerInput::from_config(
+            settings,
+        )?)),
         "jdbc" => Ok(Box::new(jdbc::JdbcInput::from_config(settings)?)),
         "syslog" => Ok(Box::new(syslog::SyslogInput::from_config(settings)?)),
         "generator" => Ok(Box::new(generator::GeneratorInput::from_config(settings)?)),
+        "gelf" => Ok(Box::new(gelf::GelfInput::from_config(settings)?)),
+        "graphite" => Ok(Box::new(graphite::GraphiteInput::from_config(settings)?)),
         "heartbeat" => Ok(Box::new(heartbeat::HeartbeatInput::from_config(settings)?)),
         "beats" => Ok(Box::new(beats::BeatsInput::from_config(settings)?)),
         "elasticsearch" => Ok(Box::new(elasticsearch::ElasticsearchInput::from_config(
@@ -149,6 +155,22 @@ mod tests {
         let settings = serde_json::json!({});
         let input = create_input("elasticsearch", &settings);
         assert!(input.is_ok());
+    }
+
+    #[test]
+    fn test_create_gelf_input() {
+        let settings = serde_json::json!({});
+        let input = create_input("gelf", &settings);
+        assert!(input.is_ok());
+        assert_eq!(input.expect("gelf input").name(), "gelf");
+    }
+
+    #[test]
+    fn test_create_graphite_input() {
+        let settings = serde_json::json!({});
+        let input = create_input("graphite", &settings);
+        assert!(input.is_ok());
+        assert_eq!(input.expect("graphite input").name(), "graphite");
     }
 
     #[test]

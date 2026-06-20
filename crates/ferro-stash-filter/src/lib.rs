@@ -16,6 +16,7 @@ pub mod elasticsearch_filter;
 pub mod fingerprint;
 pub mod geoip;
 pub mod grok;
+pub mod http_filter;
 pub mod json_encode;
 pub mod json_filter;
 pub mod kv;
@@ -95,6 +96,7 @@ pub fn create_filter(
         "elasticsearch" => Box::new(elasticsearch_filter::ElasticsearchFilter::from_config(
             settings, condition,
         )?),
+        "http" => Box::new(http_filter::HttpFilter::from_config(settings, condition)?),
         "metrics" => Box::new(metrics::MetricsFilter::from_config(settings, condition)?),
         "de_dot" => Box::new(de_dot::DeDotFilter::from_config(settings, condition)?),
         "json_encode" => Box::new(json_encode::JsonEncodeFilter::from_config(
@@ -236,6 +238,14 @@ mod tests {
         let filter = create_filter("anonymize", &settings, None);
         assert!(filter.is_ok());
         assert_eq!(filter.expect("anonymize filter").name(), "anonymize");
+    }
+
+    #[test]
+    fn test_create_http_filter() {
+        let settings = serde_json::json!({ "url": "http://example.com/%{id}" });
+        let filter = create_filter("http", &settings, None);
+        assert!(filter.is_ok());
+        assert_eq!(filter.expect("http filter").name(), "http");
     }
 
     #[test]

@@ -5,6 +5,7 @@ pub mod csv;
 pub mod datadog;
 pub mod elasticsearch;
 pub mod file;
+pub mod graphite;
 pub mod http;
 pub mod jdbc;
 pub mod kafka;
@@ -66,7 +67,9 @@ pub fn create_output_with_bus(
         "tcp" => Ok(Box::new(tcp::TcpOutput::from_config(settings, condition)?)),
         "udp" => Ok(Box::new(udp::UdpOutput::from_config(settings, condition)?)),
         "csv" => Ok(Box::new(csv::CsvOutput::from_config(settings, condition)?)),
-        "jdbc" => Ok(Box::new(jdbc::JdbcOutput::from_config(settings, condition)?)),
+        "jdbc" => Ok(Box::new(jdbc::JdbcOutput::from_config(
+            settings, condition,
+        )?)),
         "null" => Ok(Box::new(null::NullOutput::from_config(
             settings, condition,
         )?)),
@@ -80,6 +83,9 @@ pub fn create_output_with_bus(
         "sqs" => Ok(Box::new(sqs::SqsOutput::from_config(settings, condition)?)),
         "sns" => Ok(Box::new(sns::SnsOutput::from_config(settings, condition)?)),
         "datadog" => Ok(Box::new(datadog::DatadogOutput::from_config(
+            settings, condition,
+        )?)),
+        "graphite" => Ok(Box::new(graphite::GraphiteOutput::from_config(
             settings, condition,
         )?)),
         "pipeline" => {
@@ -174,6 +180,14 @@ mod tests {
         let output = create_output("csv", &settings, None);
         assert!(output.is_ok());
         assert_eq!(output.expect("csv output").name(), "csv");
+    }
+
+    #[test]
+    fn test_create_graphite_output() {
+        let settings = serde_json::json!({ "host": "localhost", "fields_are_metrics": true });
+        let output = create_output("graphite", &settings, None);
+        assert!(output.is_ok());
+        assert_eq!(output.expect("graphite output").name(), "graphite");
     }
 
     #[test]

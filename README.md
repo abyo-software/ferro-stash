@@ -129,8 +129,8 @@ The JRuby custom-logic figure is corroborated across runs (~143–147k); see
 ## Logstash compatibility scope
 
 FerroStash targets the **production-common subset** of Logstash, not its
-full plugin catalogue. It implements **~74% of the plugins bundled with
-Logstash 9.4.2** (82 / 111) — **codecs 100%, filters 86%, inputs 53%, outputs 65%** — weighted toward the parse/filter hot path; the long tail of connectors
+full plugin catalogue. It implements **~77% of the plugins bundled with
+Logstash 9.4.2** (86 / 111) — **codecs 100%, filters 89%, inputs 59%, outputs 70%** — weighted toward the parse/filter hot path; the long tail of connectors
 (AWS CloudWatch, RabbitMQ, …) is the main gap. A
 config that uses a missing plugin **fails fast** at load, so check the full
 **[compatibility matrix](docs/COMPATIBILITY.md)** before migrating. The
@@ -204,7 +204,7 @@ available, not in CI. See the Notes column and
 [Honest limitations](#honest-limitations) for exactly what each smoke
 test exercises and the per-plugin feature residuals.
 
-### Input plugins (18 registered)
+### Input plugins (20 registered)
 
 | Plugin | Status | Notes |
 |--------|--------|-------|
@@ -213,6 +213,8 @@ test exercises and the per-plugin feature residuals.
 | `tcp` | functional | TLS via rustls |
 | `udp` | functional | datagram input |
 | `http` | functional | HTTP POST (JSON / plain) |
+| `gelf` | functional | Graylog GELF over UDP (default) or TCP (NUL-delimited frames); gzip/zlib auto-detect, `short_message`→`message`, `_custom`→`custom`. Single-datagram only — chunked GELF reassembly is not implemented |
+| `graphite` | functional | Carbon plaintext over TCP: `metric value timestamp` → `metric`/`value`(float)/`timestamp`(int) |
 | `syslog` | functional | RFC 3164 / RFC 5424, TCP + UDP |
 | `generator` | functional | synthetic events for test/bench |
 | `heartbeat` | functional | periodic events |
@@ -224,11 +226,12 @@ test exercises and the per-plugin feature residuals.
 | `redis` | real (live-validated) | async client: `BLPOP` (list), `SUBSCRIBE`/`PSUBSCRIBE` (channel/pattern), `AUTH` + `SELECT`. Password-only AUTH (no username/ACL), no TLS (`rediss://`), pub/sub `key` is a single channel/pattern |
 | `s3` | real (live-validated) | `aws-sdk-s3`: paginated `ListObjectsV2` + `GetObject` poll, in-memory seen-key dedup, optional `delete_after_read`. Seen-key set is not persisted (reprocesses non-deleted objects after restart — no sincedb); no SQS-notification mode |
 
-### Filter plugins (33 registered)
+### Filter plugins (34 registered)
 
 | Plugin | Status | Notes |
 |--------|--------|-------|
 | `grok` | functional | ~50 built-in patterns (IP, TIMESTAMP_ISO8601, COMBINEDAPACHELOG, …) via the `regex` crate |
+| `http` | functional | one HTTP request per event (reqwest); `url`/`headers`/`body` with `%{field}` interpolation, response → `target_body` (default `http_response`, JSON parsed when possible) + optional `target_headers`; tags `_httprequestfailure` on transport error or non-2xx |
 | `mutate` | functional | rename/replace/uppercase/lowercase/strip/gsub/convert/split/join/add/remove |
 | `json` | functional | parse JSON strings into fields |
 | `date` | functional | ISO8601, UNIX, UNIX_MS, custom formats |
@@ -262,13 +265,14 @@ test exercises and the per-plugin feature residuals.
 | `dns` | real (live-validated) | `hickory-resolver` forward (A/AAAA) and reverse (PTR) lookups, custom `nameserver`, `Replace`/`Append` action. Validated against `8.8.8.8` |
 | `elasticsearch` | real (live-validated) | `reqwest` `_search` with host failover, query-template `%{field}` sprintf, hits→field mapping. Live-validated against real Elasticsearch 8.15.3 (a seeded hit is mapped into the target field) via an `#[ignore]` smoke test (`ES_URL`); not run in CI |
 
-### Output plugins (16 registered)
+### Output plugins (17 registered)
 
 | Plugin | Status | Notes |
 |--------|--------|-------|
 | `stdout` | functional | json, rubydebug, line, dots |
 | `elasticsearch` (aliases `ferrosearch`, `opensearch`) | functional | Bulk `_bulk` API via reqwest |
 | `file` | functional | JSON lines or custom format |
+| `graphite` | functional | Carbon plaintext over TCP (`metric value timestamp`); `metrics` map (`%{field}`-aware) or `fields_are_metrics` for all numeric fields |
 | `http` | functional | POST/PUT/PATCH |
 | `tcp` | functional | TLS via rustls |
 | `udp` | functional | codec-encoded datagrams via `tokio::net::UdpSocket` (best-effort, fire-and-forget) |
