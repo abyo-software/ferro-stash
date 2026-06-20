@@ -449,6 +449,7 @@ details = {
       "from this build. Metered per pod-hour via RegisterUsage."),
   },
   "DeliveryOptions": [{
+    "DeliveryOptionTitle": "FerroStash on Amazon EKS (Helm)",
     "Details": {"EcrDeliveryOptionDetails": {
       "ContainerImages": [img],
       "DeploymentResources": [{"Name": "HelmDeploymentTemplate", "Url": helm}],
