@@ -753,7 +753,13 @@ impl InputPlugin for ElasticsearchInput {
         sender: mpsc::Sender<Event>,
         mut shutdown: ShutdownSignal,
     ) -> Result<()> {
-        info!(hosts = ?self.hosts, index = %self.index, "elasticsearch input starting");
+        // Redact: hosts may embed credentials (userinfo / api_key query).
+        let safe_hosts: Vec<String> = self
+            .hosts
+            .iter()
+            .map(|h| ferro_stash_core::redact_url(h.as_str()))
+            .collect();
+        info!(hosts = ?safe_hosts, index = %self.index, "elasticsearch input starting");
 
         // If no schedule, run once
         if self.schedule.is_none() {

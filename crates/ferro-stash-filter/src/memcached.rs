@@ -80,8 +80,14 @@ pub struct MemcachedFilter {
 
 impl std::fmt::Debug for MemcachedFilter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Hosts can be memcache:// URLs with SASL userinfo — redact each.
+        let hosts: Vec<String> = self
+            .hosts
+            .iter()
+            .map(|h| ferro_stash_core::redact_url(h.as_str()))
+            .collect();
         f.debug_struct("MemcachedFilter")
-            .field("hosts", &self.hosts)
+            .field("hosts", &hosts)
             .field("namespace", &self.namespace)
             .field("ttl", &self.ttl)
             .field("get", &self.get)

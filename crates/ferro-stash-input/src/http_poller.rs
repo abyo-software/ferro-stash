@@ -259,7 +259,8 @@ impl InputPlugin for HttpPollerInput {
                         debug!(name = %spec.name, %status, "http_poller polled");
                     }
                     Err(e) => {
-                        warn!(name = %spec.name, url = %spec.url, error = %e, "http_poller request failed")
+                        // Redact: spec.url can carry userinfo / a signed query param.
+                        warn!(name = %spec.name, url = %ferro_stash_core::redact_url(&spec.url), error = %e, "http_poller request failed")
                     }
                 }
             }

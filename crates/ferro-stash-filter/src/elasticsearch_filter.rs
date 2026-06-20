@@ -329,6 +329,8 @@ impl ElasticsearchFilter {
                 host.trim_end_matches('/'),
                 self.index.trim_start_matches('/')
             );
+            // Log-safe form: `host` (∈ self.hosts) may embed userinfo creds.
+            let safe_url = ferro_stash_core::redact_url(&url);
 
             let mut request = self
                 .client
@@ -345,7 +347,7 @@ impl ElasticsearchFilter {
             let response = match request.send().await {
                 Ok(resp) => resp,
                 Err(e) => {
-                    warn!(url = %url, error = %e, "elasticsearch filter: request failed, trying next host");
+                    warn!(url = %safe_url, error = %e, "elasticsearch filter: request failed, trying next host");
                     continue;
                 }
             };
@@ -364,7 +366,7 @@ impl ElasticsearchFilter {
                     512,
                 )
                 .await;
-                warn!(url = %url, status = %status, body = %snippet, "elasticsearch filter: non-success response");
+                warn!(url = %safe_url, status = %status, body = %snippet, "elasticsearch filter: non-success response");
                 continue;
             }
 
@@ -383,7 +385,7 @@ impl ElasticsearchFilter {
             {
                 Ok(bytes) => bytes,
                 Err(e) => {
-                    warn!(url = %url, error = %e, "elasticsearch filter: response body too large or unreadable, trying next host");
+                    warn!(url = %safe_url, error = %e, "elasticsearch filter: response body too large or unreadable, trying next host");
                     continue;
                 }
             };
@@ -391,12 +393,12 @@ impl ElasticsearchFilter {
             let json: serde_json::Value = match serde_json::from_slice(&bytes) {
                 Ok(j) => j,
                 Err(e) => {
-                    warn!(url = %url, error = %e, "elasticsearch filter: invalid JSON response");
+                    warn!(url = %safe_url, error = %e, "elasticsearch filter: invalid JSON response");
                     continue;
                 }
             };
 
-            debug!(url = %url, "elasticsearch filter: query succeeded");
+            debug!(url = %safe_url, "elasticsearch filter: query succeeded");
             return Some(parse_hits(&json));
         }
 
