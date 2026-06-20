@@ -79,9 +79,9 @@ impl JdbcInput {
         let statement = match settings.get_string("statement") {
             Some(s) => s,
             None => match settings.get_string("statement_filepath") {
-                Some(path) => std::fs::read_to_string(&path).map_err(|e| input_err(format!(
-                    "could not read statement_filepath '{path}': {e}"
-                )))?,
+                Some(path) => std::fs::read_to_string(&path).map_err(|e| {
+                    input_err(format!("could not read statement_filepath '{path}': {e}"))
+                })?,
                 None => {
                     return Err(input_err(
                         "jdbc input requires `statement` (SQL) or `statement_filepath`".to_string(),
@@ -97,7 +97,10 @@ impl JdbcInput {
             .and_then(|s| s.get("every"))
             .and_then(serde_json::Value::as_str)
             .and_then(parse_every);
-        let interval = scheduled.or_else(|| settings.get_u64("interval")).unwrap_or(60).max(1);
+        let interval = scheduled
+            .or_else(|| settings.get_u64("interval"))
+            .unwrap_or(60)
+            .max(1);
 
         let last_run_metadata_path = settings
             .get_string("last_run_metadata_path")
@@ -176,7 +179,11 @@ impl InputPlugin for JdbcInput {
         "jdbc"
     }
 
-    async fn run(&mut self, sender: mpsc::Sender<Event>, mut shutdown: ShutdownSignal) -> Result<()> {
+    async fn run(
+        &mut self,
+        sender: mpsc::Sender<Event>,
+        mut shutdown: ShutdownSignal,
+    ) -> Result<()> {
         install_drivers_once();
         let pool = AnyPoolOptions::new()
             .max_connections(2)
@@ -345,7 +352,10 @@ mod tests {
             "postgres://h:5432/db"
         );
         assert_eq!(jdbc_to_sqlx_url("jdbc:mysql://h/db"), "mysql://h/db");
-        assert_eq!(jdbc_to_sqlx_url("jdbc:sqlite:/tmp/x.db"), "sqlite:/tmp/x.db");
+        assert_eq!(
+            jdbc_to_sqlx_url("jdbc:sqlite:/tmp/x.db"),
+            "sqlite:/tmp/x.db"
+        );
         // Already a sqlx URL: unchanged.
         assert_eq!(jdbc_to_sqlx_url("postgres://h/db"), "postgres://h/db");
         // Unknown jdbc subprotocol: strip the leading jdbc:.
@@ -460,7 +470,10 @@ mod tests {
         let url = format!("sqlite://{}?mode=rwc", db_path.display());
 
         install_drivers_once();
-        let setup = AnyPoolOptions::new().connect(&url).await.expect("connect setup");
+        let setup = AnyPoolOptions::new()
+            .connect(&url)
+            .await
+            .expect("connect setup");
         sqlx::query(
             "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, score REAL, active BOOLEAN)",
         )

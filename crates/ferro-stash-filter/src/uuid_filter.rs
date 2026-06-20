@@ -114,7 +114,10 @@ mod tests {
         let mut event = Event::new("x");
         event.set("uuid", EventValue::String("keep-me".into()));
         let out = f.filter(event).await.expect("filter");
-        assert_eq!(out[0].get("uuid"), Some(&EventValue::String("keep-me".into())));
+        assert_eq!(
+            out[0].get("uuid"),
+            Some(&EventValue::String("keep-me".into()))
+        );
     }
 
     #[tokio::test]

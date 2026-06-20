@@ -143,7 +143,9 @@ impl HttpPollerInput {
             .max(1);
 
         let request_timeout = settings.get_u64("request_timeout").unwrap_or(60).max(1);
-        let codec = settings.get_string("codec").unwrap_or_else(|| "json".to_string());
+        let codec = settings
+            .get_string("codec")
+            .unwrap_or_else(|| "json".to_string());
         let codec_settings = settings
             .get("codec_settings")
             .cloned()
@@ -172,7 +174,11 @@ impl InputPlugin for HttpPollerInput {
         "http_poller"
     }
 
-    async fn run(&mut self, sender: mpsc::Sender<Event>, mut shutdown: ShutdownSignal) -> Result<()> {
+    async fn run(
+        &mut self,
+        sender: mpsc::Sender<Event>,
+        mut shutdown: ShutdownSignal,
+    ) -> Result<()> {
         let codec = self.build_codec()?;
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(self.request_timeout))
@@ -182,7 +188,11 @@ impl InputPlugin for HttpPollerInput {
                 message: format!("failed to build HTTP client: {e}"),
             })?;
         let poll_interval = Duration::from_secs(self.interval);
-        info!(urls = self.urls.len(), interval_secs = self.interval, "http_poller starting");
+        info!(
+            urls = self.urls.len(),
+            interval_secs = self.interval,
+            "http_poller starting"
+        );
 
         loop {
             for spec in &self.urls {
@@ -209,7 +219,9 @@ impl InputPlugin for HttpPollerInput {
                                         }
                                     }
                                 }
-                                Err(e) => warn!(name = %spec.name, error = %e, "http_poller decode error"),
+                                Err(e) => {
+                                    warn!(name = %spec.name, error = %e, "http_poller decode error")
+                                }
                             },
                             Err(e) => {
                                 warn!(name = %spec.name, error = %e, "http_poller body read error")
@@ -217,7 +229,9 @@ impl InputPlugin for HttpPollerInput {
                         }
                         debug!(name = %spec.name, %status, "http_poller polled");
                     }
-                    Err(e) => warn!(name = %spec.name, url = %spec.url, error = %e, "http_poller request failed"),
+                    Err(e) => {
+                        warn!(name = %spec.name, url = %spec.url, error = %e, "http_poller request failed")
+                    }
                 }
             }
 
@@ -265,7 +279,10 @@ mod tests {
         });
         let i = HttpPollerInput::from_config(&s).expect("config");
         assert_eq!(i.urls[0].method, "post");
-        assert_eq!(i.urls[0].headers.get("Authorization").map(String::as_str), Some("Bearer t"));
+        assert_eq!(
+            i.urls[0].headers.get("Authorization").map(String::as_str),
+            Some("Bearer t")
+        );
         assert_eq!(i.interval, 120);
     }
 
@@ -303,7 +320,10 @@ mod tests {
             .await
             .expect("timed out waiting for an event")
             .expect("channel closed without an event");
-        assert_eq!(ev.get("http_poller_name").and_then(EventValue::as_str), Some("t"));
+        assert_eq!(
+            ev.get("http_poller_name").and_then(EventValue::as_str),
+            Some("t")
+        );
         controller.shutdown();
         let _ = handle.await;
     }

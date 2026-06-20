@@ -42,20 +42,24 @@ pub struct SnsOutput {
 
 impl SnsOutput {
     pub fn from_config(settings: &serde_json::Value, condition: Option<Condition>) -> Result<Self> {
-        let topic_arn = settings.get_string("topic_arn").ok_or_else(|| FerroStashError::Output {
-            plugin: "sns".to_string(),
-            message: "sns output requires `topic_arn`".to_string(),
-        })?;
+        let topic_arn =
+            settings
+                .get_string("topic_arn")
+                .ok_or_else(|| FerroStashError::Output {
+                    plugin: "sns".to_string(),
+                    message: "sns output requires `topic_arn`".to_string(),
+                })?;
         let (codec_name, codec_settings) = resolve_codec(settings, "json");
-        let codec = create_codec(&codec_name, &codec_settings).map_err(|e| {
-            FerroStashError::Output {
+        let codec =
+            create_codec(&codec_name, &codec_settings).map_err(|e| FerroStashError::Output {
                 plugin: "sns".to_string(),
                 message: format!("unknown/invalid codec '{codec_name}': {e}"),
-            }
-        })?;
+            })?;
         Ok(Self {
             topic_arn,
-            region: settings.get_string("region").unwrap_or_else(|| "us-east-1".to_string()),
+            region: settings
+                .get_string("region")
+                .unwrap_or_else(|| "us-east-1".to_string()),
             access_key_id: settings.get_string("access_key_id"),
             secret_access_key: settings.get_string("secret_access_key"),
             endpoint: settings.get_string("endpoint"),
@@ -74,7 +78,11 @@ impl SnsOutput {
                     aws_config::defaults(aws_config::BehaviorVersion::latest()).region(region);
                 if let (Some(ak), Some(sk)) = (&self.access_key_id, &self.secret_access_key) {
                     loader = loader.credentials_provider(aws_sdk_sns::config::Credentials::new(
-                        ak, sk, None, None, "ferro-stash-sns-output",
+                        ak,
+                        sk,
+                        None,
+                        None,
+                        "ferro-stash-sns-output",
                     ));
                 }
                 let sdk_config = loader.load().await;
@@ -100,10 +108,13 @@ impl OutputPlugin for SnsOutput {
         }
         let client = self.client().await;
         for event in events {
-            let bytes = self.codec.encode(&event).map_err(|e| FerroStashError::Output {
-                plugin: "sns".to_string(),
-                message: format!("codec encode error: {e}"),
-            })?;
+            let bytes = self
+                .codec
+                .encode(&event)
+                .map_err(|e| FerroStashError::Output {
+                    plugin: "sns".to_string(),
+                    message: format!("codec encode error: {e}"),
+                })?;
             let message = String::from_utf8_lossy(&bytes).to_string();
             let mut req = client.publish().topic_arn(&self.topic_arn).message(message);
             if let Some(subject) = &self.subject {

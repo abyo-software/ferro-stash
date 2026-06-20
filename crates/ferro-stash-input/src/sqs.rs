@@ -63,7 +63,9 @@ impl SqsInput {
         Ok(Self {
             queue,
             queue_url,
-            region: settings.get_string("region").unwrap_or_else(|| "us-east-1".to_string()),
+            region: settings
+                .get_string("region")
+                .unwrap_or_else(|| "us-east-1".to_string()),
             access_key_id: settings.get_string("access_key_id"),
             secret_access_key: settings.get_string("secret_access_key"),
             endpoint: settings.get_string("endpoint"),
@@ -88,8 +90,13 @@ impl SqsInput {
         let region = Region::new(self.region.clone());
         let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest()).region(region);
         if let (Some(ak), Some(sk)) = (&self.access_key_id, &self.secret_access_key) {
-            loader = loader
-                .credentials_provider(Credentials::new(ak, sk, None, None, "ferro-stash-sqs-input"));
+            loader = loader.credentials_provider(Credentials::new(
+                ak,
+                sk,
+                None,
+                None,
+                "ferro-stash-sqs-input",
+            ));
         }
         let sdk_config = loader.load().await;
         let mut cfg = aws_sdk_sqs::config::Builder::from(&sdk_config);
@@ -115,10 +122,12 @@ impl SqsInput {
                 plugin: "sqs".to_string(),
                 message: format!("GetQueueUrl({name}) failed: {e}"),
             })?;
-        out.queue_url().map(String::from).ok_or_else(|| FerroStashError::Input {
-            plugin: "sqs".to_string(),
-            message: format!("GetQueueUrl({name}) returned no URL"),
-        })
+        out.queue_url()
+            .map(String::from)
+            .ok_or_else(|| FerroStashError::Input {
+                plugin: "sqs".to_string(),
+                message: format!("GetQueueUrl({name}) returned no URL"),
+            })
     }
 }
 
@@ -128,7 +137,11 @@ impl InputPlugin for SqsInput {
         "sqs"
     }
 
-    async fn run(&mut self, sender: mpsc::Sender<Event>, mut shutdown: ShutdownSignal) -> Result<()> {
+    async fn run(
+        &mut self,
+        sender: mpsc::Sender<Event>,
+        mut shutdown: ShutdownSignal,
+    ) -> Result<()> {
         let codec = self.build_codec()?;
         let client = self.build_client().await;
         let queue_url = self.resolve_queue_url(&client).await?;
@@ -226,7 +239,8 @@ mod tests {
             return;
         };
         let endpoint = std::env::var("SQS_TEST_ENDPOINT").ok();
-        let mut cfg = serde_json::json!({ "queue_url": url, "codec": "json", "wait_time_seconds": 2 });
+        let mut cfg =
+            serde_json::json!({ "queue_url": url, "codec": "json", "wait_time_seconds": 2 });
         if let Some(ep) = endpoint {
             cfg["endpoint"] = serde_json::Value::String(ep);
         }

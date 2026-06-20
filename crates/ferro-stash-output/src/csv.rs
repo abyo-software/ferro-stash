@@ -119,10 +119,11 @@ impl OutputPlugin for CsvOutput {
             .from_writer(Vec::new());
         for event in &events {
             let row: Vec<String> = self.fields.iter().map(|f| self.cell(event, f)).collect();
-            wtr.write_record(&row).map_err(|e| FerroStashError::Output {
-                plugin: "csv".to_string(),
-                message: format!("csv encode error: {e}"),
-            })?;
+            wtr.write_record(&row)
+                .map_err(|e| FerroStashError::Output {
+                    plugin: "csv".to_string(),
+                    message: format!("csv encode error: {e}"),
+                })?;
         }
         let data = wtr.into_inner().map_err(|e| FerroStashError::Output {
             plugin: "csv".to_string(),
@@ -153,10 +154,12 @@ impl OutputPlugin for CsvOutput {
             *guard = Some(std::io::BufWriter::new(file));
         }
         if let Some(writer) = guard.as_mut() {
-            writer.write_all(&data).map_err(|e| FerroStashError::Output {
-                plugin: "csv".to_string(),
-                message: format!("write error: {e}"),
-            })?;
+            writer
+                .write_all(&data)
+                .map_err(|e| FerroStashError::Output {
+                    plugin: "csv".to_string(),
+                    message: format!("write error: {e}"),
+                })?;
             writer.flush().map_err(|e| FerroStashError::Output {
                 plugin: "csv".to_string(),
                 message: format!("flush error: {e}"),

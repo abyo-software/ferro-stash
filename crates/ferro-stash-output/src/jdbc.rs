@@ -144,13 +144,18 @@ fn parse_statement(settings: &serde_json::Value) -> Result<(String, Vec<String>)
                 .next()
                 .and_then(serde_json::Value::as_str)
                 .ok_or_else(|| {
-                    output_err("jdbc output `statement` array element 0 must be the SQL string".to_string())
+                    output_err(
+                        "jdbc output `statement` array element 0 must be the SQL string"
+                            .to_string(),
+                    )
                 })?
                 .to_string();
             let fields = it
                 .map(|v| {
                     v.as_str().map(String::from).ok_or_else(|| {
-                        output_err("jdbc output `statement` field names must be strings".to_string())
+                        output_err(
+                            "jdbc output `statement` field names must be strings".to_string(),
+                        )
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -211,7 +216,10 @@ mod tests {
             "postgres://h:5432/db"
         );
         assert_eq!(jdbc_to_sqlx_url("jdbc:mysql://h/db"), "mysql://h/db");
-        assert_eq!(jdbc_to_sqlx_url("jdbc:sqlite:/tmp/x.db"), "sqlite:/tmp/x.db");
+        assert_eq!(
+            jdbc_to_sqlx_url("jdbc:sqlite:/tmp/x.db"),
+            "sqlite:/tmp/x.db"
+        );
         assert_eq!(jdbc_to_sqlx_url("mysql://h/db"), "mysql://h/db");
     }
 
@@ -277,7 +285,10 @@ mod tests {
         let url = format!("sqlite://{}?mode=rwc", db_path.display());
 
         install_drivers_once();
-        let setup = AnyPoolOptions::new().connect(&url).await.expect("connect setup");
+        let setup = AnyPoolOptions::new()
+            .connect(&url)
+            .await
+            .expect("connect setup");
         sqlx::query("CREATE TABLE logs (msg TEXT, level INTEGER, ratio REAL)")
             .execute(&setup)
             .await

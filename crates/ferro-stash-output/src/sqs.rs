@@ -52,16 +52,17 @@ impl SqsOutput {
             return Err(err("sqs output requires `queue` (name) or `queue_url`"));
         }
         let (codec_name, codec_settings) = resolve_codec(settings, "json");
-        let codec = create_codec(&codec_name, &codec_settings).map_err(|e| {
-            FerroStashError::Output {
+        let codec =
+            create_codec(&codec_name, &codec_settings).map_err(|e| FerroStashError::Output {
                 plugin: "sqs".to_string(),
                 message: format!("unknown/invalid codec '{codec_name}': {e}"),
-            }
-        })?;
+            })?;
         Ok(Self {
             queue,
             queue_url,
-            region: settings.get_string("region").unwrap_or_else(|| "us-east-1".to_string()),
+            region: settings
+                .get_string("region")
+                .unwrap_or_else(|| "us-east-1".to_string()),
             access_key_id: settings.get_string("access_key_id"),
             secret_access_key: settings.get_string("secret_access_key"),
             endpoint: settings.get_string("endpoint"),
@@ -80,7 +81,11 @@ impl SqsOutput {
                     aws_config::defaults(aws_config::BehaviorVersion::latest()).region(region);
                 if let (Some(ak), Some(sk)) = (&self.access_key_id, &self.secret_access_key) {
                     loader = loader.credentials_provider(aws_sdk_sqs::config::Credentials::new(
-                        ak, sk, None, None, "ferro-stash-sqs-output",
+                        ak,
+                        sk,
+                        None,
+                        None,
+                        "ferro-stash-sqs-output",
                     ));
                 }
                 let sdk_config = loader.load().await;
@@ -111,10 +116,12 @@ impl SqsOutput {
                         plugin: "sqs".to_string(),
                         message: format!("GetQueueUrl({name}) failed: {e}"),
                     })?;
-                out.queue_url().map(String::from).ok_or_else(|| FerroStashError::Output {
-                    plugin: "sqs".to_string(),
-                    message: format!("GetQueueUrl({name}) returned no URL"),
-                })
+                out.queue_url()
+                    .map(String::from)
+                    .ok_or_else(|| FerroStashError::Output {
+                        plugin: "sqs".to_string(),
+                        message: format!("GetQueueUrl({name}) returned no URL"),
+                    })
             })
             .await
     }
@@ -133,10 +140,13 @@ impl OutputPlugin for SqsOutput {
         let url = self.queue_url().await?.clone();
         let client = self.client().await;
         for event in events {
-            let bytes = self.codec.encode(&event).map_err(|e| FerroStashError::Output {
-                plugin: "sqs".to_string(),
-                message: format!("codec encode error: {e}"),
-            })?;
+            let bytes = self
+                .codec
+                .encode(&event)
+                .map_err(|e| FerroStashError::Output {
+                    plugin: "sqs".to_string(),
+                    message: format!("codec encode error: {e}"),
+                })?;
             let body = String::from_utf8_lossy(&bytes).to_string();
             client
                 .send_message()
@@ -165,7 +175,9 @@ mod tests {
     fn requires_queue_or_url() {
         assert!(SqsOutput::from_config(&serde_json::json!({}), None).is_err());
         assert!(SqsOutput::from_config(&serde_json::json!({ "queue": "q" }), None).is_ok());
-        assert!(SqsOutput::from_config(&serde_json::json!({ "queue_url": "http://x/q" }), None).is_ok());
+        assert!(
+            SqsOutput::from_config(&serde_json::json!({ "queue_url": "http://x/q" }), None).is_ok()
+        );
     }
 
     #[test]

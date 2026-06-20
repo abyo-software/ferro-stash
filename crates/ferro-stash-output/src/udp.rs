@@ -91,10 +91,13 @@ impl OutputPlugin for UdpOutput {
 
         let addr = (self.host.as_str(), self.port);
         for event in &events {
-            let bytes = self.codec.encode(event).map_err(|e| FerroStashError::Output {
-                plugin: "udp".to_string(),
-                message: format!("codec encode error: {e}"),
-            })?;
+            let bytes = self
+                .codec
+                .encode(event)
+                .map_err(|e| FerroStashError::Output {
+                    plugin: "udp".to_string(),
+                    message: format!("codec encode error: {e}"),
+                })?;
             socket
                 .send_to(&bytes, addr)
                 .await
