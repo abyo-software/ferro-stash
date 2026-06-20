@@ -183,7 +183,9 @@ impl FilterPlugin for MemcachedFilter {
         // (enrich), then sets (store).
         let results: Vec<(String, Option<Vec<u8>>)> =
             tokio::task::spawn_blocking(move || -> Result<Vec<(String, Option<Vec<u8>>)>> {
-                let guard = client.lock().expect("memcached client mutex poisoned");
+                // Recover from a poisoned mutex (a prior panic while holding the
+                // lock) instead of cascading the panic into this worker.
+                let guard = client.lock().unwrap_or_else(|e| e.into_inner());
                 let mut out = Vec::with_capacity(get_ops.len());
                 for (field, key) in get_ops {
                     let val = guard

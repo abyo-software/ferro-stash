@@ -46,7 +46,11 @@ fn install_drivers_once() {
     INSTALL.call_once(sqlx::any::install_default_drivers);
 }
 
-#[derive(Debug)]
+/// JDBC output configuration.
+///
+/// `Debug` is implemented manually so the `connection_string` (which embeds DB
+/// credentials, e.g. `postgres://user:pass@host/db`) is never rendered in
+/// logs/diagnostics.
 pub struct JdbcOutput {
     connection_string: String,
     sql: String,
@@ -54,6 +58,17 @@ pub struct JdbcOutput {
     fields: Vec<String>,
     condition: Option<Condition>,
     pool: OnceCell<AnyPool>,
+}
+
+impl std::fmt::Debug for JdbcOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JdbcOutput")
+            .field("connection_string", &"***")
+            .field("sql", &self.sql)
+            .field("fields", &self.fields)
+            .field("condition", &self.condition)
+            .finish_non_exhaustive()
+    }
 }
 
 impl JdbcOutput {
@@ -234,6 +249,26 @@ mod tests {
         assert_eq!(o.sql, "INSERT INTO t (a, b) VALUES (?, ?)");
         assert_eq!(o.fields, vec!["field_a".to_string(), "field_b".to_string()]);
         assert_eq!(o.name(), "jdbc");
+    }
+
+    #[test]
+    fn debug_redacts_connection_string() {
+        // The connection string embeds DB credentials and must not leak via `{:?}`.
+        let o = JdbcOutput::from_config(
+            &serde_json::json!({
+                "connection_string": "postgres://user:super-secret-pw@h/db",
+                "statement": "DELETE FROM t"
+            }),
+            None,
+        )
+        .expect("config");
+        let dbg = format!("{o:?}");
+        assert!(
+            !dbg.contains("super-secret-pw"),
+            "connection string leaked: {dbg}"
+        );
+        assert!(!dbg.contains("user:"), "credentials leaked: {dbg}");
+        assert!(dbg.contains("***"));
     }
 
     #[test]

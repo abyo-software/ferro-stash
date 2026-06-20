@@ -89,11 +89,13 @@ fn parse_mailbox(addr: &str) -> Result<Mailbox> {
         return Ok(mb);
     }
     if let Some((user, domain)) = addr.rsplit_once('@') {
-        if !user.is_empty()
-            && !domain.is_empty()
-            && !user.contains(['<', '>', ' '])
-            && !domain.contains(['<', '>', ' '])
-        {
+        // Reject control chars (`\r`, `\n`, `\t`, …) and angle brackets/spaces so
+        // an event-templated `to` cannot inject extra SMTP headers (e.g. a CRLF
+        // followed by `Bcc:`) via the lenient `new_dangerous` fallback.
+        let unsafe_part = |s: &str| {
+            s.is_empty() || s.contains(['<', '>', ' ']) || s.chars().any(char::is_control)
+        };
+        if !unsafe_part(user) && !unsafe_part(domain) {
             return Ok(Mailbox::new(None, Address::new_dangerous(user, domain)));
         }
     }
@@ -251,6 +253,18 @@ mod tests {
         assert!(parse_mailbox("logstash@ferro-stash").is_ok());
         assert!(parse_mailbox("ops@example.com").is_ok());
         assert!(parse_mailbox("not-an-email").is_err());
+    }
+
+    #[test]
+    fn parse_mailbox_rejects_header_injection() {
+        // CRLF / control chars in a (templated) recipient must be rejected, not
+        // passed through the lenient new_dangerous fallback (SMTP header injection).
+        assert!(parse_mailbox("ops@example.com\nBcc: evil@x.com").is_err());
+        assert!(parse_mailbox("ops@exa\rmple.com").is_err());
+        assert!(parse_mailbox("ops@exa\nmple").is_err());
+        assert!(parse_mailbox("op\ts@ferro-stash").is_err());
+        // The legitimate single-label default still parses via the fallback.
+        assert!(parse_mailbox("logstash@ferro-stash").is_ok());
     }
 
     #[test]

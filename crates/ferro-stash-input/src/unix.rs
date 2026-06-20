@@ -33,12 +33,12 @@ use ferro_stash_core::plugin::InputPlugin;
 use ferro_stash_core::settings_helpers::SettingsExt;
 use ferro_stash_core::shutdown::ShutdownSignal;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::BufReader;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::exec::{event_from_line, LineCodec};
+use crate::exec::{event_from_line, read_line_capped, CappedLine, LineCodec, MAX_LINE_BYTES};
 
 /// Backoff between client-mode reconnect attempts.
 const CLIENT_RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
@@ -99,12 +99,12 @@ impl UnixInput {
         sender: &mpsc::Sender<Event>,
         shutdown: &mut ShutdownSignal,
     ) -> bool {
-        let mut lines = BufReader::new(stream).lines();
+        let mut reader = BufReader::new(stream);
         loop {
             tokio::select! {
-                next = lines.next_line() => {
+                next = read_line_capped(&mut reader, MAX_LINE_BYTES) => {
                     match next {
-                        Ok(Some(line)) => {
+                        Ok(CappedLine::Line(line)) => {
                             if line.trim().is_empty() {
                                 continue;
                             }
@@ -115,7 +115,11 @@ impl UnixInput {
                                 return true;
                             }
                         }
-                        Ok(None) => return false, // peer closed
+                        Ok(CappedLine::Overflow) => {
+                            warn!(path = %self.path, cap = MAX_LINE_BYTES, "unix input: line exceeds max length; dropping connection");
+                            return false;
+                        }
+                        Ok(CappedLine::Eof) => return false, // peer closed
                         Err(e) => {
                             warn!(error = %e, "unix input: read error");
                             return false;

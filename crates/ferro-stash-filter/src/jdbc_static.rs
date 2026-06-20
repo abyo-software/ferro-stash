@@ -56,6 +56,12 @@ use tracing::warn;
 
 use crate::jdbc_streaming::{install_drivers_once, resolve_connection_string, row_to_object};
 
+/// Default cap on the number of rows a single loader query may return. The whole
+/// reference table is held in memory, so an unbounded loader (a typo'd query
+/// against a huge table) could OOM the process. A loader that exceeds this fails
+/// loud (a load error → `_jdbcstaticfailure`) rather than exhausting memory.
+const DEFAULT_MAX_LOADER_ROWS: usize = 1_000_000;
+
 /// A startup loader: a SQL `query` whose rows are held in memory under `id`.
 #[derive(Debug, Clone)]
 struct Loader {
@@ -88,6 +94,8 @@ pub struct JdbcStaticFilter {
     loaders: Vec<Loader>,
     lookups: Vec<Lookup>,
     refresh_interval: Option<Duration>,
+    /// Max rows a single loader query may return before the load fails loud.
+    max_loader_rows: usize,
     state: RwLock<Option<LoadedState>>,
     pool: OnceCell<AnyPool>,
     condition: Option<Condition>,
@@ -128,11 +136,20 @@ impl JdbcStaticFilter {
             .filter(|s| *s > 0)
             .map(Duration::from_secs);
 
+        // Optional per-loader row cap (additive to the Logstash keys); defaults to
+        // a safe bound so a runaway loader query fails loud instead of OOMing.
+        let max_loader_rows = settings
+            .get_u64("loader_max_rows")
+            .filter(|n| *n > 0)
+            .map(|n| n as usize)
+            .unwrap_or(DEFAULT_MAX_LOADER_ROWS);
+
         Ok(Self {
             connection_string,
             loaders,
             lookups,
             refresh_interval,
+            max_loader_rows,
             state: RwLock::new(None),
             pool: OnceCell::new(),
             condition,
@@ -183,10 +200,24 @@ impl JdbcStaticFilter {
 
         let mut loader_rows: HashMap<String, Vec<EventValue>> = HashMap::new();
         for loader in &self.loaders {
-            let rows = sqlx::query(&loader.query)
+            // Cap the fetch at `max_loader_rows + 1` rows at the database level so
+            // a runaway loader never materializes more than the cap in memory.
+            let base = loader.query.trim().trim_end_matches(';');
+            let capped = format!(
+                "SELECT * FROM ({base}) AS ferro_stash_loader LIMIT {}",
+                self.max_loader_rows.saturating_add(1)
+            );
+            let rows = sqlx::query(&capped)
                 .fetch_all(pool)
                 .await
                 .map_err(|e| filter_err(format!("loader '{}' query failed: {e}", loader.id)))?;
+            if rows.len() > self.max_loader_rows {
+                return Err(filter_err(format!(
+                    "loader '{}' returned more than {} rows (the cap); refusing to load to \
+                     avoid OOM — add a WHERE/LIMIT to the loader query or raise `loader_max_rows`",
+                    loader.id, self.max_loader_rows
+                )));
+            }
             let mapped: Vec<EventValue> = rows.iter().map(row_to_object).collect();
             loader_rows.insert(loader.id.clone(), mapped);
         }
@@ -512,6 +543,46 @@ mod tests {
                 .and_then(EventValue::as_array)
                 .map(Vec::len),
             Some(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn jdbc_static_loader_row_cap_fails_loud() {
+        // A loader returning more rows than `loader_max_rows` must fail loud (a
+        // load error → `_jdbcstaticfailure`) rather than load unbounded into RAM.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("cap.db");
+        let url = format!("sqlite://{}?mode=rwc", db_path.display());
+
+        install_drivers_once();
+        let setup = AnyPoolOptions::new()
+            .connect(&url)
+            .await
+            .expect("connect setup");
+        sqlx::query("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .execute(&setup)
+            .await
+            .expect("create");
+        sqlx::query("INSERT INTO t (id) VALUES (1), (2), (3), (4), (5)")
+            .execute(&setup)
+            .await
+            .expect("insert");
+        setup.close().await;
+
+        let filter = JdbcStaticFilter::from_config(
+            &serde_json::json!({
+                "connection_string": url,
+                "loaders": [{ "id": "t", "query": "SELECT id FROM t" }],
+                "local_lookups": [{ "query": "%{k}", "target": "out" }],
+                "loader_max_rows": 2
+            }),
+            None,
+        )
+        .expect("config");
+        let out = filter.filter(Event::new("x")).await.expect("filter");
+        assert!(
+            out[0].has_tag("_jdbcstaticfailure"),
+            "over-cap loader must fail loud"
         );
     }
 

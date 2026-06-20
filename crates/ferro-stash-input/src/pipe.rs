@@ -32,12 +32,12 @@ use ferro_stash_core::settings_helpers::SettingsExt;
 use ferro_stash_core::shutdown::ShutdownSignal;
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::BufReader;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::exec::{event_from_line, LineCodec};
+use crate::exec::{event_from_line, read_line_capped, CappedLine, LineCodec, MAX_LINE_BYTES};
 
 /// Backoff between a child exiting and being relaunched. Small enough to be
 /// responsive but large enough to avoid a tight crash-loop spinning the CPU.
@@ -93,13 +93,13 @@ impl PipeInput {
                 });
             }
         };
-        let mut lines = BufReader::new(stdout).lines();
+        let mut reader = BufReader::new(stdout);
 
         loop {
             tokio::select! {
-                next = lines.next_line() => {
+                next = read_line_capped(&mut reader, MAX_LINE_BYTES) => {
                     match next {
-                        Ok(Some(line)) => {
+                        Ok(CappedLine::Line(line)) => {
                             if line.trim().is_empty() {
                                 continue;
                             }
@@ -110,7 +110,12 @@ impl PipeInput {
                                 return Ok(true);
                             }
                         }
-                        Ok(None) => {
+                        Ok(CappedLine::Overflow) => {
+                            warn!(command = %self.command, cap = MAX_LINE_BYTES, "pipe input: line exceeds max length; restarting child");
+                            let _ = child.kill().await;
+                            return Ok(false);
+                        }
+                        Ok(CappedLine::Eof) => {
                             debug!(command = %self.command, "pipe input: child stdout closed");
                             // Reap the child to avoid a zombie before relaunch.
                             let _ = child.wait().await;

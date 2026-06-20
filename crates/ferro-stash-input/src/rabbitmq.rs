@@ -29,7 +29,9 @@ use ferro_stash_core::event::Event;
 use ferro_stash_core::plugin::InputPlugin;
 use ferro_stash_core::settings_helpers::SettingsExt;
 use ferro_stash_core::shutdown::ShutdownSignal;
-use lapin::options::{BasicAckOptions, BasicConsumeOptions, QueueBindOptions, QueueDeclareOptions};
+use lapin::options::{
+    BasicAckOptions, BasicConsumeOptions, BasicNackOptions, QueueBindOptions, QueueDeclareOptions,
+};
 use lapin::types::FieldTable;
 use lapin::uri::{AMQPAuthority, AMQPScheme, AMQPUri, AMQPUserInfo};
 use lapin::{Connection, ConnectionProperties};
@@ -73,6 +75,29 @@ impl std::fmt::Debug for RabbitmqInput {
             .field("ack", &self.ack)
             .field("codec", &self.codec)
             .finish()
+    }
+}
+
+/// What to do with a consumed delivery after attempting decode + send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeliveryAction {
+    /// Decode + send succeeded and acking is enabled: ack the delivery.
+    Ack,
+    /// Decode failed (with acking enabled): nack **without requeue** so the
+    /// broker routes it to the queue's dead-letter exchange (or drops it),
+    /// instead of silently acking and dropping the data.
+    NackToDlx,
+    /// Acking is disabled in config: leave the delivery to the broker's policy.
+    Leave,
+}
+
+/// Decide what to do with a delivery. A decode failure must never ack (which
+/// would acknowledge — and so drop — a message we failed to process).
+fn delivery_action(ack_enabled: bool, decode_ok: bool) -> DeliveryAction {
+    match (ack_enabled, decode_ok) {
+        (true, true) => DeliveryAction::Ack,
+        (true, false) => DeliveryAction::NackToDlx,
+        (false, _) => DeliveryAction::Leave,
     }
 }
 
@@ -217,7 +242,8 @@ impl InputPlugin for RabbitmqInput {
                 maybe = consumer.next() => {
                     match maybe {
                         Some(Ok(delivery)) => {
-                            match codec.decode(&delivery.data) {
+                            // Only acknowledge after a successful decode + send.
+                            let decode_ok = match codec.decode(&delivery.data) {
                                 Ok(events) => {
                                     for ev in events {
                                         if sender.send(ev).await.is_err() {
@@ -226,13 +252,29 @@ impl InputPlugin for RabbitmqInput {
                                             return Ok(());
                                         }
                                     }
+                                    true
                                 }
-                                Err(e) => warn!(error = %e, "rabbitmq decode error"),
-                            }
-                            if self.ack {
-                                if let Err(e) = delivery.ack(BasicAckOptions::default()).await {
-                                    warn!(error = %e, "rabbitmq ack failed (will redeliver)");
+                                Err(e) => {
+                                    warn!(error = %e, "rabbitmq decode error; not acking (nack→DLX / leave unacked)");
+                                    false
                                 }
+                            };
+                            match delivery_action(self.ack, decode_ok) {
+                                DeliveryAction::Ack => {
+                                    if let Err(e) = delivery.ack(BasicAckOptions::default()).await {
+                                        warn!(error = %e, "rabbitmq ack failed (will redeliver)");
+                                    }
+                                }
+                                DeliveryAction::NackToDlx => {
+                                    let opts = BasicNackOptions {
+                                        requeue: false,
+                                        ..BasicNackOptions::default()
+                                    };
+                                    if let Err(e) = delivery.nack(opts).await {
+                                        warn!(error = %e, "rabbitmq nack failed (will redeliver)");
+                                    }
+                                }
+                                DeliveryAction::Leave => {}
                             }
                         }
                         Some(Err(e)) => {
@@ -307,6 +349,17 @@ mod tests {
             RabbitmqInput::from_config(&serde_json::json!({ "queue": "q", "port": 70000 }))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn delivery_action_decision() {
+        // Success + ack enabled → ack.
+        assert_eq!(delivery_action(true, true), DeliveryAction::Ack);
+        // Decode failure + ack enabled → nack to DLX (never silently ack/drop).
+        assert_eq!(delivery_action(true, false), DeliveryAction::NackToDlx);
+        // Ack disabled → leave the delivery alone regardless of decode outcome.
+        assert_eq!(delivery_action(false, true), DeliveryAction::Leave);
+        assert_eq!(delivery_action(false, false), DeliveryAction::Leave);
     }
 
     #[test]

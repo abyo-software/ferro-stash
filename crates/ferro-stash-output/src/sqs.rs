@@ -26,7 +26,10 @@ use ferro_stash_core::plugin::OutputPlugin;
 use ferro_stash_core::settings_helpers::SettingsExt;
 use tokio::sync::OnceCell;
 
-#[derive(Debug)]
+/// SQS output configuration.
+///
+/// `Debug` is implemented manually so the `secret_access_key` secret is never
+/// rendered in logs/diagnostics (`{:?}` prints `Some("***")` / `None`).
 pub struct SqsOutput {
     queue: Option<String>,
     queue_url: Option<String>,
@@ -38,6 +41,23 @@ pub struct SqsOutput {
     condition: Option<Condition>,
     client: OnceCell<aws_sdk_sqs::Client>,
     resolved_url: OnceCell<String>,
+}
+
+impl std::fmt::Debug for SqsOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SqsOutput")
+            .field("queue", &self.queue)
+            .field("queue_url", &self.queue_url)
+            .field("region", &self.region)
+            .field("access_key_id", &self.access_key_id)
+            .field(
+                "secret_access_key",
+                &self.secret_access_key.as_ref().map(|_| "***"),
+            )
+            .field("endpoint", &self.endpoint)
+            .field("condition", &self.condition)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SqsOutput {
@@ -185,5 +205,21 @@ mod tests {
         let o = SqsOutput::from_config(&serde_json::json!({ "queue": "q" }), None).expect("config");
         assert_eq!(o.name(), "sqs");
         assert_eq!(o.region, "us-east-1");
+    }
+
+    #[test]
+    fn debug_redacts_secret() {
+        let o = SqsOutput::from_config(
+            &serde_json::json!({
+                "queue": "q", "access_key_id": "AKIAEXAMPLE",
+                "secret_access_key": "super-secret-sak"
+            }),
+            None,
+        )
+        .expect("config");
+        let dbg = format!("{o:?}");
+        assert!(!dbg.contains("super-secret-sak"), "secret leaked: {dbg}");
+        assert!(dbg.contains("***"));
+        assert!(dbg.contains("AKIAEXAMPLE"));
     }
 }

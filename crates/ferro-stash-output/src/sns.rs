@@ -26,7 +26,10 @@ use ferro_stash_core::plugin::OutputPlugin;
 use ferro_stash_core::settings_helpers::SettingsExt;
 use tokio::sync::OnceCell;
 
-#[derive(Debug)]
+/// SNS output configuration.
+///
+/// `Debug` is implemented manually so the `secret_access_key` secret is never
+/// rendered in logs/diagnostics (`{:?}` prints `Some("***")` / `None`).
 pub struct SnsOutput {
     topic_arn: String,
     region: String,
@@ -38,6 +41,23 @@ pub struct SnsOutput {
     codec: Box<dyn Codec>,
     condition: Option<Condition>,
     client: OnceCell<aws_sdk_sns::Client>,
+}
+
+impl std::fmt::Debug for SnsOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SnsOutput")
+            .field("topic_arn", &self.topic_arn)
+            .field("region", &self.region)
+            .field("access_key_id", &self.access_key_id)
+            .field(
+                "secret_access_key",
+                &self.secret_access_key.as_ref().map(|_| "***"),
+            )
+            .field("endpoint", &self.endpoint)
+            .field("subject", &self.subject)
+            .field("condition", &self.condition)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SnsOutput {
@@ -156,5 +176,21 @@ mod tests {
         .expect("config");
         assert_eq!(o.name(), "sns");
         assert_eq!(o.region, "us-east-1");
+    }
+
+    #[test]
+    fn debug_redacts_secret() {
+        let o = SnsOutput::from_config(
+            &serde_json::json!({
+                "topic_arn": "arn:aws:sns:us-east-1:1:t",
+                "access_key_id": "AKIAEXAMPLE", "secret_access_key": "super-secret-sak"
+            }),
+            None,
+        )
+        .expect("config");
+        let dbg = format!("{o:?}");
+        assert!(!dbg.contains("super-secret-sak"), "secret leaked: {dbg}");
+        assert!(dbg.contains("***"));
+        assert!(dbg.contains("AKIAEXAMPLE"));
     }
 }

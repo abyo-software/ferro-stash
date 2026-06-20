@@ -37,9 +37,84 @@ use ferro_stash_core::plugin::InputPlugin;
 use ferro_stash_core::settings_helpers::SettingsExt;
 use ferro_stash_core::shutdown::ShutdownSignal;
 use std::time::{Duration, Instant};
+use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
+
+/// Maximum bytes a single line may accumulate before a newline is seen, used by
+/// the line-streaming inputs (`pipe`, `unix`). An upstream (child process / socket
+/// peer) that never emits a newline could otherwise grow the per-line buffer
+/// until OOM. 1 MiB is far above any legitimate log line (mirrors the
+/// graphite/tcp inputs' caps).
+pub(crate) const MAX_LINE_BYTES: usize = 1024 * 1024;
+
+/// Outcome of a single bounded line read.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CappedLine {
+    /// A complete (or final EOF-terminated) line, with the trailing `\n`/`\r\n`
+    /// stripped.
+    Line(String),
+    /// The stream reached EOF with no further data.
+    Eof,
+    /// A line exceeded the cap before a newline was seen; its bytes were
+    /// discarded. The caller should stop reading the stream.
+    Overflow,
+}
+
+/// Read one `\n`-delimited line into a `String`, enforcing a hard cap on the
+/// bytes buffered before a newline is seen. This is a DoS-safe replacement for
+/// `AsyncBufReadExt::lines()` (which is unbounded). Mirrors the graphite/tcp
+/// inputs' bounded readers.
+pub(crate) async fn read_line_capped<R>(reader: &mut R, cap: usize) -> std::io::Result<CappedLine>
+where
+    R: AsyncBufReadExt + Unpin,
+{
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            if buf.is_empty() {
+                return Ok(CappedLine::Eof);
+            }
+            // EOF with a trailing, unterminated line.
+            return Ok(CappedLine::Line(strip_eol(&buf)));
+        }
+        match available.iter().position(|&b| b == b'\n') {
+            Some(idx) => {
+                let take = idx + 1;
+                if buf.len() + take > cap {
+                    reader.consume(take);
+                    return Ok(CappedLine::Overflow);
+                }
+                buf.extend_from_slice(&available[..take]);
+                reader.consume(take);
+                return Ok(CappedLine::Line(strip_eol(&buf)));
+            }
+            None => {
+                let len = available.len();
+                if buf.len() + len > cap {
+                    reader.consume(len);
+                    return Ok(CappedLine::Overflow);
+                }
+                buf.extend_from_slice(available);
+                reader.consume(len);
+            }
+        }
+    }
+}
+
+/// Strip a trailing `\n` (and a preceding `\r`) and decode to a `String`.
+fn strip_eol(buf: &[u8]) -> String {
+    let mut end = buf.len();
+    if end > 0 && buf[end - 1] == b'\n' {
+        end -= 1;
+        if end > 0 && buf[end - 1] == b'\r' {
+            end -= 1;
+        }
+    }
+    String::from_utf8_lossy(&buf[..end]).into_owned()
+}
 
 /// How stdout bytes are turned into events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,6 +204,9 @@ impl ExecInput {
         let output = Command::new("sh")
             .arg("-c")
             .arg(&self.command)
+            // Kill the child if this future is dropped (e.g. shutdown interrupts a
+            // hung command) so it is not orphaned.
+            .kill_on_drop(true)
             .output()
             .await?;
         let elapsed = started.elapsed();
@@ -167,7 +245,16 @@ impl InputPlugin for ExecInput {
     ) -> Result<()> {
         info!(command = %self.command, interval = self.interval, "exec input starting");
         loop {
-            match self.run_once().await {
+            // Run the command under shutdown.wait() so a hung/long-running command
+            // cannot block pipeline shutdown (kill_on_drop reaps the child).
+            let result = tokio::select! {
+                r = self.run_once() => r,
+                () = shutdown.wait() => {
+                    info!("exec input shutting down");
+                    break;
+                }
+            };
+            match result {
                 Ok((stdout, duration)) => {
                     for mut event in events_from_output(&stdout, self.codec) {
                         self.stamp_metadata(&mut event, duration);
@@ -273,6 +360,58 @@ mod tests {
         assert_eq!(events[0].get("k"), Some(&EventValue::Integer(1)));
         assert!(events[1].has_tag("_jsonparsefailure"));
         assert_eq!(events[1].message(), Some("notjson"));
+    }
+
+    #[tokio::test]
+    async fn read_line_capped_splits_and_eofs() {
+        use tokio::io::BufReader;
+        let data = b"alpha\nbeta\n";
+        let mut r = BufReader::new(&data[..]);
+        assert_eq!(
+            read_line_capped(&mut r, 1024).await.expect("read"),
+            CappedLine::Line("alpha".to_string())
+        );
+        assert_eq!(
+            read_line_capped(&mut r, 1024).await.expect("read"),
+            CappedLine::Line("beta".to_string())
+        );
+        assert_eq!(
+            read_line_capped(&mut r, 1024).await.expect("read"),
+            CappedLine::Eof
+        );
+    }
+
+    #[tokio::test]
+    async fn read_line_capped_rejects_overlong_line() {
+        use tokio::io::BufReader;
+        // 64 bytes with no newline within a 16-byte cap → Overflow (DoS-safe).
+        let mut data = vec![b'x'; 64];
+        data.push(b'\n');
+        let mut r = BufReader::new(&data[..]);
+        assert_eq!(
+            read_line_capped(&mut r, 16).await.expect("read"),
+            CappedLine::Overflow
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_shutdown_interrupts_running_command() {
+        // A long-running command must not block shutdown: requesting shutdown
+        // should return run() promptly, well before the command would finish.
+        let mut input =
+            ExecInput::from_config(&serde_json::json!({ "command": "sleep 30", "interval": 1 }))
+                .expect("config");
+        let (tx, _rx) = mpsc::channel(8);
+        let (controller, signal) = ShutdownController::new();
+        let handle = tokio::spawn(async move { input.run(tx, signal).await });
+        // Let the command start, then request shutdown.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        controller.shutdown();
+        let joined = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        assert!(
+            joined.is_ok(),
+            "exec input did not shut down while the command was still running"
+        );
     }
 
     #[tokio::test]

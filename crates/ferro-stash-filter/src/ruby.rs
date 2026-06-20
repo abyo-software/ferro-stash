@@ -9,6 +9,24 @@
 //! - `path` option for external script files
 //! - `new_event_block` for creating additional events
 //! - Ruby stdlib (JSON, Time, Regexp, etc.)
+//!
+//! ## Residuals (honest limitations)
+//!
+//! - **Per-thread runtime cache is not evicted on reload.** Each OS worker thread
+//!   lazily builds and caches its own Artichoke interpreter in the thread-local
+//!   `RUBY_RUNTIMES` map, keyed by filter id (Artichoke is not `Send`/`Sync`, so
+//!   one interpreter cannot be shared across threads). That cache is **not**
+//!   evicted on `config.reload.automatic`: each reload mints a new filter id, so a
+//!   long-lived process that reloads repeatedly slowly leaks one interpreter per
+//!   reload × worker thread. This is acceptable for the common, non-reloading
+//!   deployment; a proper fix needs pipeline-teardown hooks (out of scope here).
+//! - **Interpreter state is per-OS-worker-thread, not global.** Because each
+//!   worker thread has its own interpreter, instance/global variables (`@x`,
+//!   `$x`) and other interpreter state accumulated by the `init`/`code` blocks are
+//!   **per-thread**, not shared by one interpreter. Stateful Ruby accumulators
+//!   (e.g. a running counter in `$x`) are therefore **non-deterministic** across
+//!   threads — each thread keeps its own copy. Use the event itself (or an
+//!   external store) for cross-event state instead of interpreter globals.
 
 use std::cell::RefCell;
 use std::collections::HashMap;

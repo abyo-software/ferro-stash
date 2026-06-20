@@ -36,12 +36,35 @@ use ferro_stash_core::shutdown::ShutdownSignal;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-#[derive(Clone, Debug)]
+/// Cap on a single polled response body. Mirrors the http filter's
+/// `MAX_RESPONSE_BYTES`: a misconfigured/hostile endpoint returning a huge body
+/// must not be buffered unbounded into memory.
+const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
+/// One configured request.
+///
+/// `Debug` is implemented manually so header **values** (which may carry
+/// `Authorization: Bearer …` secrets) are never rendered in logs/diagnostics;
+/// the header names stay visible.
+#[derive(Clone)]
 struct UrlSpec {
     name: String,
     url: String,
     method: String,
     headers: BTreeMap<String, String>,
+}
+
+impl std::fmt::Debug for UrlSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted: BTreeMap<&str, &str> =
+            self.headers.keys().map(|k| (k.as_str(), "***")).collect();
+        f.debug_struct("UrlSpec")
+            .field("name", &self.name)
+            .field("url", &self.url)
+            .field("method", &self.method)
+            .field("headers", &redacted)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -205,7 +228,12 @@ impl InputPlugin for HttpPollerInput {
                 match req.send().await {
                     Ok(resp) => {
                         let status = resp.status();
-                        match resp.bytes().await {
+                        match ferro_stash_core::read_capped_body(
+                            Box::pin(resp.bytes_stream()),
+                            MAX_RESPONSE_BYTES,
+                        )
+                        .await
+                        {
                             Ok(body) => match codec.decode(&body) {
                                 Ok(events) => {
                                     for mut event in events {
@@ -284,6 +312,24 @@ mod tests {
             Some("Bearer t")
         );
         assert_eq!(i.interval, 120);
+    }
+
+    #[test]
+    fn debug_redacts_header_values() {
+        // Authorization/Bearer header values must not leak via `{:?}`.
+        let s = serde_json::json!({
+            "urls": { "m": { "url": "http://x/m",
+                             "headers": { "Authorization": "Bearer super-secret-token" } } },
+        });
+        let i = HttpPollerInput::from_config(&s).expect("config");
+        let dbg = format!("{i:?}");
+        assert!(
+            !dbg.contains("super-secret-token"),
+            "header secret leaked: {dbg}"
+        );
+        assert!(dbg.contains("***"));
+        // The header name is still visible (only the value is masked).
+        assert!(dbg.contains("Authorization"));
     }
 
     #[test]

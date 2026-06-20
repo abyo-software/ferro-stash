@@ -180,6 +180,12 @@ pub(crate) fn rewrite_named_params(sql: &str) -> (String, Vec<String>) {
 
 // ----- jdbc_streaming filter -----
 
+/// Default cap on the number of rows cached under a single key. A query that
+/// matches a huge number of rows is still returned for the current event, but is
+/// not cached — so one pathological lookup cannot pin an unbounded amount of
+/// memory in the result cache.
+const DEFAULT_MAX_CACHED_ROWS_PER_KEY: usize = 10_000;
+
 /// A cached result set with its insertion time (for expiry).
 struct CacheEntry {
     rows: Vec<EventValue>,
@@ -192,15 +198,18 @@ struct ResultCache {
     order: VecDeque<String>,
     capacity: usize,
     expiration: Option<Duration>,
+    /// Per-key row cap: a result with more rows than this is not cached.
+    max_rows: usize,
 }
 
 impl ResultCache {
-    fn new(capacity: usize, expiration: Option<Duration>) -> Self {
+    fn new(capacity: usize, expiration: Option<Duration>, max_rows: usize) -> Self {
         Self {
             map: HashMap::new(),
             order: VecDeque::new(),
             capacity,
             expiration,
+            max_rows,
         }
     }
 
@@ -226,6 +235,11 @@ impl ResultCache {
 
     fn insert(&mut self, key: String, rows: Vec<EventValue>) {
         if self.capacity == 0 {
+            return;
+        }
+        // Refuse to cache an over-limit result (the caller still uses it for the
+        // current event); prevents one giant result set from pinning memory.
+        if rows.len() > self.max_rows {
             return;
         }
         if !self.map.contains_key(&key) {
@@ -303,6 +317,12 @@ impl JdbcStreamingFilter {
             .get_f64("cache_expiration")
             .filter(|s| *s > 0.0)
             .map(Duration::from_secs_f64);
+        // Optional per-key row cap (additive to the Logstash keys); defaults to a
+        // safe bound so a huge result set is not cached.
+        let cache_max_rows = settings
+            .get_u64("cache_max_rows")
+            .map(|n| n as usize)
+            .unwrap_or(DEFAULT_MAX_CACHED_ROWS_PER_KEY);
 
         Ok(Self {
             connection_string,
@@ -310,7 +330,11 @@ impl JdbcStreamingFilter {
             param_order,
             parameters,
             target,
-            cache: Mutex::new(ResultCache::new(cache_size, cache_expiration)),
+            cache: Mutex::new(ResultCache::new(
+                cache_size,
+                cache_expiration,
+                cache_max_rows,
+            )),
             pool: OnceCell::new(),
             condition,
         })
@@ -479,7 +503,30 @@ mod tests {
     }
 
     fn cache_only(capacity: usize) -> ResultCache {
-        ResultCache::new(capacity, None)
+        ResultCache::new(capacity, None, usize::MAX)
+    }
+
+    #[test]
+    fn cache_refuses_over_limit_result() {
+        // max_rows = 2: a result of exactly 2 rows caches; 3 rows is refused.
+        let mut c = ResultCache::new(10, None, 2);
+        c.insert(
+            "ok".into(),
+            vec![EventValue::Integer(1), EventValue::Integer(2)],
+        );
+        assert!(c.get("ok").is_some(), "at-cap result should cache");
+        c.insert(
+            "big".into(),
+            vec![
+                EventValue::Integer(1),
+                EventValue::Integer(2),
+                EventValue::Integer(3),
+            ],
+        );
+        assert!(
+            c.get("big").is_none(),
+            "over-limit result must not be cached"
+        );
     }
 
     #[test]

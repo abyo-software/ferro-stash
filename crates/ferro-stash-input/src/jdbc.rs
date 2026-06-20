@@ -35,8 +35,12 @@
 //! - **Column type-mapping is best-effort**: each value is decoded as the first
 //!   of i64 / f64 / bool / String that succeeds, else Null (blobs become Null).
 //! - **Paging** (`jdbc_paging_enabled`) wraps the statement in
-//!   `SELECT * FROM (<statement>) LIMIT/OFFSET`; add an `ORDER BY` for stable
-//!   pages.
+//!   `SELECT * FROM (<statement>) LIMIT/OFFSET` and **streams each page to the
+//!   pipeline before fetching the next**, so a large result set is never fully
+//!   buffered in memory. Paging **requires a stable `ORDER BY`** in your
+//!   `statement`: LIMIT/OFFSET over an unordered query may return rows in a
+//!   different order between pages, silently **duplicating or skipping** rows. A
+//!   paged statement without an `ORDER BY` is logged with a warning at startup.
 
 use async_trait::async_trait;
 use ferro_stash_core::error::{FerroStashError, Result};
@@ -45,7 +49,7 @@ use ferro_stash_core::plugin::InputPlugin;
 use ferro_stash_core::settings_helpers::SettingsExt;
 use ferro_stash_core::shutdown::ShutdownSignal;
 use sqlx::any::{AnyPoolOptions, AnyRow};
-use sqlx::{AnyPool, Column, Row};
+use sqlx::{Column, Row};
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -57,7 +61,12 @@ fn install_drivers_once() {
     INSTALL.call_once(sqlx::any::install_default_drivers);
 }
 
-#[derive(Clone, Debug)]
+/// JDBC input configuration.
+///
+/// `Debug` is implemented manually so the `connection_string` (which embeds DB
+/// credentials, e.g. `postgres://user:pass@host/db`) is never rendered in
+/// logs/diagnostics.
+#[derive(Clone)]
 pub struct JdbcInput {
     connection_string: String,
     statement: String,
@@ -69,6 +78,31 @@ pub struct JdbcInput {
     lowercase_column_names: bool,
     paging_enabled: bool,
     page_size: u64,
+}
+
+impl std::fmt::Debug for JdbcInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JdbcInput")
+            .field("connection_string", &"***")
+            .field("statement", &self.statement)
+            .field("interval", &self.interval)
+            .field("tracking_column", &self.tracking_column)
+            .field("use_column_value", &self.use_column_value)
+            .field("last_run_metadata_path", &self.last_run_metadata_path)
+            .field("clean_run", &self.clean_run)
+            .field("lowercase_column_names", &self.lowercase_column_names)
+            .field("paging_enabled", &self.paging_enabled)
+            .field("page_size", &self.page_size)
+            .finish()
+    }
+}
+
+/// Outcome of emitting one batch of rows downstream.
+enum EmitOutcome {
+    /// All rows were sent.
+    Sent,
+    /// The downstream channel closed; the input should stop.
+    DownstreamClosed,
 }
 
 impl JdbcInput {
@@ -107,6 +141,17 @@ impl JdbcInput {
             .map(PathBuf::from)
             .unwrap_or_else(|| std::env::temp_dir().join(".ferro_stash_jdbc_last_run"));
 
+        let paging_enabled = settings.get_bool("jdbc_paging_enabled").unwrap_or(false);
+        // LIMIT/OFFSET paging over an unordered query can return rows in a
+        // different order between pages, silently duplicating or skipping rows.
+        // Warn loudly so the operator adds a stable ORDER BY.
+        if paging_enabled && !statement.to_lowercase().contains("order by") {
+            warn!(
+                "jdbc input: `jdbc_paging_enabled` is set but the statement has no `ORDER BY`; \
+                 paging requires a stable ORDER BY to avoid duplicate/skipped rows"
+            );
+        }
+
         Ok(Self {
             connection_string,
             statement,
@@ -116,7 +161,7 @@ impl JdbcInput {
             last_run_metadata_path,
             clean_run: settings.get_bool("clean_run").unwrap_or(false),
             lowercase_column_names: settings.get_bool("lowercase_column_names").unwrap_or(true),
-            paging_enabled: settings.get_bool("jdbc_paging_enabled").unwrap_or(false),
+            paging_enabled,
             page_size: settings.get_u64("jdbc_page_size").unwrap_or(100_000).max(1),
         })
     }
@@ -148,28 +193,46 @@ impl JdbcInput {
         }
     }
 
-    /// Fetches all rows for one poll cycle, optionally paged with LIMIT/OFFSET.
-    async fn fetch_rows(&self, pool: &AnyPool, statement: &str) -> sqlx::Result<Vec<AnyRow>> {
-        if !self.paging_enabled {
-            return sqlx::query(statement).fetch_all(pool).await;
-        }
-        let base = statement.trim().trim_end_matches(';');
-        let mut all = Vec::new();
-        let mut offset: u64 = 0;
-        loop {
-            let paged = format!(
-                "SELECT * FROM ({base}) AS ferro_stash_paged LIMIT {} OFFSET {offset}",
-                self.page_size
-            );
-            let rows = sqlx::query(&paged).fetch_all(pool).await?;
-            let n = rows.len() as u64;
-            all.extend(rows);
-            if n < self.page_size {
-                break;
+    /// Emits one batch of rows to `sender`, mapping each row to an event and
+    /// tracking the greatest tracking-column value seen across batches. Returns
+    /// whether the downstream channel closed (so the caller can stop).
+    async fn emit_rows(
+        &self,
+        rows: Vec<AnyRow>,
+        sender: &mpsc::Sender<Event>,
+        max_tracked: &mut Option<EventValue>,
+    ) -> EmitOutcome {
+        let tracking = self.tracking_column.clone();
+        for row in rows {
+            let mut event = Event::empty();
+            for col in row.columns() {
+                let raw_name = col.name();
+                let value = decode_any_value(&row, col.ordinal());
+                if self.tracking_active() {
+                    if let Some(tc) = &tracking {
+                        if raw_name.eq_ignore_ascii_case(tc) {
+                            let greater = max_tracked
+                                .as_ref()
+                                .map_or(true, |cur| value_gt(&value, cur));
+                            if greater {
+                                *max_tracked = Some(value.clone());
+                            }
+                        }
+                    }
+                }
+                let key = if self.lowercase_column_names {
+                    raw_name.to_lowercase()
+                } else {
+                    raw_name.to_string()
+                };
+                event.set(key, value);
             }
-            offset += self.page_size;
+            if sender.send(event).await.is_err() {
+                info!("jdbc input: downstream closed, stopping");
+                return EmitOutcome::DownstreamClosed;
+            }
         }
-        Ok(all)
+        EmitOutcome::Sent
     }
 }
 
@@ -196,45 +259,53 @@ impl InputPlugin for JdbcInput {
 
         loop {
             let statement = self.statement.replace(":sql_last_value", &sql_last_value);
-            match self.fetch_rows(&pool, &statement).await {
-                Ok(rows) => {
-                    let mut max_tracked: Option<EventValue> = None;
-                    let tracking = self.tracking_column.clone();
-                    for row in rows {
-                        let mut event = Event::empty();
-                        for col in row.columns() {
-                            let raw_name = col.name();
-                            let value = decode_any_value(&row, col.ordinal());
-                            if self.tracking_active() {
-                                if let Some(tc) = &tracking {
-                                    if raw_name.eq_ignore_ascii_case(tc) {
-                                        let greater = max_tracked
-                                            .as_ref()
-                                            .map_or(true, |cur| value_gt(&value, cur));
-                                        if greater {
-                                            max_tracked = Some(value.clone());
-                                        }
-                                    }
-                                }
-                            }
-                            let key = if self.lowercase_column_names {
-                                raw_name.to_lowercase()
-                            } else {
-                                raw_name.to_string()
-                            };
-                            event.set(key, value);
-                        }
-                        if sender.send(event).await.is_err() {
-                            info!("jdbc input: downstream closed, stopping");
+            let mut max_tracked: Option<EventValue> = None;
+
+            if !self.paging_enabled {
+                match sqlx::query(&statement).fetch_all(&pool).await {
+                    Ok(rows) => {
+                        if let EmitOutcome::DownstreamClosed =
+                            self.emit_rows(rows, &sender, &mut max_tracked).await
+                        {
                             return Ok(());
                         }
                     }
-                    if let Some(max) = max_tracked {
-                        sql_last_value = max.to_string_lossy();
-                        self.persist_last_value(&sql_last_value);
+                    Err(e) => warn!(error = %e, "jdbc query failed, will retry next interval"),
+                }
+            } else {
+                // Paged: stream each page downstream BEFORE fetching the next so a
+                // large result set is never fully buffered in memory.
+                let base = statement.trim().trim_end_matches(';');
+                let mut offset: u64 = 0;
+                loop {
+                    let paged = format!(
+                        "SELECT * FROM ({base}) AS ferro_stash_paged LIMIT {} OFFSET {offset}",
+                        self.page_size
+                    );
+                    match sqlx::query(&paged).fetch_all(&pool).await {
+                        Ok(rows) => {
+                            let n = rows.len() as u64;
+                            if let EmitOutcome::DownstreamClosed =
+                                self.emit_rows(rows, &sender, &mut max_tracked).await
+                            {
+                                return Ok(());
+                            }
+                            if n < self.page_size {
+                                break;
+                            }
+                            offset += self.page_size;
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "jdbc paged query failed, will retry next interval");
+                            break;
+                        }
                     }
                 }
-                Err(e) => warn!(error = %e, "jdbc query failed, will retry next interval"),
+            }
+
+            if let Some(max) = max_tracked {
+                sql_last_value = max.to_string_lossy();
+                self.persist_last_value(&sql_last_value);
             }
 
             debug!("jdbc poll cycle complete");
@@ -379,6 +450,23 @@ mod tests {
             &serde_json::json!({ "connection_string": "sqlite::memory:" })
         )
         .is_err());
+    }
+
+    #[test]
+    fn debug_redacts_connection_string() {
+        // The connection string embeds DB credentials and must not leak via `{:?}`.
+        let i = JdbcInput::from_config(&serde_json::json!({
+            "connection_string": "postgres://user:super-secret-pw@h/db",
+            "statement": "SELECT 1"
+        }))
+        .expect("config");
+        let dbg = format!("{i:?}");
+        assert!(
+            !dbg.contains("super-secret-pw"),
+            "connection string leaked: {dbg}"
+        );
+        assert!(!dbg.contains("user:"), "credentials leaked: {dbg}");
+        assert!(dbg.contains("***"));
     }
 
     #[test]

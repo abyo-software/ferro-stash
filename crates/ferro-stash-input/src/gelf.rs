@@ -46,6 +46,13 @@ const UDP_BUFFER_SIZE: usize = 65536;
 /// buffer until OOM. 16 MB is far above any legitimate GELF message.
 const MAX_TCP_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
+/// Maximum number of bytes a single GELF payload may expand to once
+/// decompressed. This listener is unauthenticated, so a small gzip/zlib
+/// "decompression bomb" (a few KB on the wire expanding to gigabytes) could
+/// otherwise exhaust memory. 8 MiB is far above any legitimate GELF message; an
+/// over-limit payload is dropped without ever being fully materialized.
+const MAX_DECOMPRESSED: u64 = 8 * 1024 * 1024;
+
 /// Outcome of detecting/decompressing a GELF payload prefix.
 enum Payload {
     /// Uncompressed-or-decompressed JSON bytes ready to parse.
@@ -54,6 +61,22 @@ enum Payload {
     Chunked,
     /// Decompression failed.
     Failed,
+    /// Decompressed output exceeded [`MAX_DECOMPRESSED`] (possible bomb).
+    TooLarge,
+}
+
+/// Drain a decompressing reader, but never past [`MAX_DECOMPRESSED`] bytes. The
+/// reader is capped at `MAX_DECOMPRESSED + 1` so a payload of exactly the limit
+/// is accepted while anything larger is rejected as a potential bomb (without
+/// allocating the full expansion).
+fn decompress_capped<R: Read>(decoder: R) -> Payload {
+    let mut out = Vec::new();
+    let mut limited = decoder.take(MAX_DECOMPRESSED + 1);
+    match limited.read_to_end(&mut out) {
+        Ok(_) if out.len() as u64 > MAX_DECOMPRESSED => Payload::TooLarge,
+        Ok(_) => Payload::Data(out),
+        Err(_) => Payload::Failed,
+    }
 }
 
 /// Detect compression by magic bytes and return the JSON payload.
@@ -62,20 +85,10 @@ fn decompress(data: &[u8]) -> Payload {
         return Payload::Chunked;
     }
     if data.len() >= 2 && data[0] == 0x1f && data[1] == 0x8b {
-        let mut out = Vec::new();
-        let mut decoder = flate2::read::GzDecoder::new(data);
-        return match decoder.read_to_end(&mut out) {
-            Ok(_) => Payload::Data(out),
-            Err(_) => Payload::Failed,
-        };
+        return decompress_capped(flate2::read::GzDecoder::new(data));
     }
     if !data.is_empty() && data[0] == 0x78 {
-        let mut out = Vec::new();
-        let mut decoder = flate2::read::ZlibDecoder::new(data);
-        return match decoder.read_to_end(&mut out) {
-            Ok(_) => Payload::Data(out),
-            Err(_) => Payload::Failed,
-        };
+        return decompress_capped(flate2::read::ZlibDecoder::new(data));
     }
     Payload::Data(data.to_vec())
 }
@@ -126,6 +139,13 @@ fn decode_gelf(data: &[u8]) -> Option<Event> {
         }
         Payload::Failed => {
             warn!("gelf input: payload decompression failed; dropping");
+            return None;
+        }
+        Payload::TooLarge => {
+            warn!(
+                cap = MAX_DECOMPRESSED,
+                "gelf input: decompressed payload exceeds cap; dropping (possible decompression bomb)"
+            );
             return None;
         }
     };
@@ -425,6 +445,26 @@ mod tests {
         assert_eq!(compressed[0], 0x78);
         let event = decode_gelf(&compressed).expect("decode zlib");
         assert_eq!(event.message(), Some("zl"));
+    }
+
+    #[test]
+    fn test_decode_gelf_decompression_bomb_rejected() {
+        // A VALID but oversized JSON payload (a ~9 MiB `short_message`) that
+        // decompresses beyond the 8 MiB cap. Without the cap it would decode into
+        // an event; with the cap it is dropped before the full payload is ever
+        // materialized — proving the bound, not merely a JSON-parse failure.
+        let mut json = Vec::new();
+        json.extend_from_slice(br#"{"short_message":""#);
+        json.extend_from_slice(&vec![b'a'; 9 * 1024 * 1024]);
+        json.extend_from_slice(br#""}"#);
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&json).expect("gz write");
+        let compressed = encoder.finish().expect("gz finish");
+        assert!(compressed.len() < json.len(), "payload should compress");
+        assert!(
+            decode_gelf(&compressed).is_none(),
+            "over-limit decompression must be dropped"
+        );
     }
 
     #[test]

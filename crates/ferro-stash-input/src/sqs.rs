@@ -33,7 +33,11 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-#[derive(Clone, Debug)]
+/// SQS input configuration.
+///
+/// `Debug` is implemented manually so the `secret_access_key` secret is never
+/// rendered in logs/diagnostics (`{:?}` prints `Some("***")` / `None`).
+#[derive(Clone)]
 pub struct SqsInput {
     queue: Option<String>,
     queue_url: Option<String>,
@@ -46,6 +50,37 @@ pub struct SqsInput {
     max_messages: i32,
     wait_time_seconds: i32,
     delete_after_read: bool,
+}
+
+impl std::fmt::Debug for SqsInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SqsInput")
+            .field("queue", &self.queue)
+            .field("queue_url", &self.queue_url)
+            .field("region", &self.region)
+            .field("access_key_id", &self.access_key_id)
+            .field(
+                "secret_access_key",
+                &self.secret_access_key.as_ref().map(|_| "***"),
+            )
+            .field("endpoint", &self.endpoint)
+            .field("codec", &self.codec)
+            .field("codec_settings", &self.codec_settings)
+            .field("max_messages", &self.max_messages)
+            .field("wait_time_seconds", &self.wait_time_seconds)
+            .field("delete_after_read", &self.delete_after_read)
+            .finish()
+    }
+}
+
+/// Whether an SQS message may be deleted (acknowledged) after processing.
+///
+/// A message is deleted only when `delete_after_read` is enabled **and** its body
+/// decoded successfully. A decode failure must NOT delete the message: leaving it
+/// undeleted lets SQS redeliver it (and ultimately route it to the queue's
+/// configured DLQ via the redrive policy) instead of silently dropping the data.
+fn should_delete(delete_after_read: bool, decode_ok: bool) -> bool {
+    delete_after_read && decode_ok
 }
 
 impl SqsInput {
@@ -159,8 +194,11 @@ impl InputPlugin for SqsInput {
                     match result {
                         Ok(out) => {
                             for msg in out.messages.unwrap_or_default() {
-                                if let Some(body) = msg.body() {
-                                    match codec.decode(body.as_bytes()) {
+                                // Decode (and deliver) before deciding whether to
+                                // delete. A decode failure must leave the message
+                                // on the queue so SQS can redeliver / DLQ it.
+                                let decode_ok = match msg.body() {
+                                    Some(body) => match codec.decode(body.as_bytes()) {
                                         Ok(events) => {
                                             for ev in events {
                                                 if sender.send(ev).await.is_err() {
@@ -168,11 +206,18 @@ impl InputPlugin for SqsInput {
                                                     return Ok(());
                                                 }
                                             }
+                                            true
                                         }
-                                        Err(e) => warn!(error = %e, "sqs decode error"),
-                                    }
-                                }
-                                if self.delete_after_read {
+                                        Err(e) => {
+                                            warn!(error = %e, "sqs decode error; leaving message on queue (redeliver / DLQ)");
+                                            false
+                                        }
+                                    },
+                                    // No body to decode: nothing to lose, treat as
+                                    // ackable so it does not loop forever.
+                                    None => true,
+                                };
+                                if should_delete(self.delete_after_read, decode_ok) {
                                     if let Some(rh) = msg.receipt_handle() {
                                         if let Err(e) = client.delete_message()
                                             .queue_url(&queue_url).receipt_handle(rh).send().await {
@@ -211,6 +256,31 @@ mod tests {
         assert!(SqsInput::from_config(&serde_json::json!({})).is_err());
         assert!(SqsInput::from_config(&serde_json::json!({ "queue": "q" })).is_ok());
         assert!(SqsInput::from_config(&serde_json::json!({ "queue_url": "http://x/q" })).is_ok());
+    }
+
+    #[test]
+    fn decode_failure_does_not_delete() {
+        // A decode failure must NOT delete the message (let SQS redeliver / DLQ),
+        // even when delete_after_read is enabled — otherwise data is silently lost.
+        assert!(!should_delete(true, false));
+        // A successful decode with delete_after_read deletes (acks) the message.
+        assert!(should_delete(true, true));
+        // delete_after_read disabled never deletes, regardless of decode outcome.
+        assert!(!should_delete(false, true));
+        assert!(!should_delete(false, false));
+    }
+
+    #[test]
+    fn debug_redacts_secret() {
+        let i = SqsInput::from_config(&serde_json::json!({
+            "queue": "q", "access_key_id": "AKIAEXAMPLE", "secret_access_key": "super-secret-sak"
+        }))
+        .expect("config");
+        let dbg = format!("{i:?}");
+        assert!(!dbg.contains("super-secret-sak"), "secret leaked: {dbg}");
+        assert!(dbg.contains("***"));
+        // Non-secret fields stay visible.
+        assert!(dbg.contains("AKIAEXAMPLE"));
     }
 
     #[test]
