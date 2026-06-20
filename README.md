@@ -4,14 +4,20 @@
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
 
-## Drop the JVM: a Logstash-compatible data pipeline in Rust — ~10× less memory, instant start
+## Run your existing Logstash pipelines in Rust — no JVM, no config rewrite
 
-**FerroStash** ingests, transforms, and routes events through the same
-`input → filter → output` model as [Logstash](https://www.elastic.co/logstash),
-parsing the Logstash `pipeline.conf` DSL natively so your existing pipelines run
-**without a JVM**. Same config language, same event model (`@timestamp`, tags,
-`[a][b]` field references, `%{field}` interpolation) — but a single ~14 MB static
-binary that starts in milliseconds and holds tens of MB of RAM instead of ~1 GB.
+**FerroStash** runs your existing Logstash `pipeline.conf` **unchanged** —
+parsing the [Logstash](https://www.elastic.co/logstash) DSL natively (same
+`input → filter → output` model, same event model: `@timestamp`, tags,
+`[a][b]` field references, `%{field}` interpolation) — but **without a JVM**.
+The result is a single ~14 MB static binary that starts in milliseconds and
+holds tens of MB of RAM instead of ~1 GB.
+
+> **Low-risk to try:** FerroStash reads the same config and emits the same
+> events as Logstash, so you can run it *beside* your current pipeline and diff
+> the output before trusting it with anything. Start there — see
+> [When NOT to use FerroStash](#when-not-to-use-ferrostash) for the honest
+> caveats first.
 
 ```
   inputs  ──▶   filters   ──▶   outputs
@@ -68,6 +74,7 @@ caveats before deploying any connector.
 
 | Property | Logstash (JVM) | FerroStash (native) |
 |----------|----------------|---------------------|
+| Migration cost | — (already running it) | Runs your existing `.conf` unchanged (byte-eq verified) |
 | Runtime | JVM (Java) + JRuby | Native Rust binary |
 | Idle memory (RSS) | ~0.5–1 GB+ | ~10–50 MB |
 | Cold start | ~8–30 s (JVM warm-up) | < 1 s (~10 ms) |
@@ -168,6 +175,24 @@ cargo test -p ferro-stash-e2e --test logstash_docker_compat_test \
 The docker-driven regression harness under
 [`tests/logstash-compat/`](tests/logstash-compat/) is the authoritative,
 runnable record of what this evidence does and does not substantiate.
+
+## How FerroStash compares to Vector
+
+[Vector](https://vector.dev/) (maintained by Datadog) is an excellent, mature,
+Rust-based observability pipeline — if you're starting fresh, it's a strong
+default. The difference is the **migration path**, not the runtime:
+
+- **Vector** asks you to rewrite your pipelines in **VRL** (Vector Remap
+  Language) and its own config format. Great for greenfield; a real project if
+  you already run Logstash.
+- **FerroStash** runs your **existing Logstash `pipeline.conf` unchanged**, with
+  output verified byte-for-byte against Logstash 9.4.2. It's built for teams with
+  an existing Logstash investment who don't want to rewrite it just to drop the
+  JVM.
+
+If you have no Logstash config to preserve, Vector is the more battle-tested,
+broader-ecosystem choice and you should probably use it. If you do, FerroStash
+lets you keep what you have.
 
 ## When NOT to use FerroStash
 
@@ -638,14 +663,15 @@ Data sources → FerroStash → FerroSearch → Applications
 ## More from abyo software
 
 FerroStash is part of a family of Rust infrastructure tools from **abyo
-software**; several ship on AWS Marketplace under one seller account — browse the
-catalog at **[abyo software on AWS Marketplace](https://aws.amazon.com/marketplace/seller-profile?id=seller-65lhisp4ppavm)**.
+software** focused on cutting AWS observability and storage cost; several ship on
+AWS Marketplace under one seller account — browse the catalog at **[abyo software
+on AWS Marketplace](https://aws.amazon.com/marketplace/seller-profile?id=seller-65lhisp4ppavm)**.
 
 | Product | What it does |
 |---|---|
-| **FerroStash** | This project: a Logstash-compatible data pipeline in Rust. |
 | **S4 — Squished S3** | Transparent GPU/CPU compression gateway in front of S3 — cut storage 50–80%. |
 | **S4 Logs** | CloudWatch Logs → S3 archiver that cuts log-storage cost. |
+| **FerroStash** | This project: a Logstash-compatible data pipeline in Rust. |
 | **S4 Scan** | Amazon Athena scan-cost reducer. |
 | **S4 NAT** | Cost-optimized NAT for Amazon VPC. |
 | **S4 MockAPI** | Security API simulator for testing and demos. |
