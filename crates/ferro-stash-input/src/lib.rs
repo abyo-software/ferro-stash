@@ -5,6 +5,7 @@ pub mod beats;
 pub mod cloudwatch;
 pub mod dead_letter_queue;
 pub mod elasticsearch;
+pub mod exec;
 pub mod file;
 pub mod gelf;
 pub mod generator;
@@ -14,6 +15,7 @@ pub mod http;
 pub mod http_poller;
 pub mod jdbc;
 pub mod kafka;
+pub mod pipe;
 pub mod pipeline;
 pub mod rabbitmq;
 pub mod redis;
@@ -23,6 +25,8 @@ pub mod stdin;
 pub mod syslog;
 pub mod tcp;
 pub mod udp;
+#[cfg(unix)]
+pub mod unix;
 
 use std::sync::Arc;
 
@@ -52,6 +56,15 @@ pub fn create_input_with_bus(
             settings,
         )?)),
         "jdbc" => Ok(Box::new(jdbc::JdbcInput::from_config(settings)?)),
+        "exec" => Ok(Box::new(exec::ExecInput::from_config(settings)?)),
+        "pipe" => Ok(Box::new(pipe::PipeInput::from_config(settings)?)),
+        #[cfg(unix)]
+        "unix" => Ok(Box::new(unix::UnixInput::from_config(settings)?)),
+        #[cfg(not(unix))]
+        "unix" => Err(FerroStashError::Input {
+            plugin: "unix".to_string(),
+            message: "unix input is only available on Unix platforms".to_string(),
+        }),
         "syslog" => Ok(Box::new(syslog::SyslogInput::from_config(settings)?)),
         "generator" => Ok(Box::new(generator::GeneratorInput::from_config(settings)?)),
         "gelf" => Ok(Box::new(gelf::GelfInput::from_config(settings)?)),
@@ -193,6 +206,31 @@ mod tests {
         let input = create_input("cloudwatch", &settings);
         assert!(input.is_ok());
         assert_eq!(input.expect("cloudwatch input").name(), "cloudwatch");
+    }
+
+    #[test]
+    fn test_create_exec_input() {
+        let settings = serde_json::json!({ "command": "echo hi" });
+        let input = create_input("exec", &settings);
+        assert!(input.is_ok());
+        assert_eq!(input.expect("exec input").name(), "exec");
+    }
+
+    #[test]
+    fn test_create_pipe_input() {
+        let settings = serde_json::json!({ "command": "tail -F x" });
+        let input = create_input("pipe", &settings);
+        assert!(input.is_ok());
+        assert_eq!(input.expect("pipe input").name(), "pipe");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_create_unix_input() {
+        let settings = serde_json::json!({ "path": "/tmp/ferro-stash-test.sock" });
+        let input = create_input("unix", &settings);
+        assert!(input.is_ok());
+        assert_eq!(input.expect("unix input").name(), "unix");
     }
 
     #[test]

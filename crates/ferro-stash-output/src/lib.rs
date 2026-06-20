@@ -12,6 +12,7 @@ pub mod http;
 pub mod jdbc;
 pub mod kafka;
 pub mod null;
+pub mod pipe;
 pub mod pipeline;
 pub mod rabbitmq;
 pub mod redis;
@@ -74,6 +75,9 @@ pub fn create_output_with_bus(
             settings, condition,
         )?)),
         "null" => Ok(Box::new(null::NullOutput::from_config(
+            settings, condition,
+        )?)),
+        "pipe" => Ok(Box::new(pipe::PipeOutput::from_config(
             settings, condition,
         )?)),
         "kafka" => Ok(Box::new(kafka::KafkaOutput::from_config(
@@ -224,6 +228,14 @@ mod tests {
         let output = create_output("cloudwatch", &settings, None);
         assert!(output.is_ok());
         assert_eq!(output.expect("cloudwatch output").name(), "cloudwatch");
+    }
+
+    #[test]
+    fn test_create_pipe_output() {
+        let settings = serde_json::json!({ "command": "cat" });
+        let output = create_output("pipe", &settings, None);
+        assert!(output.is_ok());
+        assert_eq!(output.expect("pipe output").name(), "pipe");
     }
 
     #[test]

@@ -17,6 +17,8 @@ pub mod fingerprint;
 pub mod geoip;
 pub mod grok;
 pub mod http_filter;
+pub mod jdbc_static;
+pub mod jdbc_streaming;
 pub mod json_encode;
 pub mod json_filter;
 pub mod kv;
@@ -113,6 +115,12 @@ pub fn create_filter(
             settings, condition,
         )?),
         "memcached" => Box::new(memcached::MemcachedFilter::from_config(
+            settings, condition,
+        )?),
+        "jdbc_streaming" => Box::new(jdbc_streaming::JdbcStreamingFilter::from_config(
+            settings, condition,
+        )?),
+        "jdbc_static" => Box::new(jdbc_static::JdbcStaticFilter::from_config(
             settings, condition,
         )?),
         _ => {
@@ -258,6 +266,32 @@ mod tests {
         let filter = create_filter("memcached", &settings, None);
         assert!(filter.is_ok());
         assert_eq!(filter.expect("memcached filter").name(), "memcached");
+    }
+
+    #[test]
+    fn test_create_jdbc_streaming_filter() {
+        let settings = serde_json::json!({
+            "connection_string": "sqlite::memory:",
+            "statement": "SELECT 1 WHERE id = :id"
+        });
+        let filter = create_filter("jdbc_streaming", &settings, None);
+        assert!(filter.is_ok());
+        assert_eq!(
+            filter.expect("jdbc_streaming filter").name(),
+            "jdbc_streaming"
+        );
+    }
+
+    #[test]
+    fn test_create_jdbc_static_filter() {
+        let settings = serde_json::json!({
+            "connection_string": "sqlite::memory:",
+            "loaders": [{ "id": "t", "query": "SELECT 1" }],
+            "local_lookups": [{ "query": "%{k}", "target": "v" }]
+        });
+        let filter = create_filter("jdbc_static", &settings, None);
+        assert!(filter.is_ok());
+        assert_eq!(filter.expect("jdbc_static filter").name(), "jdbc_static");
     }
 
     #[test]

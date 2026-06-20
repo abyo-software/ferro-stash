@@ -129,8 +129,8 @@ The JRuby custom-logic figure is corroborated across runs (~143–147k); see
 ## Logstash compatibility scope
 
 FerroStash targets the **production-common subset** of Logstash, not its
-full plugin catalogue. It implements **~83% of the plugins bundled with
-Logstash 9.4.2** (92 / 111) — **codecs 100%, filters 91%, inputs 65%, outputs 83%** — weighted toward the parse/filter hot path; the long tail of connectors
+full plugin catalogue. It implements **~88% of the plugins bundled with
+Logstash 9.4.2** (98 / 111) — **codecs 100%, filters 97%, inputs 74%, outputs 87%** — weighted toward the parse/filter hot path; the long tail of connectors
 (enterprise messaging / SNMP, …) is the main gap. A
 config that uses a missing plugin **fails fast** at load, so check the full
 **[compatibility matrix](docs/COMPATIBILITY.md)** before migrating. The
@@ -204,7 +204,7 @@ available, not in CI. See the Notes column and
 [Honest limitations](#honest-limitations) for exactly what each smoke
 test exercises and the per-plugin feature residuals.
 
-### Input plugins (22 registered)
+### Input plugins (25 registered)
 
 | Plugin | Status | Notes |
 |--------|--------|-------|
@@ -212,6 +212,9 @@ test exercises and the per-plugin feature residuals.
 | `file` | functional | tailing, glob, sincedb, rotation detection |
 | `tcp` | functional | TLS via rustls |
 | `udp` | functional | datagram input |
+| `exec` | functional | runs `command` via `sh -c` every `interval`s (or `schedule => { every => "Ns" }`); stdout → events (`codec` plain = one event per line, json = NDJSON). `[@metadata][exec][command]` + `[@metadata][exec][duration]`. stdout only |
+| `pipe` | functional | runs a long-running `command` and streams its stdout line-by-line (`codec` plain/json), relaunching the child with a small backoff when it exits |
+| `unix` (Unix-only) | functional | Unix domain socket `path`; `mode` server (default, accept + read lines) or client (connect + read); `codec` line/plain/json. The factory returns a clear error on non-Unix platforms |
 | `http` | functional | HTTP POST (JSON / plain) |
 | `gelf` | functional | Graylog GELF over UDP (default) or TCP (NUL-delimited frames); gzip/zlib auto-detect, `short_message`→`message`, `_custom`→`custom`. Single-datagram only — chunked GELF reassembly is not implemented |
 | `graphite` | functional | Carbon plaintext over TCP: `metric value timestamp` → `metric`/`value`(float)/`timestamp`(int) |
@@ -228,7 +231,7 @@ test exercises and the per-plugin feature residuals.
 | `rabbitmq` | real (compile/unit-validated) | `lapin` AMQP: `queue_declare` (+ optional `exchange`/`key` bind), `basic_consume`, codec decode, `basic_ack` (when `ack`). `host`/`port`/`vhost`/`user`/`password`/`durable`. rustls TLS stance. No TLS (`amqps`)/x-args/prefetch tuning yet. Unit-tested; `#[ignore]` live smoke (`RABBITMQ_URL`) |
 | `cloudwatch` | real (compile/unit-validated) | `aws-sdk-cloudwatch` `GetMetricStatistics` polled every `interval`s over `[now-interval, now]`, one event per datapoint (`metric`/`namespace`/statistic values/`unit`). `namespace` (required), `metric_names`(alias `metrics`), `period`, `statistics`. No dimension filtering / `GetMetricData` discovery yet. Unit-tested; `#[ignore]` live smoke |
 
-### Filter plugins (35 registered)
+### Filter plugins (37 registered)
 
 | Plugin | Status | Notes |
 |--------|--------|-------|
@@ -267,8 +270,10 @@ test exercises and the per-plugin feature residuals.
 | `dns` | real (live-validated) | `hickory-resolver` forward (A/AAAA) and reverse (PTR) lookups, custom `nameserver`, `Replace`/`Append` action. Validated against `8.8.8.8` |
 | `elasticsearch` | real (live-validated) | `reqwest` `_search` with host failover, query-template `%{field}` sprintf, hits→field mapping. Live-validated against real Elasticsearch 8.15.3 (a seeded hit is mapped into the target field) via an `#[ignore]` smoke test (`ES_URL`); not run in CI |
 | `memcached` | real (compile/unit-validated) | sync `memcache` client (multi-host `hosts`, consistent hashing) via `tokio::task::spawn_blocking`: `get` (key→field) and `set` (field→key) maps with `%{field}`-aware keys, `namespace` prefix, `ttl`. Plaintext only (OpenSSL `tls` feature disabled to stay rustls-only). Unit-tested; `#[ignore]` live smoke (`MEMCACHED_HOST`) |
+| `jdbc_streaming` | real (sqlite-tested) | per-event SQL enrichment via native `sqlx` `Any` (Postgres/MySQL/SQLite, no Java driver); `:param` placeholders rewritten to positional binds, `parameters` resolved from event fields / `%{}`; matched rows → `target` array; bounded FIFO/TTL result cache (`cache_size`/`cache_expiration`); tags `_jdbcstreamingfailure` on error. SQLite-tested in CI |
+| `jdbc_static` | real (sqlite-tested) | loads `loaders` reference tables into memory once (lazy refresh via `refresh_interval`), enriches events via in-memory keyed `local_lookups` (`key_column` + `%{}`/field key) → `target` array. Subset: no local in-memory SQL DB / joins (single keyed lookup per entry); tags `_jdbcstaticfailure` on load error. SQLite-tested in CI |
 
-### Output plugins (20 registered)
+### Output plugins (21 registered)
 
 | Plugin | Status | Notes |
 |--------|--------|-------|
@@ -281,6 +286,7 @@ test exercises and the per-plugin feature residuals.
 | `udp` | functional | codec-encoded datagrams via `tokio::net::UdpSocket` (best-effort, fire-and-forget) |
 | `csv` | functional | append CSV rows to a file; `fields` define column order, `csv_options` (separator/quote) |
 | `null` | functional | discard (benchmarking) |
+| `pipe` | functional | writes each codec-encoded event (`codec` json/line, or a `%{}` `message_format`) to a long-lived `sh -c <command>` child's stdin, relaunching once on broken pipe |
 | `pipeline` | functional | pipeline-to-pipeline (multi-pipeline mode) |
 | `kafka` | real (live-validated) | `rdkafka` `FutureProducer`: codec serialize, key sprintf, compression/acks/retries, flush. Live round-trip validated against real Apache Kafka 3.9.1 (and redpanda) via an `#[ignore]` smoke test (`KAFKA_BROKERS`); not run in CI |
 | `redis` | real (live-validated) | async `ConnectionManager`: `RPUSH` (list) / `PUBLISH` (channel). Password-only AUTH (no username/ACL), no TLS (`rediss://`), `key` is a single channel |

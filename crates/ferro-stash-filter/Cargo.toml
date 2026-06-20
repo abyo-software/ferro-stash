@@ -45,10 +45,15 @@ hickory-resolver = "0.26.1"
 # Synchronous memcached client (driven via spawn_blocking); default-features off
 # to drop the OpenSSL `tls` feature and stay rustls-only / plaintext memcached.
 memcache = { version = "0.19", default-features = false }
+# Native Rust DB drivers (Postgres/MySQL/SQLite) for the jdbc_static /
+# jdbc_streaming filters — same backend set + features already used by the
+# jdbc input/output plugins, so no new transitive crates enter the lock.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "any", "postgres", "mysql", "sqlite"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 criterion = { workspace = true }
+tempfile = "3"
 
 [[bench]]
 name = "filter_bench"
