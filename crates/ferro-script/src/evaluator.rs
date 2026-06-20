@@ -522,18 +522,20 @@ fn eval_binop(left: &ScriptValue, op: &BinOp, right: &ScriptValue) -> FerroResul
         FerroError::QueryParseError(format!("cannot use {right:?} in arithmetic"))
     })?;
 
-    // If both are integers and the op produces an integer result, keep as int
-    let both_int = matches!(left, ScriptValue::Int(_)) && matches!(right, ScriptValue::Int(_));
-
-    // Integer arithmetic on (attacker-supplied) event values uses checked ops:
-    // overflow returns a script error instead of panicking (debug) or silently
-    // wrapping to a wrong value (release — overflow-checks are off there).
+    // When BOTH operands are integers, operate on the real i64 values — NEVER on
+    // the f64s (`lf`/`rf`), which silently lose precision for |v| > 2^53
+    // (snowflake IDs, epoch-nanos) and make ordering disagree with `==`. Mixed
+    // int/float keeps f64 semantics. checked_* turns overflow into a script
+    // error instead of a debug panic / release silent-wrap.
+    let int_ops: Option<(i64, i64)> = match (left, right) {
+        (ScriptValue::Int(a), ScriptValue::Int(b)) => Some((*a, *b)),
+        _ => None,
+    };
     let overflow = |what: &str| FerroError::QueryParseError(format!("integer overflow in {what}"));
     match op {
         BinOp::Add => {
-            if both_int {
-                (lf as i64)
-                    .checked_add(rf as i64)
+            if let Some((a, b)) = int_ops {
+                a.checked_add(b)
                     .map(ScriptValue::Int)
                     .ok_or_else(|| overflow("addition"))
             } else {
@@ -541,9 +543,8 @@ fn eval_binop(left: &ScriptValue, op: &BinOp, right: &ScriptValue) -> FerroResul
             }
         }
         BinOp::Sub => {
-            if both_int {
-                (lf as i64)
-                    .checked_sub(rf as i64)
+            if let Some((a, b)) = int_ops {
+                a.checked_sub(b)
                     .map(ScriptValue::Int)
                     .ok_or_else(|| overflow("subtraction"))
             } else {
@@ -551,9 +552,8 @@ fn eval_binop(left: &ScriptValue, op: &BinOp, right: &ScriptValue) -> FerroResul
             }
         }
         BinOp::Mul => {
-            if both_int {
-                (lf as i64)
-                    .checked_mul(rf as i64)
+            if let Some((a, b)) = int_ops {
+                a.checked_mul(b)
                     .map(ScriptValue::Int)
                     .ok_or_else(|| overflow("multiplication"))
             } else {
@@ -561,36 +561,42 @@ fn eval_binop(left: &ScriptValue, op: &BinOp, right: &ScriptValue) -> FerroResul
             }
         }
         BinOp::Div => {
-            if rf == 0.0 {
-                return Err(FerroError::QueryParseError("division by zero".into()));
-            }
-            if both_int {
+            if let Some((a, b)) = int_ops {
+                if b == 0 {
+                    return Err(FerroError::QueryParseError("division by zero".into()));
+                }
                 // checked_div also catches i64::MIN / -1 (panics even in release).
-                (lf as i64)
-                    .checked_div(rf as i64)
+                a.checked_div(b)
                     .map(ScriptValue::Int)
                     .ok_or_else(|| overflow("division"))
             } else {
+                if rf == 0.0 {
+                    return Err(FerroError::QueryParseError("division by zero".into()));
+                }
                 Ok(ScriptValue::Float(lf / rf))
             }
         }
         BinOp::Mod => {
-            if rf == 0.0 {
-                return Err(FerroError::QueryParseError("modulo by zero".into()));
-            }
-            if both_int {
-                (lf as i64)
-                    .checked_rem(rf as i64)
+            if let Some((a, b)) = int_ops {
+                if b == 0 {
+                    return Err(FerroError::QueryParseError("modulo by zero".into()));
+                }
+                a.checked_rem(b)
                     .map(ScriptValue::Int)
                     .ok_or_else(|| overflow("modulo"))
             } else {
+                if rf == 0.0 {
+                    return Err(FerroError::QueryParseError("modulo by zero".into()));
+                }
                 Ok(ScriptValue::Float(lf % rf))
             }
         }
-        BinOp::Gt => Ok(ScriptValue::Bool(lf > rf)),
-        BinOp::Lt => Ok(ScriptValue::Bool(lf < rf)),
-        BinOp::Gte => Ok(ScriptValue::Bool(lf >= rf)),
-        BinOp::Lte => Ok(ScriptValue::Bool(lf <= rf)),
+        // Ordering on the exact i64s when both are ints, so it never disagrees
+        // with `==` (which is already exact above).
+        BinOp::Gt => Ok(ScriptValue::Bool(int_ops.map_or(lf > rf, |(a, b)| a > b))),
+        BinOp::Lt => Ok(ScriptValue::Bool(int_ops.map_or(lf < rf, |(a, b)| a < b))),
+        BinOp::Gte => Ok(ScriptValue::Bool(int_ops.map_or(lf >= rf, |(a, b)| a >= b))),
+        BinOp::Lte => Ok(ScriptValue::Bool(int_ops.map_or(lf <= rf, |(a, b)| a <= b))),
         BinOp::Eq | BinOp::Neq | BinOp::And | BinOp::Or => unreachable!(),
     }
 }
@@ -1001,10 +1007,12 @@ fn eval_method(
             | "minusMinutes" | "plusSeconds" | "minusSeconds"),
         ) => {
             let (_, _, _, _, _, _, epoch_ms) = parse_date_components(val)?;
-            let amount = args
-                .first()
-                .and_then(super::types::ScriptValue::as_f64)
-                .unwrap_or(0.0) as i64;
+            // Keep an exact i64 amount for int args (f64 rounds |v| > 2^53).
+            let amount = match args.first() {
+                Some(ScriptValue::Int(i)) => *i,
+                Some(v) => v.as_f64().map_or(0, |f| f as i64),
+                None => 0,
+            };
             // Checked throughout: a huge/MIN attacker `amount` would otherwise
             // overflow the multiply/negate/add (debug panic, release wraps).
             let (unit, negate) = match method_name {
@@ -1196,10 +1204,9 @@ fn eval_math(func: &str, args: &[ScriptValue]) -> FerroResult<ScriptValue> {
                 .get(1)
                 .and_then(super::types::ScriptValue::as_f64)
                 .ok_or_else(|| FerroError::QueryParseError("Math.max requires numbers".into()))?;
-            let both_int =
-                matches!(args[0], ScriptValue::Int(_)) && matches!(args[1], ScriptValue::Int(_));
-            if both_int {
-                Ok(ScriptValue::Int(a.max(b) as i64))
+            if let (ScriptValue::Int(ai), ScriptValue::Int(bi)) = (&args[0], &args[1]) {
+                // Exact i64 max — never round through f64 (loses |v| > 2^53).
+                Ok(ScriptValue::Int((*ai).max(*bi)))
             } else {
                 Ok(ScriptValue::Float(a.max(b)))
             }
@@ -1213,10 +1220,9 @@ fn eval_math(func: &str, args: &[ScriptValue]) -> FerroResult<ScriptValue> {
                 .get(1)
                 .and_then(super::types::ScriptValue::as_f64)
                 .ok_or_else(|| FerroError::QueryParseError("Math.min requires numbers".into()))?;
-            let both_int =
-                matches!(args[0], ScriptValue::Int(_)) && matches!(args[1], ScriptValue::Int(_));
-            if both_int {
-                Ok(ScriptValue::Int(a.min(b) as i64))
+            if let (ScriptValue::Int(ai), ScriptValue::Int(bi)) = (&args[0], &args[1]) {
+                // Exact i64 min — never round through f64 (loses |v| > 2^53).
+                Ok(ScriptValue::Int((*ai).min(*bi)))
             } else {
                 Ok(ScriptValue::Float(a.min(b)))
             }
@@ -1337,6 +1343,14 @@ fn to_vector(val: &ScriptValue) -> FerroResult<Vec<f64>> {
                         "vector element must be numeric for similarity function".into(),
                     )
                 })?;
+                // Reject NaN/inf components: they propagate to a non-finite
+                // result (serialized as null), and NaN silently mis-counts in
+                // `hamming` (NaN comparisons are always false).
+                if !f.is_finite() {
+                    return Err(FerroError::QueryParseError(
+                        "vector element must be finite for similarity function".into(),
+                    ));
+                }
                 out.push(f);
             }
             Ok(out)
@@ -1423,6 +1437,13 @@ fn eval_func_call(
                     .count() as f64,
                 _ => unreachable!(),
             };
+            // Float overflow in the dot/norm sums (e.g. components ~1e200)
+            // yields inf/NaN, which serializes to null — surface a clear error.
+            if !result.is_finite() {
+                return Err(FerroError::QueryParseError(format!(
+                    "{func}: non-finite result (numeric overflow or invalid vector)"
+                )));
+            }
             Ok(ScriptValue::Float(result))
         }
         // Painless `decayDateLinear`/`decayNumericGauss` etc. are not yet
@@ -2610,6 +2631,73 @@ mod tests {
             eval_doc_int("Math.abs(doc['n'].value)", "n", -5).unwrap(),
             serde_json::json!(5)
         );
+    }
+
+    // ── Integer precision beyond 2^53 (round-7 root fix: no f64 laundering) ──
+
+    #[test]
+    fn int_arithmetic_exact_beyond_2_53() {
+        // 2^53+1 + 1 must be 2^53+2 exactly, not rounded back to 2^53+1.
+        let n = 9_007_199_254_740_993_i64; // 2^53 + 1
+        assert_eq!(
+            eval_doc_int("doc['n'].value + 1", "n", n).unwrap(),
+            serde_json::json!(9_007_199_254_740_994_i64)
+        );
+    }
+
+    #[test]
+    fn int_ordering_exact_beyond_2_53() {
+        // a = 2^53+1, b = 2^53: a > b is true (via f64 both round to 2^53 → false).
+        let a = 9_007_199_254_740_993_i64;
+        let b = 9_007_199_254_740_992_i64;
+        assert_eq!(
+            eval_doc_two("doc['a'].value > doc['b'].value", a, b).unwrap(),
+            serde_json::json!(true)
+        );
+        // ordering must not disagree with equality (== is already exact).
+        assert_eq!(
+            eval_doc_two("doc['a'].value == doc['b'].value", a, b).unwrap(),
+            serde_json::json!(false)
+        );
+    }
+
+    #[test]
+    fn math_max_min_exact_beyond_2_53() {
+        let a = 9_007_199_254_740_993_i64;
+        let b = 9_007_199_254_740_992_i64;
+        let mut ctx = ScriptContext::new();
+        ctx.doc.insert("a".into(), serde_json::json!(a));
+        ctx.doc.insert("b".into(), serde_json::json!(b));
+        assert_eq!(
+            evaluate("Math.max(doc['a'].value, doc['b'].value)", &mut ctx).unwrap(),
+            serde_json::json!(a)
+        );
+        assert_eq!(
+            evaluate("Math.min(doc['a'].value, doc['b'].value)", &mut ctx).unwrap(),
+            serde_json::json!(b)
+        );
+    }
+
+    #[test]
+    fn vector_non_finite_result_errors() {
+        // Components are finite (1e200) but the dot product overflows to inf,
+        // which would otherwise serialize to null — must error instead.
+        let mut ctx = ScriptContext::new();
+        ctx.params
+            .insert("q".into(), serde_json::json!([1e200, 1e200]));
+        ctx.doc
+            .insert("v".into(), serde_json::json!([1e200, 1e200]));
+        let r = evaluate("dotProduct(params.q, 'v')", &mut ctx);
+        assert!(r.is_err(), "non-finite vector result should error: {r:?}");
+    }
+
+    #[test]
+    fn vector_normal_still_works() {
+        let mut ctx = ScriptContext::new();
+        ctx.params.insert("q".into(), serde_json::json!([1.0, 2.0]));
+        ctx.doc.insert("v".into(), serde_json::json!([3.0, 4.0]));
+        let r = evaluate("dotProduct(params.q, 'v')", &mut ctx).unwrap();
+        assert_eq!(r, serde_json::json!(11.0)); // 1*3 + 2*4
     }
 
     #[test]
