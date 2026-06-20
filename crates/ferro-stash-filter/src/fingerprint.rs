@@ -15,7 +15,6 @@ enum HashMethod {
     MURMUR3,
 }
 
-#[derive(Debug)]
 pub struct FingerprintFilter {
     source: Vec<String>,
     target: String,
@@ -23,6 +22,24 @@ pub struct FingerprintFilter {
     concatenate_sources: bool,
     key: Option<String>,
     condition: Option<Condition>,
+}
+
+// Manual `Debug` so the HMAC `key` is never rendered in plaintext: a leaked key
+// lets an attacker recompute the fingerprint and de-anonymize low-entropy
+// fields. The presence (Some/None) is preserved for diagnostics, but the value
+// is masked — mirroring the redacting Debug impls on the credential-bearing
+// connectors and the anonymize filter.
+impl std::fmt::Debug for FingerprintFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FingerprintFilter")
+            .field("source", &self.source)
+            .field("target", &self.target)
+            .field("method", &self.method)
+            .field("concatenate_sources", &self.concatenate_sources)
+            .field("key", &self.key.as_ref().map(|_| "***"))
+            .field("condition", &self.condition)
+            .finish()
+    }
 }
 
 impl FingerprintFilter {
@@ -271,5 +288,17 @@ mod tests {
         let settings = serde_json::json!({});
         let filter = FingerprintFilter::from_config(&settings, None).expect("config");
         assert_eq!(filter.name(), "fingerprint");
+    }
+
+    #[test]
+    fn debug_redacts_key() {
+        let settings = serde_json::json!({ "source": ["message"], "key": "super-secret-hmac" });
+        let filter = FingerprintFilter::from_config(&settings, None).expect("config");
+        let dbg = format!("{filter:?}");
+        assert!(!dbg.contains("super-secret-hmac"), "key leaked: {dbg}");
+        assert!(dbg.contains("***"), "expected masked key: {dbg}");
+        // absent key renders as None, not "***"
+        let f2 = FingerprintFilter::from_config(&serde_json::json!({}), None).expect("config");
+        assert!(format!("{f2:?}").contains("key: None"));
     }
 }

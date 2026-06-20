@@ -13,6 +13,7 @@ pub mod multi_pipeline;
 pub mod persistent_queue;
 pub mod pipeline;
 pub mod plugin;
+pub mod redact;
 pub mod settings_helpers;
 pub mod shutdown;
 
@@ -20,6 +21,7 @@ pub use error::FerroStashError;
 pub use event::{Event, EventValue, Metadata};
 pub use pipeline::{Pipeline, PipelineConfig};
 pub use plugin::{FilterPlugin, InputPlugin, OutputPlugin};
+pub use redact::{redact_secrets_in_json, redact_url};
 pub use shutdown::ShutdownSignal;
 
 /// Truncate `body` to at most `limit` bytes (on a UTF-8 char boundary),

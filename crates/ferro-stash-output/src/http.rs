@@ -12,7 +12,6 @@ use reqwest::Client;
 use tracing::warn;
 
 #[allow(dead_code)]
-#[derive(Debug)]
 pub struct HttpOutput {
     url: String,
     method: HttpMethod,
@@ -22,6 +21,33 @@ pub struct HttpOutput {
     format: HttpFormat,
     retry_count: usize,
     condition: Option<Condition>,
+}
+
+/// Manual `Debug` impl that redacts header values and the URL.
+///
+/// Header values frequently carry credentials (`Authorization: Bearer …`) and
+/// a URL can carry userinfo / signed query params; a derived `Debug` would
+/// print them verbatim into logs. We render header *names* (structural) but
+/// mask their values, and route `url` through [`ferro_stash_core::redact_url`].
+/// Mirrors the `HttpFilter` redacting Debug impl.
+impl std::fmt::Debug for HttpOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted_headers: Vec<(&str, &str)> = self
+            .headers
+            .iter()
+            .map(|(k, _)| (k.as_str(), "***"))
+            .collect();
+        f.debug_struct("HttpOutput")
+            .field("url", &ferro_stash_core::redact_url(&self.url))
+            .field("method", &self.method)
+            .field("headers", &redacted_headers)
+            .field("content_type", &self.content_type)
+            .field("client", &self.client)
+            .field("format", &self.format)
+            .field("retry_count", &self.retry_count)
+            .field("condition", &self.condition)
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -412,6 +438,27 @@ mod tests {
         });
         let output = HttpOutput::from_config(&settings, None).expect("config");
         assert_eq!(output.retry_count, 5);
+    }
+
+    #[test]
+    fn test_http_output_debug_redacts_headers_and_url() {
+        let settings = serde_json::json!({
+            "url": "https://user:pa55word@example.com/api?token=s3cr3t&page=2",
+            "headers": { "Authorization": "Bearer abc123def" }
+        });
+        let output = HttpOutput::from_config(&settings, None).expect("config");
+        let dbg = format!("{output:?}");
+        assert!(!dbg.contains("abc123def"), "header value leaked: {dbg}");
+        assert!(!dbg.contains("s3cr3t"), "url token leaked: {dbg}");
+        assert!(!dbg.contains("pa55word"), "url userinfo leaked: {dbg}");
+        assert!(
+            dbg.contains("Authorization"),
+            "header name should be visible: {dbg}"
+        );
+        assert!(dbg.contains("***"), "redaction marker missing: {dbg}");
+        // Non-secret structure stays visible.
+        assert!(dbg.contains("example.com"), "host should be visible: {dbg}");
+        assert!(dbg.contains("page=2"), "non-secret query dropped: {dbg}");
     }
 
     #[test]

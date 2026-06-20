@@ -73,11 +73,26 @@ pub trait OutputPlugin: Send + Sync + Debug {
 }
 
 /// Configuration for a plugin instance.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is implemented manually so the free-form `settings` blob (which can
+/// hold plugin secrets — passwords, API keys, tokens) is rendered through
+/// [`crate::redact_secrets_in_json`] instead of verbatim. Only `Debug` changes;
+/// the in-memory `settings` value is untouched.
+#[derive(Clone)]
 pub struct PluginConfig {
     pub plugin_type: String,
     pub settings: serde_json::Value,
     pub condition: Option<Condition>,
+}
+
+impl Debug for PluginConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PluginConfig")
+            .field("plugin_type", &self.plugin_type)
+            .field("settings", &crate::redact_secrets_in_json(&self.settings))
+            .field("condition", &self.condition)
+            .finish()
+    }
 }
 
 impl PluginConfig {
@@ -92,5 +107,24 @@ impl PluginConfig {
     pub fn with_condition(mut self, condition: Condition) -> Self {
         self.condition = Some(condition);
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plugin_config_debug_redacts_settings() {
+        let cfg = PluginConfig::new(
+            "kafka",
+            serde_json::json!({ "bootstrap": "h:9092", "sasl_password": "s3cr3t" }),
+        );
+        let dbg = format!("{cfg:?}");
+        assert!(!dbg.contains("s3cr3t"), "secret leaked via Debug: {dbg}");
+        assert!(dbg.contains("***"), "redaction marker missing: {dbg}");
+        // Non-secret setting stays visible; the real value is untouched.
+        assert!(dbg.contains("h:9092"), "non-secret setting hidden: {dbg}");
+        assert_eq!(cfg.settings["sasl_password"], "s3cr3t");
     }
 }

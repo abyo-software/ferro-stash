@@ -44,8 +44,9 @@ const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 /// One configured request.
 ///
 /// `Debug` is implemented manually so header **values** (which may carry
-/// `Authorization: Bearer …` secrets) are never rendered in logs/diagnostics;
-/// the header names stay visible.
+/// `Authorization: Bearer …` secrets) are never rendered in logs/diagnostics
+/// and the `url` is routed through [`ferro_stash_core::redact_url`] (URLs can
+/// carry userinfo / signed query params); the header names stay visible.
 #[derive(Clone)]
 struct UrlSpec {
     name: String,
@@ -60,7 +61,7 @@ impl std::fmt::Debug for UrlSpec {
             self.headers.keys().map(|k| (k.as_str(), "***")).collect();
         f.debug_struct("UrlSpec")
             .field("name", &self.name)
-            .field("url", &self.url)
+            .field("url", &ferro_stash_core::redact_url(&self.url))
             .field("method", &self.method)
             .field("headers", &redacted)
             .finish()
@@ -318,7 +319,7 @@ mod tests {
     fn debug_redacts_header_values() {
         // Authorization/Bearer header values must not leak via `{:?}`.
         let s = serde_json::json!({
-            "urls": { "m": { "url": "http://x/m",
+            "urls": { "m": { "url": "https://u:p4ss@x/m?access_token=leakme",
                              "headers": { "Authorization": "Bearer super-secret-token" } } },
         });
         let i = HttpPollerInput::from_config(&s).expect("config");
@@ -330,6 +331,9 @@ mod tests {
         assert!(dbg.contains("***"));
         // The header name is still visible (only the value is masked).
         assert!(dbg.contains("Authorization"));
+        // The url is redacted: no userinfo password and no signed token value.
+        assert!(!dbg.contains("p4ss"), "url userinfo leaked: {dbg}");
+        assert!(!dbg.contains("leakme"), "url token value leaked: {dbg}");
     }
 
     #[test]

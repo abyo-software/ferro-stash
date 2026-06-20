@@ -143,7 +143,13 @@ fn default_buffer_size() -> usize {
 }
 
 /// Input plugin configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is implemented manually so the free-form `settings` blob (which can
+/// hold plugin secrets — passwords, API keys, tokens) is rendered through
+/// [`ferro_stash_core::redact_secrets_in_json`] instead of verbatim. The
+/// `Serialize`/`Deserialize` derives are untouched, so config reload still
+/// round-trips the real values.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct InputConfig {
     #[serde(rename = "type")]
     pub plugin_type: String,
@@ -161,8 +167,28 @@ pub struct InputConfig {
     pub event_type: Option<String>,
 }
 
+impl std::fmt::Debug for InputConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InputConfig")
+            .field("plugin_type", &self.plugin_type)
+            .field(
+                "settings",
+                &ferro_stash_core::redact_secrets_in_json(&self.settings),
+            )
+            .field("codec", &self.codec)
+            .field("codec_settings", &self.codec_settings)
+            .field("tags", &self.tags)
+            .field("event_type", &self.event_type)
+            .finish()
+    }
+}
+
 /// Filter plugin configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` renders the secret-bearing `settings` blob via
+/// [`ferro_stash_core::redact_secrets_in_json`]; `Serialize`/`Deserialize` are
+/// untouched so reload round-trips real values.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct FilterConfig {
     #[serde(rename = "type")]
     pub plugin_type: String,
@@ -172,8 +198,25 @@ pub struct FilterConfig {
     pub condition: Option<Condition>,
 }
 
+impl std::fmt::Debug for FilterConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FilterConfig")
+            .field("plugin_type", &self.plugin_type)
+            .field(
+                "settings",
+                &ferro_stash_core::redact_secrets_in_json(&self.settings),
+            )
+            .field("condition", &self.condition)
+            .finish()
+    }
+}
+
 /// Output plugin configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` renders the secret-bearing `settings` blob via
+/// [`ferro_stash_core::redact_secrets_in_json`]; `Serialize`/`Deserialize` are
+/// untouched so reload round-trips real values.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct OutputConfig {
     #[serde(rename = "type")]
     pub plugin_type: String,
@@ -185,6 +228,21 @@ pub struct OutputConfig {
     pub codec_settings: serde_json::Value,
     #[serde(default)]
     pub condition: Option<Condition>,
+}
+
+impl std::fmt::Debug for OutputConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OutputConfig")
+            .field("plugin_type", &self.plugin_type)
+            .field(
+                "settings",
+                &ferro_stash_core::redact_secrets_in_json(&self.settings),
+            )
+            .field("codec", &self.codec)
+            .field("codec_settings", &self.codec_settings)
+            .field("condition", &self.condition)
+            .finish()
+    }
 }
 
 #[cfg(test)]
@@ -236,6 +294,65 @@ mod tests {
         assert_eq!(q.queue_type, "persisted");
         assert_eq!(q.path, "/tmp/pq");
         assert_eq!(q.max_bytes, 500);
+    }
+
+    #[test]
+    fn test_input_config_debug_redacts_settings_but_serialize_keeps_them() {
+        let cfg = InputConfig {
+            plugin_type: "http".to_string(),
+            settings: serde_json::json!({
+                "url": "http://example.com",
+                "password": "hunter2",
+                "api_key": "AKIA-SECRET"
+            }),
+            codec: None,
+            codec_settings: serde_json::Value::Null,
+            tags: vec![],
+            event_type: None,
+        };
+
+        // Debug masks the secrets but keeps non-secret structure visible.
+        let dbg = format!("{cfg:?}");
+        assert!(!dbg.contains("hunter2"), "password leaked via Debug: {dbg}");
+        assert!(
+            !dbg.contains("AKIA-SECRET"),
+            "api_key leaked via Debug: {dbg}"
+        );
+        assert!(dbg.contains("***"), "redaction marker missing: {dbg}");
+        assert!(
+            dbg.contains("http://example.com"),
+            "non-secret setting should stay visible: {dbg}"
+        );
+
+        // Serialize MUST still round-trip the real secret values (config reload).
+        let val = serde_json::to_value(&cfg).expect("serialize");
+        assert_eq!(val["settings"]["password"], "hunter2");
+        assert_eq!(val["settings"]["api_key"], "AKIA-SECRET");
+    }
+
+    #[test]
+    fn test_config_debug_inherits_plugin_redaction() {
+        // The top-level Config holds no raw secret Value of its own; it inherits
+        // redaction from the per-plugin config Debug impls.
+        let cfg = Config {
+            outputs: vec![OutputConfig {
+                plugin_type: "elasticsearch".to_string(),
+                settings: serde_json::json!({ "secret": "topsecret" }),
+                codec: None,
+                codec_settings: serde_json::Value::Null,
+                condition: None,
+            }],
+            ..Config::default()
+        };
+        let dbg = format!("{cfg:?}");
+        assert!(
+            !dbg.contains("topsecret"),
+            "secret leaked via Config Debug: {dbg}"
+        );
+        assert!(dbg.contains("***"), "redaction marker missing: {dbg}");
+        // Serialize still preserves the real value.
+        let val = serde_json::to_value(&cfg).expect("serialize");
+        assert_eq!(val["outputs"][0]["settings"]["secret"], "topsecret");
     }
 
     #[test]

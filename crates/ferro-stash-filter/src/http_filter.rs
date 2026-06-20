@@ -74,7 +74,7 @@ impl std::fmt::Debug for HttpFilter {
             .map(|(k, _)| (k.as_str(), "***"))
             .collect();
         f.debug_struct("HttpFilter")
-            .field("url", &self.url)
+            .field("url", &ferro_stash_core::redact_url(&self.url))
             .field("method", &self.method)
             .field("headers", &redacted_headers)
             .field("body", &self.body.as_ref().map(|_| "***"))
@@ -195,6 +195,10 @@ impl FilterPlugin for HttpFilter {
 
     async fn filter(&self, mut event: Event) -> Result<Vec<Event>> {
         let url = event.sprintf(&self.url);
+        // Log-safe rendering: the real `url` is used for the request, but a
+        // url can carry userinfo / signed query params, so warnings log the
+        // redacted form.
+        let safe_url = ferro_stash_core::redact_url(&url);
         let mut request = self.client.request(self.method.clone(), &url);
         for (key, value) in &self.headers {
             request = request.header(key, event.sprintf(value));
@@ -206,7 +210,7 @@ impl FilterPlugin for HttpFilter {
         let response = match request.send().await {
             Ok(resp) => resp,
             Err(e) => {
-                warn!(url = %url, error = %e, "http filter: request failed");
+                warn!(url = %safe_url, error = %e, "http filter: request failed");
                 event.add_tag(&self.tag_on_failure);
                 return Ok(vec![event]);
             }
@@ -237,7 +241,7 @@ impl FilterPlugin for HttpFilter {
                 self.store_body(&mut event, raw);
             }
             Err(e) => {
-                warn!(url = %url, error = %e, "http filter: response body too large or unreadable");
+                warn!(url = %safe_url, error = %e, "http filter: response body too large or unreadable");
                 event.add_tag(&self.tag_on_failure);
                 return Ok(vec![event]);
             }
@@ -246,7 +250,7 @@ impl FilterPlugin for HttpFilter {
         // A non-2xx response stored its body above but still flags failure so a
         // downstream conditional can route it.
         if !status.is_success() {
-            warn!(url = %url, status = %status, "http filter: non-success response");
+            warn!(url = %safe_url, status = %status, "http filter: non-success response");
             event.add_tag(&self.tag_on_failure);
         }
 
@@ -324,7 +328,7 @@ mod tests {
     #[test]
     fn test_http_filter_debug_redacts_header_values_and_body() {
         let settings = serde_json::json!({
-            "url": "http://example.com",
+            "url": "https://user:urlpw@example.com/p?api_key=urltoken",
             "headers": { "Authorization": "Bearer s3cr3t" },
             "body": "topsecretbody"
         });
@@ -337,6 +341,10 @@ mod tests {
             "header name should be visible: {dbg}"
         );
         assert!(dbg.contains("***"), "redaction marker missing: {dbg}");
+        // The url is routed through redact_url: userinfo and signed params gone.
+        assert!(!dbg.contains("urlpw"), "url userinfo leaked: {dbg}");
+        assert!(!dbg.contains("urltoken"), "url api_key value leaked: {dbg}");
+        assert!(dbg.contains("example.com"), "host should be visible: {dbg}");
     }
 
     // ----- Behaviour tests against a tiny raw-HTTP mock server -----
