@@ -1,0 +1,87 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# FerroStash -- main service systemd unit (AWS Marketplace AMI).
+#
+# Hardening choices (matched to the repo deploy/systemd unit and the
+# FerroSCA / FerroAuth / FerroStream standards):
+#
+#   * Type=simple -- the ferro-stash binary does not call sd_notify(); it
+#     starts the pipeline + monitoring API directly.
+#   * Restart=on-failure with a short back-off so transient crashes self-heal.
+#   * ProtectSystem=strict + ReadWritePaths makes / read-only except for the
+#     data + log dirs. ProtectHome=true hides /home. PrivateTmp=true gives a
+#     per-process /tmp.
+#   * NoNewPrivileges=true so any privilege-elevation syscall fails instantly.
+#   * MemoryDenyWriteExecute is INTENTIONALLY false: the native `script`
+#     filter uses a Cranelift JIT that needs W^X transitions.
+
+[Unit]
+Description=FerroStash -- Logstash-compatible log and event pipeline
+Documentation=file:/var/lib/ferro-stash/initial-info.txt
+After=network-online.target ferro-stash-firstboot.service
+Wants=network-online.target ferro-stash-firstboot.service
+
+[Service]
+Type=simple
+User=ferrostash
+Group=ferrostash
+
+# The monitoring API binds to localhost only; pipeline input ports are
+# whatever /etc/ferro-stash/pipeline.conf declares (the shipped default is
+# Elastic Beats on TCP 5044). Reach the API over SSH / a private tunnel.
+ExecStart=/usr/local/bin/ferro-stash \
+    -f /etc/ferro-stash/pipeline.conf \
+    --path.data /var/lib/ferro-stash/data \
+    --path.logs /var/log/ferro-stash \
+    --api.http.host 127.0.0.1:9600 \
+    --log.level info
+
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=35
+# Graceful shutdown: the binary drains pipelines on SIGTERM.
+KillSignal=SIGTERM
+KillMode=mixed
+
+# Filesystem isolation.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ReadWritePaths=/var/lib/ferro-stash /var/log/ferro-stash
+
+# Privilege isolation.
+NoNewPrivileges=true
+LockPersonality=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RemoveIPC=true
+MemoryDenyWriteExecute=false
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+
+# Syscall filter: deny anything outside the network-server baseline.
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallArchitectures=native
+
+# Networking: tcp/udp/http/beats/kafka/es inputs+outputs need INET; some
+# plugins (unix input) use AF_UNIX.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# Resource limits.
+LimitNOFILE=65536
+
+# Output to journald.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

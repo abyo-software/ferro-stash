@@ -12,3 +12,6 @@
 
 # bench runtime state (path.data)
 bench/data/
+
+# Marketplace AMI build staging (cross-compiled binaries; rebuilt by build.sh)
+marketplace/packer/build/

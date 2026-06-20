@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# ferro-stash-firstboot.service -- once-per-AMI initialiser.
+#
+# Runs `/usr/local/sbin/ferro-stash-firstboot` (installed by
+# `40-install-systemd-units.sh`) before the main `ferro-stash.service`.
+# The script self-gates via `/var/lib/ferro-stash/.firstboot-done`, so
+# subsequent reboots are no-ops even though the unit is enabled.
+#
+# FerroStash has NO auth / admin user / session secret to generate, so the
+# first boot only records instance metadata + a quick-start note. It is kept
+# as a oneshot for parity with the sibling AMIs and so the main service has a
+# stable ordering anchor.
+
+[Unit]
+Description=FerroStash -- one-time first-boot initialiser
+Documentation=file:/var/lib/ferro-stash/initial-info.txt
+After=network-online.target cloud-final.service
+Wants=network-online.target
+Before=ferro-stash.service
+ConditionPathExists=!/var/lib/ferro-stash/.firstboot-done
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/ferro-stash-firstboot
+TimeoutStartSec=120
+
+# Runs as root so it can write the info file into the data dir and create
+# directories. The hardening below matches the main service where it does
+# not block the first-boot workflow.
+NoNewPrivileges=false
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/etc/ferro-stash /var/lib/ferro-stash /var/log/ferro-stash
+
+[Install]
+WantedBy=multi-user.target

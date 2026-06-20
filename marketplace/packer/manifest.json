@@ -1,0 +1,18 @@
+{
+  "builds": [
+    {
+      "name": "arm64",
+      "builder_type": "amazon-ebs",
+      "build_time": 1781962228,
+      "files": null,
+      "artifact_id": "us-east-1:ami-03f0120594eaba3ee",
+      "packer_run_uuid": "12f8dc63-bb54-14a9-7a21-4740c1e00d19",
+      "custom_data": {
+        "build_suffix": "20260620132559",
+        "ferrostash_version": "1.0.0",
+        "product_code": "REPLACE-WITH-SELLER-PRODUCT-CODE"
+      }
+    }
+  ],
+  "last_run_uuid": "12f8dc63-bb54-14a9-7a21-4740c1e00d19"
+}

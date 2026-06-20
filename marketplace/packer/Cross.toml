@@ -1,0 +1,68 @@
+# SPDX-License-Identifier: Apache-2.0
+# `cross` configuration for the FerroStash Marketplace AMI build.
+#
+# WHY THIS FILE EXISTS: FerroStash's default build pulls `rdkafka`, which
+# vendors librdkafka and compiles it with CMake + a C toolchain. The stock
+# `cross` images do not ship cmake, so the rdkafka-sys build script fails with
+# "could not find cmake". The pre-build hooks below install cmake + a C/clang
+# toolchain + pkg-config into the target image before cargo runs.
+#
+# GLIBC CAVEAT: we build the GNU (glibc) target, so the produced binary is
+# dynamically linked. The `cross` 0.2.5+ default GNU images are Ubuntu 20.04
+# based (glibc 2.31), which is OLDER than Amazon Linux 2023's glibc (~2.34), so
+# the binary runs on the AL2023 AMI. If you bump `cross` (or pin a different
+# `image = ...` below), keep the image's glibc <= AL2023's or the service will
+# fail at launch with a "GLIBC_2.xx not found" loader error.
+#
+# Connector TLS is rustls, so NO system OpenSSL is required (one fewer C dep).
+
+[build]
+# Keep the host RUSTC_WRAPPER (sccache) OUT of the container: a host-path
+# wrapper does not exist inside the image. build.sh also clears it.
+[build.env]
+passthrough = [
+    "RUSTC_WRAPPER",
+    "CARGO_BUILD_RUSTC_WRAPPER",
+    "SCCACHE_DISABLE",
+    "CARGO_NET_GIT_FETCH_WITH_CLI",
+]
+
+[target.aarch64-unknown-linux-gnu]
+# librdkafka (vendored by rdkafka-sys) builds with WITH_ZLIB=1 and runs
+# `find_package(ZLIB)`. Two cross-build hazards have to be defused below; both
+# are specific to rdkafka-sys 4.10.0+2.12.1's CMake build path. SSL/SASL/ZSTD/
+# curl/lz4 are all passed `-D...=0`, so zlib (gzip) is the only C dep we keep.
+pre-build = [
+    "apt-get update",
+    "apt-get install --assume-yes --no-install-recommends cmake clang pkg-config",
+    # --- HAZARD 1: zlib not found under the cross find-root ---------------
+    # libz-sys cross-builds a STATIC target zlib and hands its location to the
+    # librdkafka CMake build through the *environment* variable CMAKE_PREFIX_PATH
+    # (cmake-rs sets `cmd.env("CMAKE_PREFIX_PATH", DEP_Z_ROOT)`). The stock
+    # /opt/toolchain.cmake only folds the *CMake variable* ${CMAKE_PREFIX_PATH}
+    # (empty at toolchain-read time) into CMAKE_FIND_ROOT_PATH, and sets
+    # CMAKE_FIND_ROOT_PATH_MODE_{LIBRARY,INCLUDE}=ONLY -- so the staged zlib,
+    # which lives OUTSIDE the sysroot, is invisible and the configure fails.
+    # Fix: append the ENV CMAKE_PREFIX_PATH entries to CMAKE_FIND_ROOT_PATH so
+    # FindZLIB resolves libz-sys's `out/{lib,include}`. We deliberately keep
+    # MODE=ONLY (do NOT relax to BOTH): BOTH over-detects HOST libraries.
+    "printf '\\nif(DEFINED ENV{CMAKE_PREFIX_PATH})\\n  file(TO_CMAKE_PATH \"$ENV{CMAKE_PREFIX_PATH}\" _cross_prefix_roots)\\n  list(APPEND CMAKE_FIND_ROOT_PATH ${_cross_prefix_roots})\\n  list(REMOVE_ITEM CMAKE_FIND_ROOT_PATH \"\")\\nendif()\\n' >> /opt/toolchain.cmake",
+    # --- HAZARD 2: unconditional <curl/curl.h> include (librdkafka bug) ----
+    # librdkafka's CMake config.h.in declares WITH_OAUTHBEARER_OIDC via
+    # `#cmakedefine01`, which ALWAYS emits `#define WITH_OAUTHBEARER_OIDC 0`
+    # (even with curl off). But src/rdkafka_conf.c guards `#include <curl/curl.h>`
+    # with `#ifdef WITH_OAUTHBEARER_OIDC` -- TRUE even when the value is 0 -- so
+    # curl.h is pulled in despite WITH_CURL=0. Every actual curl/OIDC code path
+    # uses the correct `#if WITH_OAUTHBEARER_OIDC` (=0), so NO libcurl symbols are
+    # ever compiled or linked; only the header include must resolve. Drop an
+    # empty stub into the target sysroot include dir (cross gcc searches it for
+    # <> includes). TLS is rustls; libcurl is never linked into the binary.
+    "mkdir -p /usr/aarch64-linux-gnu/include/curl",
+    "printf '%s\\n' '/* Empty stub -- see marketplace/packer/Cross.toml HAZARD 2. Satisfies a librdkafka 2.12.1 cmake-path #ifdef(WITH_OAUTHBEARER_OIDC) include of <curl/curl.h> while WITH_CURL=0. No curl symbols are compiled; rustls is the TLS stack. */' > /usr/aarch64-linux-gnu/include/curl/curl.h",
+]
+
+[target.x86_64-unknown-linux-gnu]
+pre-build = [
+    "apt-get update",
+    "apt-get install --assume-yes --no-install-recommends cmake clang pkg-config",
+]
