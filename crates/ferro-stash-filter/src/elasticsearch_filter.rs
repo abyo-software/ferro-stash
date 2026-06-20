@@ -92,8 +92,14 @@ pub struct ElasticsearchFilter {
 impl std::fmt::Debug for ElasticsearchFilter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let redact = |opt: &Option<String>| opt.as_ref().map(|_| "***");
+        // Hosts are URLs and may embed credentials (userinfo / api_key query).
+        let hosts: Vec<String> = self
+            .hosts
+            .iter()
+            .map(|h| ferro_stash_core::redact_url(h.as_str()))
+            .collect();
         f.debug_struct("ElasticsearchFilter")
-            .field("hosts", &self.hosts)
+            .field("hosts", &hosts)
             .field("index", &self.index)
             .field("query_template", &self.query_template)
             .field("result_size", &self.result_size)

@@ -38,8 +38,14 @@ pub struct ElasticsearchInput {
 // Manual Debug to avoid leaking `password` / `api_key` into logs / error context.
 impl std::fmt::Debug for ElasticsearchInput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Hosts are URLs and may embed credentials (userinfo / api_key query).
+        let hosts: Vec<String> = self
+            .hosts
+            .iter()
+            .map(|h| ferro_stash_core::redact_url(h.as_str()))
+            .collect();
         f.debug_struct("ElasticsearchInput")
-            .field("hosts", &self.hosts)
+            .field("hosts", &hosts)
             .field("index", &self.index)
             .field("query", &self.query)
             .field("esql_query", &self.esql_query)

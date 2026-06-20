@@ -55,8 +55,15 @@ impl std::fmt::Debug for ElasticsearchOutput {
         // `{:?}`. `username` is an identifier, not a secret, so it stays visible.
         let password = self.password.as_ref().map(|_| "***");
         let api_key = self.api_key.as_ref().map(|_| "***");
+        // Hosts are URLs and may embed credentials (userinfo / api_key query),
+        // so redact each like the http plugins do.
+        let hosts: Vec<String> = self
+            .hosts
+            .iter()
+            .map(|h| ferro_stash_core::redact_url(h.as_str()))
+            .collect();
         f.debug_struct("ElasticsearchOutput")
-            .field("hosts", &self.hosts)
+            .field("hosts", &hosts)
             .field("index", &self.index)
             .field("client", &self.client)
             .field("username", &self.username)
@@ -675,6 +682,22 @@ mod tests {
     use super::*;
     use axum::{routing::post, Json, Router};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn debug_redacts_credentialed_host() {
+        let settings = serde_json::json!({
+            "hosts": ["https://user:secretpw@es:9200/?api_key=sekret"],
+            "index": "i"
+        });
+        let output = ElasticsearchOutput::from_config(&settings, None).expect("config");
+        let dbg = format!("{output:?}");
+        assert!(!dbg.contains("secretpw"), "host userinfo leaked: {dbg}");
+        assert!(!dbg.contains("sekret"), "host api_key leaked: {dbg}");
+        assert!(
+            dbg.contains("es:9200"),
+            "host should still be visible: {dbg}"
+        );
+    }
 
     #[test]
     fn test_build_bulk_body() {

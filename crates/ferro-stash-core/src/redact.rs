@@ -94,15 +94,16 @@ fn redact_query(query: &str) -> String {
 /// params (`token`, `access_token`, `api_key`, `apikey`, `key`, `sig`,
 /// `signature`, `password`, `secret`) with `***`.
 ///
-/// Scheme, host, path, fragment, and non-secret query params stay visible. The
+/// Scheme, host, path, and non-secret query/fragment params stay visible. The
 /// input need not be a well-formed URL — parsing is best-effort and never
 /// panics; a non-URL string is returned unchanged except that an
 /// `userinfo@` prefix is still stripped if present.
 #[must_use]
 pub fn redact_url(url: &str) -> String {
-    // Peel off the fragment (kept verbatim) then the query (redacted).
+    // Peel off the fragment, then the query. Both can carry a secret (e.g.
+    // `#access_token=…`), so redact the fragment's k=v pairs too.
     let (rest, fragment) = match url.find('#') {
-        Some(i) => (&url[..i], &url[i..]),
+        Some(i) => (&url[..i], &url[i + 1..]),
         None => (url, ""),
     };
     let (base, query) = match rest.split_once('?') {
@@ -110,9 +111,14 @@ pub fn redact_url(url: &str) -> String {
         None => (rest, None),
     };
     let base = strip_userinfo(base);
+    let frag = if fragment.is_empty() {
+        String::new()
+    } else {
+        format!("#{}", redact_query(fragment))
+    };
     match query {
-        Some(q) => format!("{base}?{}{fragment}", redact_query(q)),
-        None => format!("{base}{fragment}"),
+        Some(q) => format!("{base}?{}{frag}", redact_query(q)),
+        None => format!("{base}{frag}"),
     }
 }
 
@@ -175,6 +181,22 @@ mod tests {
         assert!(out.contains("sig=***"));
         assert!(out.contains("x=1"));
         assert!(out.contains("#frag"), "fragment dropped: {out}");
+    }
+
+    #[test]
+    fn redact_url_masks_secret_in_fragment() {
+        let out = redact_url("https://api.example/p#access_token=secret&page=2");
+        assert!(!out.contains("secret"), "fragment secret leaked: {out}");
+        assert!(
+            out.contains("access_token=***"),
+            "fragment not masked: {out}"
+        );
+        assert!(
+            out.contains("page=2"),
+            "non-secret fragment param dropped: {out}"
+        );
+        // A plain (non k=v) fragment is still preserved.
+        assert!(redact_url("http://h/p#section").contains("#section"));
     }
 
     #[test]
