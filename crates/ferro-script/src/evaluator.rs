@@ -653,7 +653,15 @@ fn eval_method(
             };
             let start = start.min(s.len());
             let end = end.min(s.len());
-            Ok(ScriptValue::Str(s[start..end].to_string()))
+            // `s.get` returns None when start > end or when either index falls
+            // inside a multibyte character — never panic on attacker-supplied
+            // event data (a raw `s[start..end]` slice would).
+            match s.get(start..end) {
+                Some(sub) => Ok(ScriptValue::Str(sub.to_string())),
+                None => Err(FerroError::QueryParseError(
+                    "substring() indices out of range or not on a character boundary".into(),
+                )),
+            }
         }
         (ScriptValue::Str(s), "trim") => Ok(ScriptValue::Str(s.trim().to_string())),
         (ScriptValue::Str(s), "startsWith") => {
@@ -940,6 +948,15 @@ fn eval_method(
                     Ok(ScriptValue::Int(dow))
                 }
                 "getDayOfYear" => {
+                    // `month` comes from a parsed (possibly attacker-supplied)
+                    // date string and may be out of 1..=12 (e.g. "2025-99-15");
+                    // validate before indexing so `[..(month-1)]` can't go
+                    // out of bounds or underflow.
+                    if !(1..=12).contains(&month) {
+                        return Err(FerroError::QueryParseError(format!(
+                            "getDayOfYear(): invalid month {month} in date"
+                        )));
+                    }
                     let is_leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
                     let days_in_months: &[i64] = if is_leap {
                         &[31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
@@ -1015,7 +1032,11 @@ fn parse_date_components(val: &ScriptValue) -> FerroResult<(i64, i64, i64, i64, 
         ScriptValue::Str(s) => {
             // Parse ISO 8601: "2025-03-15T10:30:00Z" or "2025-03-15"
             let s = s.trim();
-            if s.len() < 10 {
+            // ISO 8601 timestamps are pure ASCII. Require ASCII (and length)
+            // up front so the byte-index slicing below can never split a
+            // multibyte character — a raw `s[0..4]` on event data like "€€€€"
+            // would panic and wedge the filter worker.
+            if s.len() < 10 || !s.is_ascii() {
                 return Err(FerroError::QueryParseError(format!(
                     "cannot parse date: {s}"
                 )));
@@ -2409,6 +2430,80 @@ mod tests {
         assert_eq!(r, serde_json::json!(1));
         let r = evaluate("doc['ts'].value.toEpochMilli()", &mut ctx).unwrap();
         assert_eq!(r, serde_json::json!(1735689600000_i64));
+    }
+
+    // ── Panic-safety on hostile event data (round-5 review fixes) ──
+    // These previously panicked (unwinding past the script filter and aborting
+    // the filter worker = remote DoS); they must now return Err, never panic.
+
+    #[test]
+    fn substring_multibyte_does_not_panic() {
+        // Byte index 2 falls inside the 3-byte '€' — a raw slice would panic.
+        let mut ctx = ScriptContext::new();
+        ctx.doc.insert("f".to_string(), serde_json::json!("€abc"));
+        let r = evaluate("doc['f'].value.substring(0, 2)", &mut ctx);
+        assert!(
+            r.is_err(),
+            "multibyte substring should error, not panic: {r:?}"
+        );
+    }
+
+    #[test]
+    fn substring_reversed_args_does_not_panic() {
+        let mut ctx = ScriptContext::new();
+        ctx.doc.insert("f".to_string(), serde_json::json!("hello"));
+        let r = evaluate("doc['f'].value.substring(3, 1)", &mut ctx);
+        assert!(
+            r.is_err(),
+            "start>end substring should error, not panic: {r:?}"
+        );
+    }
+
+    #[test]
+    fn substring_ascii_still_works() {
+        let mut ctx = ScriptContext::new();
+        ctx.doc.insert("f".to_string(), serde_json::json!("hello"));
+        let r = evaluate("doc['f'].value.substring(1, 3)", &mut ctx).unwrap();
+        assert_eq!(r, serde_json::json!("el"));
+    }
+
+    #[test]
+    fn date_method_multibyte_string_does_not_panic() {
+        // Non-ASCII value ≥10 bytes: byte slices like s[0..4] would split a char.
+        let mut ctx = ScriptContext::new();
+        ctx.doc
+            .insert("d".to_string(), serde_json::json!("€€€€abcdef"));
+        let r = evaluate("doc['d'].value.getYear()", &mut ctx);
+        assert!(r.is_err(), "multibyte date should error, not panic: {r:?}");
+    }
+
+    #[test]
+    fn get_day_of_year_invalid_month_does_not_panic() {
+        // month=99 → days_in_months[..98] would be out of bounds.
+        let mut ctx = ScriptContext::new();
+        ctx.doc
+            .insert("d".to_string(), serde_json::json!("2025-99-15T00:00:00Z"));
+        let r = evaluate("doc['d'].value.getDayOfYear()", &mut ctx);
+        assert!(r.is_err(), "invalid month should error, not panic: {r:?}");
+    }
+
+    #[test]
+    fn get_day_of_year_zero_month_does_not_panic() {
+        // month=00 → (month as usize - 1) would underflow.
+        let mut ctx = ScriptContext::new();
+        ctx.doc
+            .insert("d".to_string(), serde_json::json!("2025-00-15T00:00:00Z"));
+        let r = evaluate("doc['d'].value.getDayOfYear()", &mut ctx);
+        assert!(r.is_err(), "zero month should error, not panic: {r:?}");
+    }
+
+    #[test]
+    fn get_day_of_year_valid_still_works() {
+        let mut ctx = ScriptContext::new();
+        ctx.doc
+            .insert("d".to_string(), serde_json::json!("2025-03-15T00:00:00Z"));
+        let r = evaluate("doc['d'].value.getDayOfYear()", &mut ctx).unwrap();
+        assert_eq!(r, serde_json::json!(74)); // Jan(31)+Feb(28)+15
     }
 
     #[test]

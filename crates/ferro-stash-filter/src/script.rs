@@ -88,9 +88,17 @@ impl FilterPlugin for ScriptFilter {
                 .insert(k.clone(), serde_json::Value::from(v.clone()));
         }
 
-        // Execute the pre-parsed script (no per-event re-parse).
-        match ferro_script::evaluate_parsed(program, &mut ctx) {
-            Ok(_result) => {
+        // Execute the pre-parsed script (no per-event re-parse). The evaluator
+        // is a dynamic tree-walker over attacker-controlled event data; even
+        // with the known panics fixed, contain any future panic with
+        // `catch_unwind` so one crafted event tags-and-continues instead of
+        // unwinding past this `filter` and aborting the whole filter worker
+        // (which would permanently wedge the pipeline's filter stage).
+        let eval = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ferro_script::evaluate_parsed(program, &mut ctx)
+        }));
+        match eval {
+            Ok(Ok(_result)) => {
                 // Apply changes from ctx._source back to event
                 if let serde_json::Value::Object(src) = &ctx.source {
                     for (k, v) in src {
@@ -105,9 +113,14 @@ impl FilterPlugin for ScriptFilter {
                     }
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 warn!(error = %e, "script filter error");
                 event.add_tag("_scripterror");
+            }
+            Err(_panic) => {
+                warn!("script filter panicked on event data; tagging and continuing");
+                event.add_tag("_scripterror");
+                event.add_tag("_scriptpanic");
             }
         }
 
@@ -177,5 +190,28 @@ mod tests {
         let settings = serde_json::json!({ "code": "" });
         let filter = ScriptFilter::from_config(&settings, None).expect("config");
         assert_eq!(filter.name(), "script");
+    }
+
+    #[tokio::test]
+    async fn hostile_event_data_does_not_wedge_worker() {
+        // A script that errors on crafted event data must tag-and-continue, not
+        // unwind past filter() and abort the filter worker. The known panics are
+        // fixed at the evaluator level (they now return Err → _scripterror); this
+        // also exercises the catch_unwind containment path for any future panic.
+        let settings = serde_json::json!({
+            "code": "ctx._source.out = ctx._source.message.substring(0, 2)"
+        });
+        let filter = ScriptFilter::from_config(&settings, None).expect("config");
+        // "€abc" — byte index 2 is inside the 3-byte '€'.
+        let event = Event::new("€abc");
+        let result = filter
+            .filter(event)
+            .await
+            .expect("filter must not error out");
+        assert_eq!(result.len(), 1, "event must survive (not be dropped)");
+        assert!(
+            result[0].has_tag("_scripterror"),
+            "expected _scripterror tag on surviving event"
+        );
     }
 }
