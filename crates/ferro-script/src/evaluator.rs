@@ -525,24 +525,37 @@ fn eval_binop(left: &ScriptValue, op: &BinOp, right: &ScriptValue) -> FerroResul
     // If both are integers and the op produces an integer result, keep as int
     let both_int = matches!(left, ScriptValue::Int(_)) && matches!(right, ScriptValue::Int(_));
 
+    // Integer arithmetic on (attacker-supplied) event values uses checked ops:
+    // overflow returns a script error instead of panicking (debug) or silently
+    // wrapping to a wrong value (release — overflow-checks are off there).
+    let overflow = |what: &str| FerroError::QueryParseError(format!("integer overflow in {what}"));
     match op {
         BinOp::Add => {
             if both_int {
-                Ok(ScriptValue::Int(lf as i64 + rf as i64))
+                (lf as i64)
+                    .checked_add(rf as i64)
+                    .map(ScriptValue::Int)
+                    .ok_or_else(|| overflow("addition"))
             } else {
                 Ok(ScriptValue::Float(lf + rf))
             }
         }
         BinOp::Sub => {
             if both_int {
-                Ok(ScriptValue::Int(lf as i64 - rf as i64))
+                (lf as i64)
+                    .checked_sub(rf as i64)
+                    .map(ScriptValue::Int)
+                    .ok_or_else(|| overflow("subtraction"))
             } else {
                 Ok(ScriptValue::Float(lf - rf))
             }
         }
         BinOp::Mul => {
             if both_int {
-                Ok(ScriptValue::Int(lf as i64 * rf as i64))
+                (lf as i64)
+                    .checked_mul(rf as i64)
+                    .map(ScriptValue::Int)
+                    .ok_or_else(|| overflow("multiplication"))
             } else {
                 Ok(ScriptValue::Float(lf * rf))
             }
@@ -552,7 +565,11 @@ fn eval_binop(left: &ScriptValue, op: &BinOp, right: &ScriptValue) -> FerroResul
                 return Err(FerroError::QueryParseError("division by zero".into()));
             }
             if both_int {
-                Ok(ScriptValue::Int(lf as i64 / rf as i64))
+                // checked_div also catches i64::MIN / -1 (panics even in release).
+                (lf as i64)
+                    .checked_div(rf as i64)
+                    .map(ScriptValue::Int)
+                    .ok_or_else(|| overflow("division"))
             } else {
                 Ok(ScriptValue::Float(lf / rf))
             }
@@ -562,7 +579,10 @@ fn eval_binop(left: &ScriptValue, op: &BinOp, right: &ScriptValue) -> FerroResul
                 return Err(FerroError::QueryParseError("modulo by zero".into()));
             }
             if both_int {
-                Ok(ScriptValue::Int(lf as i64 % rf as i64))
+                (lf as i64)
+                    .checked_rem(rf as i64)
+                    .map(ScriptValue::Int)
+                    .ok_or_else(|| overflow("modulo"))
             } else {
                 Ok(ScriptValue::Float(lf % rf))
             }
@@ -579,7 +599,11 @@ fn eval_unary(op: &UnaryOp, val: &ScriptValue) -> FerroResult<ScriptValue> {
     match op {
         UnaryOp::Not => Ok(ScriptValue::Bool(!val.is_truthy())),
         UnaryOp::Neg => match val {
-            ScriptValue::Int(i) => Ok(ScriptValue::Int(-i)),
+            // checked_neg: -i64::MIN overflows (panics in debug, wraps in release).
+            ScriptValue::Int(i) => i
+                .checked_neg()
+                .map(ScriptValue::Int)
+                .ok_or_else(|| FerroError::QueryParseError("integer overflow in negation".into())),
             ScriptValue::Float(f) => Ok(ScriptValue::Float(-f)),
             _ => Err(FerroError::QueryParseError(format!(
                 "cannot negate {val:?}"
@@ -981,18 +1005,31 @@ fn eval_method(
                 .first()
                 .and_then(super::types::ScriptValue::as_f64)
                 .unwrap_or(0.0) as i64;
-            let delta_ms = match method_name {
-                "plusDays" => amount * 86_400_000,
-                "minusDays" => -amount * 86_400_000,
-                "plusHours" => amount * 3_600_000,
-                "minusHours" => -amount * 3_600_000,
-                "plusMinutes" => amount * 60_000,
-                "minusMinutes" => -amount * 60_000,
-                "plusSeconds" => amount * 1_000,
-                "minusSeconds" => -amount * 1_000,
+            // Checked throughout: a huge/MIN attacker `amount` would otherwise
+            // overflow the multiply/negate/add (debug panic, release wraps).
+            let (unit, negate) = match method_name {
+                "plusDays" => (86_400_000_i64, false),
+                "minusDays" => (86_400_000, true),
+                "plusHours" => (3_600_000, false),
+                "minusHours" => (3_600_000, true),
+                "plusMinutes" => (60_000, false),
+                "minusMinutes" => (60_000, true),
+                "plusSeconds" => (1_000, false),
+                "minusSeconds" => (1_000, true),
                 _ => unreachable!(),
             };
-            Ok(ScriptValue::Int(epoch_ms + delta_ms))
+            let mut delta_ms = amount.checked_mul(unit).ok_or_else(|| {
+                FerroError::QueryParseError(format!("integer overflow in {method_name}"))
+            })?;
+            if negate {
+                delta_ms = delta_ms.checked_neg().ok_or_else(|| {
+                    FerroError::QueryParseError(format!("integer overflow in {method_name}"))
+                })?;
+            }
+            let result = epoch_ms.checked_add(delta_ms).ok_or_else(|| {
+                FerroError::QueryParseError(format!("integer overflow in {method_name}"))
+            })?;
+            Ok(ScriptValue::Int(result))
         }
 
         _ => Err(FerroError::QueryParseError(format!(
@@ -1189,7 +1226,10 @@ fn eval_math(func: &str, args: &[ScriptValue]) -> FerroResult<ScriptValue> {
                 FerroError::QueryParseError("Math.abs requires an argument".into())
             })?;
             match a {
-                ScriptValue::Int(i) => Ok(ScriptValue::Int(i.abs())),
+                // checked_abs: i64::MIN.abs() overflows (panics in debug).
+                ScriptValue::Int(i) => i.checked_abs().map(ScriptValue::Int).ok_or_else(|| {
+                    FerroError::QueryParseError("integer overflow in Math.abs".into())
+                }),
                 ScriptValue::Float(f) => Ok(ScriptValue::Float(f.abs())),
                 _ => Err(FerroError::QueryParseError(
                     "Math.abs requires a number".into(),
@@ -2504,6 +2544,72 @@ mod tests {
             .insert("d".to_string(), serde_json::json!("2025-03-15T00:00:00Z"));
         let r = evaluate("doc['d'].value.getDayOfYear()", &mut ctx).unwrap();
         assert_eq!(r, serde_json::json!(74)); // Jan(31)+Feb(28)+15
+    }
+
+    // ── Integer overflow on hostile event ints (round-6 fixes) ──
+    // These must return Err, never panic (debug) or silently wrap (release).
+
+    fn eval_doc_int(script: &str, key: &str, val: i64) -> FerroResult<serde_json::Value> {
+        let mut ctx = ScriptContext::new();
+        ctx.doc.insert(key.to_string(), serde_json::json!(val));
+        evaluate(script, &mut ctx)
+    }
+
+    fn eval_doc_two(script: &str, a: i64, b: i64) -> FerroResult<serde_json::Value> {
+        let mut ctx = ScriptContext::new();
+        ctx.doc.insert("a".to_string(), serde_json::json!(a));
+        ctx.doc.insert("b".to_string(), serde_json::json!(b));
+        evaluate(script, &mut ctx)
+    }
+
+    #[test]
+    fn int_add_sub_mul_overflow_errors() {
+        assert!(eval_doc_int("doc['n'].value + 1", "n", i64::MAX).is_err());
+        assert!(eval_doc_int("doc['n'].value - 1", "n", i64::MIN).is_err());
+        assert!(eval_doc_int("doc['n'].value * 2", "n", i64::MAX).is_err());
+    }
+
+    #[test]
+    fn int_div_mod_min_over_neg_one_errors() {
+        // i64::MIN / -1 (and % -1) overflows and panics even in release.
+        assert!(eval_doc_two("doc['a'].value / doc['b'].value", i64::MIN, -1).is_err());
+        assert!(eval_doc_two("doc['a'].value % doc['b'].value", i64::MIN, -1).is_err());
+    }
+
+    #[test]
+    fn int_negation_and_abs_min_errors() {
+        assert!(eval_doc_int("-doc['n'].value", "n", i64::MIN).is_err());
+        assert!(eval_doc_int("Math.abs(doc['n'].value)", "n", i64::MIN).is_err());
+    }
+
+    #[test]
+    fn date_arithmetic_overflow_errors() {
+        let mut ctx = ScriptContext::new();
+        ctx.doc
+            .insert("ts".to_string(), serde_json::json!(i64::MAX));
+        assert!(evaluate("doc['ts'].value.plusSeconds(1)", &mut ctx).is_err());
+        // huge amount overflows the multiply
+        let mut ctx2 = ScriptContext::new();
+        ctx2.doc.insert("ts".to_string(), serde_json::json!(0_i64));
+        ctx2.doc
+            .insert("n".to_string(), serde_json::json!(i64::MAX));
+        assert!(evaluate("doc['ts'].value.plusDays(doc['n'].value)", &mut ctx2).is_err());
+    }
+
+    #[test]
+    fn normal_int_arithmetic_still_works() {
+        assert_eq!(
+            eval_doc_int("doc['n'].value + 1", "n", 41).unwrap(),
+            serde_json::json!(42)
+        );
+        assert_eq!(
+            eval_doc_two("doc['a'].value / doc['b'].value", 10, 3).unwrap(),
+            serde_json::json!(3)
+        );
+        assert_eq!(
+            eval_doc_int("Math.abs(doc['n'].value)", "n", -5).unwrap(),
+            serde_json::json!(5)
+        );
     }
 
     #[test]
