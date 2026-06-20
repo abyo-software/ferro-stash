@@ -59,7 +59,7 @@ impl AnonymizeFilter {
             .unwrap_or_default();
         if fields.is_empty() {
             return Err(err(
-                "anonymize filter requires a non-empty `fields` array".to_string(),
+                "anonymize filter requires a non-empty `fields` array".to_string()
             ));
         }
 
@@ -305,7 +305,8 @@ mod tests {
     #[tokio::test]
     async fn test_anonymize_hmac_differs_from_plain() {
         let plain = mk(serde_json::json!({ "fields": ["v"], "algorithm": "SHA256" }));
-        let keyed = mk(serde_json::json!({ "fields": ["v"], "algorithm": "SHA256", "key": "secret" }));
+        let keyed =
+            mk(serde_json::json!({ "fields": ["v"], "algorithm": "SHA256", "key": "secret" }));
         let mut e1 = Event::new("x");
         e1.set("v", EventValue::String("data".into()));
         let mut e2 = Event::new("x");
@@ -314,7 +315,10 @@ mod tests {
         let r_keyed = keyed.filter(e2).await.expect("filter");
         assert_ne!(r_plain[0].get("v"), r_keyed[0].get("v"));
         // HMAC-SHA256 hex is still 64 chars.
-        assert_eq!(r_keyed[0].get("v").expect("v").as_str().expect("s").len(), 64);
+        assert_eq!(
+            r_keyed[0].get("v").expect("v").as_str().expect("s").len(),
+            64
+        );
     }
 
     #[tokio::test]

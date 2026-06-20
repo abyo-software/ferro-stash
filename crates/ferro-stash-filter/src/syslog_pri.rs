@@ -83,10 +83,18 @@ impl SyslogPriFilter {
             .unwrap_or_else(|| "syslog_pri".to_string());
         let use_labels = settings.get_bool("use_labels").unwrap_or(true);
 
-        let severity_labels = override_labels(settings, "severity_labels")
-            .unwrap_or_else(|| DEFAULT_SEVERITY_LABELS.iter().map(|s| (*s).to_string()).collect());
-        let facility_labels = override_labels(settings, "facility_labels")
-            .unwrap_or_else(|| DEFAULT_FACILITY_LABELS.iter().map(|s| (*s).to_string()).collect());
+        let severity_labels = override_labels(settings, "severity_labels").unwrap_or_else(|| {
+            DEFAULT_SEVERITY_LABELS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect()
+        });
+        let facility_labels = override_labels(settings, "facility_labels").unwrap_or_else(|| {
+            DEFAULT_FACILITY_LABELS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect()
+        });
 
         Ok(Self {
             field_name,
@@ -120,7 +128,11 @@ impl FilterPlugin for SyslogPriFilter {
             .get(&self.field_name)
             .map_or(DEFAULT_PRI, |v| match v {
                 EventValue::Integer(n) => *n,
-                other => other.to_string_lossy().trim().parse::<i64>().unwrap_or(DEFAULT_PRI),
+                other => other
+                    .to_string_lossy()
+                    .trim()
+                    .parse::<i64>()
+                    .unwrap_or(DEFAULT_PRI),
             });
 
         // Negative PRIs are nonsensical; clamp to the default to avoid negative
@@ -170,8 +182,14 @@ mod tests {
         let mut event = Event::new("x");
         event.set("syslog_pri", EventValue::Integer(34));
         let out = f.filter(event).await.expect("filter");
-        assert_eq!(out[0].get("syslog_facility_code"), Some(&EventValue::Integer(4)));
-        assert_eq!(out[0].get("syslog_severity_code"), Some(&EventValue::Integer(2)));
+        assert_eq!(
+            out[0].get("syslog_facility_code"),
+            Some(&EventValue::Integer(4))
+        );
+        assert_eq!(
+            out[0].get("syslog_severity_code"),
+            Some(&EventValue::Integer(2))
+        );
         assert_eq!(
             out[0].get("syslog_facility"),
             Some(&EventValue::String("security/authorization".into()))
@@ -190,8 +208,14 @@ mod tests {
         event.set("syslog_pri", EventValue::String("191".into()));
         let out = f.filter(event).await.expect("filter");
         // 191 → facility 23 (local7), severity 7 (debug).
-        assert_eq!(out[0].get("syslog_facility_code"), Some(&EventValue::Integer(23)));
-        assert_eq!(out[0].get("syslog_severity_code"), Some(&EventValue::Integer(7)));
+        assert_eq!(
+            out[0].get("syslog_facility_code"),
+            Some(&EventValue::Integer(23))
+        );
+        assert_eq!(
+            out[0].get("syslog_severity_code"),
+            Some(&EventValue::Integer(7))
+        );
         assert_eq!(
             out[0].get("syslog_facility"),
             Some(&EventValue::String("local7".into()))
@@ -207,8 +231,14 @@ mod tests {
         // No syslog_pri field → default 13 → facility 1 (user-level), severity 5 (notice).
         let f = SyslogPriFilter::from_config(&serde_json::json!({}), None).expect("config");
         let out = f.filter(Event::new("x")).await.expect("filter");
-        assert_eq!(out[0].get("syslog_facility_code"), Some(&EventValue::Integer(1)));
-        assert_eq!(out[0].get("syslog_severity_code"), Some(&EventValue::Integer(5)));
+        assert_eq!(
+            out[0].get("syslog_facility_code"),
+            Some(&EventValue::Integer(1))
+        );
+        assert_eq!(
+            out[0].get("syslog_severity_code"),
+            Some(&EventValue::Integer(5))
+        );
         assert_eq!(
             out[0].get("syslog_facility"),
             Some(&EventValue::String("user-level".into()))
@@ -225,21 +255,27 @@ mod tests {
         let mut event = Event::new("x");
         event.set("syslog_pri", EventValue::String("garbage".into()));
         let out = f.filter(event).await.expect("filter");
-        assert_eq!(out[0].get("syslog_facility_code"), Some(&EventValue::Integer(1)));
-        assert_eq!(out[0].get("syslog_severity_code"), Some(&EventValue::Integer(5)));
+        assert_eq!(
+            out[0].get("syslog_facility_code"),
+            Some(&EventValue::Integer(1))
+        );
+        assert_eq!(
+            out[0].get("syslog_severity_code"),
+            Some(&EventValue::Integer(5))
+        );
     }
 
     #[tokio::test]
     async fn test_use_labels_false_skips_label_fields() {
-        let f = SyslogPriFilter::from_config(
-            &serde_json::json!({ "use_labels": false }),
-            None,
-        )
-        .expect("config");
+        let f = SyslogPriFilter::from_config(&serde_json::json!({ "use_labels": false }), None)
+            .expect("config");
         let mut event = Event::new("x");
         event.set("syslog_pri", EventValue::Integer(34));
         let out = f.filter(event).await.expect("filter");
-        assert_eq!(out[0].get("syslog_facility_code"), Some(&EventValue::Integer(4)));
+        assert_eq!(
+            out[0].get("syslog_facility_code"),
+            Some(&EventValue::Integer(4))
+        );
         assert!(out[0].get("syslog_facility").is_none());
         assert!(out[0].get("syslog_severity").is_none());
     }

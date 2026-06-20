@@ -50,7 +50,9 @@ impl CidrFilter {
         let addresses = string_array(settings, "address");
         let network_strs = string_array(settings, "network");
         if network_strs.is_empty() {
-            return Err(err("cidr filter requires at least one `network`".to_string()));
+            return Err(err(
+                "cidr filter requires at least one `network`".to_string()
+            ));
         }
         let mut networks = Vec::with_capacity(network_strs.len());
         for n in &network_strs {
@@ -148,7 +150,11 @@ fn in_network(net: IpAddr, prefix: u8, addr: IpAddr) -> bool {
             }
             let net = u32::from(net);
             let addr = u32::from(addr);
-            let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix)
+            };
             (net & mask) == (addr & mask)
         }
         (IpAddr::V6(net), IpAddr::V6(addr)) => {
@@ -216,10 +222,7 @@ mod tests {
 
     #[test]
     fn test_cidr_invalid_network_rejected() {
-        let err = CidrFilter::from_config(
-            &serde_json::json!({ "network": ["10.0.0.0/40"] }),
-            None,
-        );
+        let err = CidrFilter::from_config(&serde_json::json!({ "network": ["10.0.0.0/40"] }), None);
         assert!(err.is_err(), "out-of-range prefix must fail config");
         let err = CidrFilter::from_config(&serde_json::json!({ "network": ["nope"] }), None);
         assert!(err.is_err(), "non-IP network must fail config");
@@ -288,7 +291,10 @@ mod tests {
         event.set("clientip", EventValue::String("192.168.5.5".into()));
         let out = f.filter(event).await.expect("filter");
         assert!(out[0].has_tag("internal"));
-        assert_eq!(out[0].get("zone"), Some(&EventValue::String("private".into())));
+        assert_eq!(
+            out[0].get("zone"),
+            Some(&EventValue::String("private".into()))
+        );
     }
 
     #[tokio::test]
