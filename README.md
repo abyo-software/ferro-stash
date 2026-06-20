@@ -19,6 +19,14 @@ holds tens of MB of RAM instead of ~1 GB.
 > [When NOT to use FerroStash](#when-not-to-use-ferrostash) for the honest
 > caveats first.
 
+> ☁️ **Run it on AWS Marketplace — AWS-billed, nothing to self-manage:**
+> **▶ [Container on EKS / ECS / Fargate](https://aws.amazon.com/marketplace/pp/prodview-jfvmee7a7vaw4)**
+> or **[AMI for EC2](https://aws.amazon.com/marketplace/pp/prodview-k7a5mm7shs6wa)** —
+> the same binary as the free build, billed through your AWS account.
+> The open-source build is **free** for local and self-managed use and is the
+> **full engine** — Marketplace doesn't unlock features, it adds AWS
+> procurement, consolidated billing, and a supported commercial path.
+
 ```
   inputs  ──▶   filters   ──▶   outputs
   stdin, file,      grok, mutate, json,     elasticsearch, kafka,
@@ -58,6 +66,10 @@ credentials) and verify reachability + a round-trip, not exhaustive
 conformance. See [Honest limitations](#honest-limitations) for exactly
 what was validated and the feature residuals per plugin; read those
 caveats before deploying any connector.
+
+> The OSS build (Apache-2.0) and the AWS Marketplace builds are the **same
+> engine**; Marketplace adds AWS-native procurement, billing, and commercial
+> support, not features.
 
 ## Why teams use FerroStash
 
@@ -345,6 +357,27 @@ test exercises and the per-plugin feature residuals.
 - **Field references** — bracket notation `[a][b][c]`.
 - **Interpolation** — `%{field}` in strings; `${ENV_VAR}` /
   `${ENV_VAR:default}` environment expansion.
+
+## Deploy
+
+The same engine ships three ways; pick by how you want it billed and run, not
+by feature set:
+
+- **Self-managed (free, OSS)** — build the single static binary with
+  `cargo build --release` (see [Quick start](#quick-start)), or `docker build`
+  the included [`Dockerfile`](Dockerfile) for a container image. Apache-2.0, no
+  fee, no entitlement check — the full engine.
+- **AWS Marketplace — Container (EKS / ECS / Fargate)** — the same image,
+  billed through your AWS account per pod-hour, for teams that want it on their
+  AWS bill with a supported commercial path →
+  [listing](https://aws.amazon.com/marketplace/pp/prodview-jfvmee7a7vaw4). The
+  Marketplace container verifies entitlement once at startup (AWS
+  `RegisterUsage`) and fails closed if the copy is not entitled; the OSS image
+  has no such check and runs unrestricted.
+- **AWS Marketplace — AMI (EC2)** — the same binary as a Graviton/arm64 AMI,
+  metered by AWS per instance-hour (no entitlement code), for high-throughput
+  or VM-based deployments →
+  [listing](https://aws.amazon.com/marketplace/pp/prodview-k7a5mm7shs6wa).
 
 ## Quick start
 
@@ -663,15 +696,15 @@ Data sources → FerroStash → FerroSearch → Applications
 ## More from abyo software
 
 FerroStash is part of a family of Rust infrastructure tools from **abyo
-software** focused on cutting AWS observability and storage cost; several ship on
-AWS Marketplace under one seller account — browse the catalog at **[abyo software
-on AWS Marketplace](https://aws.amazon.com/marketplace/seller-profile?id=seller-65lhisp4ppavm)**.
+software**; several ship on AWS Marketplace under one seller account — browse
+the catalog at **[abyo software on AWS
+Marketplace](https://aws.amazon.com/marketplace/seller-profile?id=seller-65lhisp4ppavm)**.
 
 | Product | What it does |
 |---|---|
+| **FerroStash** | This project: a Logstash-compatible data pipeline in Rust. |
 | **S4 — Squished S3** | Transparent GPU/CPU compression gateway in front of S3 — cut storage 50–80%. |
 | **S4 Logs** | CloudWatch Logs → S3 archiver that cuts log-storage cost. |
-| **FerroStash** | This project: a Logstash-compatible data pipeline in Rust. |
 | **S4 Scan** | Amazon Athena scan-cost reducer. |
 | **S4 NAT** | Cost-optimized NAT for Amazon VPC. |
 | **S4 MockAPI** | Security API simulator for testing and demos. |
