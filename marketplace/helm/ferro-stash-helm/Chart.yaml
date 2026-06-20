@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0
+apiVersion: v2
+# IMPORTANT: the chart name MUST be `ferro-stash-helm`. `helm push` appends the
+# chart name to the OCI namespace, so this lands the chart at exactly
+#   709825985650.dkr.ecr.us-east-1.amazonaws.com/abyo-software/ferro-stash-helm:<version>
+# which is the second repo provisioned by deploy/marketplace-container.sh
+# (AddRepositories). The Helm OCI tag equals the chart `version:` below.
+name: ferro-stash-helm
+description: FerroStash (AWS Marketplace) -- a Logstash-compatible data pipeline written in Rust
+type: application
+# Chart version -- this is also the Helm OCI push tag. Bump on chart changes
+# (ECR tags are immutable; a wrong push cannot be overwritten).
+version: 1.0.0
+# Application version -- tracks the ferro-stash container image tag.
+appVersion: "1.0.0"
+maintainers:
+  - name: abyo software 合同会社 (abyo software LLC)
+    email: aws-support@abyo.net
+keywords:
+  - logstash
+  - logging
+  - observability
+  - data-pipeline
+  - rust

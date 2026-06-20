@@ -547,6 +547,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-marketplacemetering"
+version = "1.106.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1eebd3551f8faeacfc30693dd478fa6906967ea4fbc82b1d237f467ce806c59"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand 2.4.1",
+ "http 0.2.12",
+ "http 1.4.2",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-s3"
 version = "1.137.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2152,6 +2177,8 @@ name = "ferro-stash"
 version = "1.0.0"
 dependencies = [
  "anyhow",
+ "aws-config",
+ "aws-sdk-marketplacemetering",
  "axum",
  "chrono",
  "clap",

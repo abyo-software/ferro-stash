@@ -1,0 +1,10 @@
+{{/* SPDX-License-Identifier: Apache-2.0 */}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "ferro-stash.fullname" . }}-config
+  labels:
+    {{- include "ferro-stash.labels" . | nindent 4 }}
+data:
+  pipeline.conf: |
+    {{- .Values.pipelineConf | nindent 4 }}

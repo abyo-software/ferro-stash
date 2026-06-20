@@ -21,6 +21,10 @@ use ferro_stash_core::pipeline::{Pipeline, PipelineConfig};
 use ferro_stash_core::shutdown::ShutdownController;
 
 mod api;
+// AWS Marketplace metered-container entitlement gate — compiled in only by the
+// (default-off) `marketplace` cargo feature, for the paid container image.
+#[cfg(feature = "marketplace")]
+mod marketplace;
 
 /// Logstash version we are compatible with.
 /// Can be overridden at build time via LOGSTASH_COMPAT_VERSION env var.
@@ -521,6 +525,15 @@ fn spawn_config_watcher(config_path: &str, _interval_secs: u64) -> tokio::sync::
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // AWS Marketplace entitlement gate (PAID container image only). Compiled in
+    // by the default-off `marketplace` cargo feature and active only when the
+    // FERROSTASH_MARKETPLACE_PRODUCT_CODE env var is set; otherwise it is a
+    // no-op. It calls RegisterUsage once before anything else runs and exits
+    // non-zero (fail closed) if this copy is not entitled. The OSS / AMI binary
+    // never includes this code.
+    #[cfg(feature = "marketplace")]
+    marketplace::check_entitlement_or_exit().await;
+
     // Parse CLI via ArgMatches so we can distinguish clap's default value for
     // `--pipeline.id` from an explicit user override (e.g. `--pipeline.id main`).
     let matches = Cli::command().get_matches();

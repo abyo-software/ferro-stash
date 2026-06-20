@@ -1,0 +1,28 @@
+FerroStash has been deployed.
+
+Release:   {{ .Release.Name }}
+Namespace: {{ .Release.Namespace }}
+Image:     {{ include "ferro-stash.image" . }}
+
+The monitoring/metrics API is served on port {{ .Values.service.port }} via
+service "{{ include "ferro-stash.fullname" . }}".
+
+Check it:
+  kubectl --namespace {{ .Release.Namespace }} port-forward \
+    svc/{{ include "ferro-stash.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
+  curl http://127.0.0.1:{{ .Values.service.port }}/_node
+  curl http://127.0.0.1:{{ .Values.service.port }}/_health_report
+
+The pipeline configuration is taken from `.Values.pipelineConf` and mounted at
+/etc/ferro-stash/pipeline.conf. Edit it and `helm upgrade` to roll the pods.
+
+{{- if .Values.geoip.enabled }}
+
+GeoIP is enabled; the database from secret "{{ .Values.geoip.existingSecret }}"
+is mounted at {{ .Values.geoip.mountPath }}. Reference it in the geoip filter:
+  geoip { source => "client_ip" database => "{{ .Values.geoip.mountPath }}" }
+{{- else }}
+
+GeoIP is disabled. To use the geoip filter, create a Secret containing your
+.mmdb and set geoip.enabled=true, geoip.existingSecret=<name>.
+{{- end }}

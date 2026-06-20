@@ -17,6 +17,10 @@ default = []
 # Build the `ruby` filter (embeds Artichoke mruby; needs clang/gcc + cmake).
 # Off by default to keep the default binary light and toolchain-free.
 ruby = ["ferro-stash-filter/ruby"]
+# AWS Marketplace metered-container entitlement gate (RegisterUsage at startup).
+# OFF by default: the OSS source build and the AMI build never include it. Only
+# the PAID Marketplace CONTAINER image is built with `--features marketplace`.
+marketplace = ["dep:aws-config", "dep:aws-sdk-marketplacemetering"]
 
 [dependencies]
 ferro-stash-core = { workspace = true }
@@ -42,6 +46,13 @@ notify = { workspace = true }
 fs2 = "0.4"
 socket2 = "0.5"
 serde_yaml = { workspace = true }
+
+# AWS Marketplace entitlement gate — only pulled in by the `marketplace` feature.
+# Versions track the aws-config / aws-smithy generation already in the workspace
+# (see crates/ferro-stash-{input,output}), so enabling the feature does not force
+# a workspace-wide smithy bump.
+aws-config = { version = "1.8.11", features = ["behavior-version-latest"], optional = true }
+aws-sdk-marketplacemetering = { version = "1", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

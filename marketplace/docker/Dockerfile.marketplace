@@ -1,0 +1,115 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 abyo software 合同会社 (abyo software LLC)
+#
+# FerroStash -- AWS Marketplace PAID CONTAINER image (amd64, single-manifest).
+#
+# This is the image published to the Marketplace ECR repo for the metered
+# ContainerProduct@1.0 listing. It differs from the repo-root ./Dockerfile in
+# two deliberate ways:
+#   1. it is built `--features marketplace` so the binary calls AWS Marketplace
+#      Metering RegisterUsage once at startup (entitlement gate; see
+#      crates/ferro-stash-cli/src/marketplace.rs), and
+#   2. it does NOT build the optional `ruby` filter, matching the published
+#      "honest scope" (the ruby/Artichoke filter is excluded from the default
+#      build); this also keeps the build toolchain-light.
+#
+# SINGLE-MANIFEST REQUIREMENT (do not skip)
+# -----------------------------------------
+# The AWS Marketplace container scanner REJECTS an OCI image *index* that carries
+# provenance/SBOM attestation children (`UnsupportedImageType` SCAN_ERROR), which
+# is what Docker 24+/buildx produces by DEFAULT. The pushed image MUST be a
+# single image manifest (application/vnd.docker.distribution.manifest.v2+json).
+# Build it from the repo root, with attestations OFF and a single platform:
+#
+#   docker build \
+#     --provenance=false --sbom=false --platform linux/amd64 \
+#     -f marketplace/docker/Dockerfile.marketplace \
+#     -t 709825985650.dkr.ecr.us-east-1.amazonaws.com/abyo-software/ferro-stash:<tag> .
+#
+# Verify it is NOT an index before pushing (ECR tags are IMMUTABLE -- a wrong
+# first push cannot be overwritten; bump the tag instead):
+#
+#   docker buildx imagetools inspect <tag> --format '{{.Manifest.MediaType}}'
+#   # must print: application/vnd.docker.distribution.manifest.v2+json
+#   # (NOT ...index.v1+json)
+#
+# The build context is the REPOSITORY ROOT (cargo needs the whole workspace);
+# always pass `-f marketplace/docker/Dockerfile.marketplace .` from the repo root.
+
+# ---------------------------------------------------------------------------
+# Stage 1 -- builder (native amd64; no cross-compile needed)
+# ---------------------------------------------------------------------------
+# The amd64 target platform is pinned by the `docker build --platform linux/amd64`
+# flag documented above (not a constant FROM --platform, which buildx discourages).
+FROM rust:1.95-bookworm AS builder
+
+# Build toolchain for the default (no-ruby) feature set:
+#   cmake + clang/llvm + libclang-dev -> rdkafka's vendored librdkafka (CMake + C)
+#   zlib1g-dev                        -> zlib for the vendored librdkafka build
+#   pkg-config                        -> -sys crate discovery
+#   perl/make                         -> some -sys build scripts
+#   git                               -> cargo fetches git dependencies (if any)
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        cmake \
+        clang \
+        llvm \
+        libclang-dev \
+        zlib1g-dev \
+        pkg-config \
+        make \
+        perl \
+        git \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY . /build
+
+# Release build of the CLI with the Marketplace entitlement gate. The `ruby`
+# feature is intentionally NOT enabled.
+RUN cargo build --release --bin ferro-stash --features marketplace \
+    && strip /build/target/release/ferro-stash || true
+
+# ---------------------------------------------------------------------------
+# Stage 2 -- runtime (minimal, non-root)
+# ---------------------------------------------------------------------------
+# debian:bookworm-slim keeps a shell for ops debugging while staying small.
+# ca-certificates is required for outbound rustls TLS (ES/OpenSearch/S3/Datadog)
+# AND for the RegisterUsage HTTPS call. tini reaps zombies and forwards signals
+# so SIGTERM triggers a graceful pipeline shutdown.
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates tini \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system --gid 65532 ferrostash \
+    && useradd --system --uid 65532 --gid ferrostash \
+        --home-dir /var/lib/ferro-stash --shell /usr/sbin/nologin ferrostash \
+    && mkdir -p /etc/ferro-stash /var/lib/ferro-stash \
+    && chown -R ferrostash:ferrostash /var/lib/ferro-stash
+
+COPY --from=builder /build/target/release/ferro-stash /usr/local/bin/ferro-stash
+
+# A safe self-contained default pipeline so the container starts cleanly with no
+# external dependency. In Kubernetes the Helm chart overrides this via a mounted
+# ConfigMap; override at `docker run` with `-v ./pipeline.conf:/etc/ferro-stash/pipeline.conf:ro`.
+COPY marketplace/docker/pipeline.conf /etc/ferro-stash/pipeline.conf
+
+# Writable runtime state (per-instance lock, uuid, queues, DLQ, default output).
+VOLUME ["/var/lib/ferro-stash"]
+
+# Ports: 9600 = monitoring/metrics API; 5044 = the default pipeline's Beats input.
+EXPOSE 9600 5044
+
+USER 65532:65532
+ENV RUST_LOG=info
+
+# ENTRYPOINT = the binary (via tini); CMD = the default args so a Kubernetes
+# `args:` override (the Helm chart sets its own) cleanly replaces them without
+# duplicating `-f`. The effective default command is:
+#   ferro-stash -f /etc/ferro-stash/pipeline.conf --path.data /var/lib/ferro-stash --api.http.host 0.0.0.0:9600
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/ferro-stash"]
+CMD ["-f", "/etc/ferro-stash/pipeline.conf", \
+     "--path.data", "/var/lib/ferro-stash", \
+     "--api.http.host", "0.0.0.0:9600"]

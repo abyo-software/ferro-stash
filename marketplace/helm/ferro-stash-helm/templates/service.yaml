@@ -1,0 +1,20 @@
+{{/* SPDX-License-Identifier: Apache-2.0 */}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ferro-stash.fullname" . }}
+  labels:
+    {{- include "ferro-stash.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - name: api
+      port: {{ .Values.service.port }}
+      targetPort: api
+      protocol: TCP
+  selector:
+    {{- include "ferro-stash.selectorLabels" . | nindent 4 }}
