@@ -13,11 +13,11 @@ image:
 # AWS Marketplace metered-container entitlement settings. The image is built
 # `--features marketplace` and calls RegisterUsage once at startup.
 marketplace:
-  # The Marketplace product code (from `describe-entity ... ProductCode`, printed
-  # by deploy/marketplace-container.sh). Set this at deploy time. When empty the
-  # in-container entitlement check is skipped (so the chart still installs in a
-  # dev cluster without a real product code).
-  productCode: ""
+  # The Marketplace product code for this product (from `describe-entity ...
+  # ProductCode`). Baked in so the Marketplace-distributed chart works out of the
+  # box; override only for testing. When empty the in-container entitlement check
+  # is skipped (so the chart still installs in a dev cluster without a code).
+  productCode: "ippzcwqluqeypw0r8trjvlti"
   # AWS region for the RegisterUsage call. MUST be non-empty so a fail-closed
   # template never renders an empty region; us-east-1 is the Marketplace home.
   awsRegion: us-east-1
