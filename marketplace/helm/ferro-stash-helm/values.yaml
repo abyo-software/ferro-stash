@@ -5,7 +5,7 @@ image:
   # MUST point at the Marketplace ECR repo that deploy/marketplace-container.sh
   # provisions via AddRepositories. AWS scans the chart and fails it
   # (INVALID_HELM_CHART_IMAGES) if the image is not from this repository.
-  repository: 709825985650.dkr.ecr.us-east-1.amazonaws.com/abyo-software/ferro-stash
+  repository: 709825985650.dkr.ecr.us-east-1.amazonaws.com/abyo-software/ferro-stash-container
   # Defaults to the chart appVersion when empty. ECR tags are immutable.
   tag: ""
   pullPolicy: IfNotPresent
@@ -17,7 +17,7 @@ marketplace:
   # ProductCode`). Baked in so the Marketplace-distributed chart works out of the
   # box; override only for testing. When empty the in-container entitlement check
   # is skipped (so the chart still installs in a dev cluster without a code).
-  productCode: "ippzcwqluqeypw0r8trjvlti"
+  productCode: "5yfse46z2atv2xoba1qm3666x"
   # AWS region for the RegisterUsage call. MUST be non-empty so a fail-closed
   # template never renders an empty region; us-east-1 is the Marketplace home.
   awsRegion: us-east-1

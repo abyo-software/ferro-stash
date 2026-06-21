@@ -61,7 +61,7 @@ set -euo pipefail
 PROFILE="${PROFILE:-as}"
 REGION="${REGION:-us-east-1}"        # Marketplace Catalog API home region
 CATALOG=AWSMarketplace
-TITLE="FerroStash - Rust-native, Logstash-compatible log and event pipeline"
+TITLE="${TITLE:-FerroStash Container - Rust-native Logstash-compatible log pipeline}"
 PID="${PID:-}"                       # set to skip CreateProduct and only (re)populate
 OFFER="${OFFER:-}"                   # set to skip CreateOffer / for RELEASE
 
@@ -248,7 +248,7 @@ highlights = [
    "queue; deployed by Helm and metered per pod-hour."),
 ]
 det = {
-  "ProductTitle": "FerroStash - Rust-native, Logstash-compatible log and event pipeline",
+  "ProductTitle": "FerroStash Container - Rust-native Logstash-compatible log pipeline",
   "ShortDescription": short,
   "LongDescription": long,
   "Highlights": highlights,
@@ -339,10 +339,15 @@ if [ "${OFFER_STEP:-0}" = "1" ]; then
     echo "  offer id: $OFFER"
   fi
 
-  echo "UpdatePricingTerms (Usage; \$$HOURLY_USD per Hours; no annual)..."
-  python3 - "$OFFER" "$CURRENCY" "$HOURLY_USD" > /tmp/cs-ferrostash-ctr-pricing.json <<'PY'
+  # Read the ACTUAL dimension key AWS assigned (it may be "PID1", not the "Key"
+  # we passed to AddDimensions) and price THAT key. Hardcoding "Hours" produced a
+  # rate card that did not match the real dimension -> metered usage had no price
+  # and the released offer could not be corrected afterwards.
+  DIM_KEY=$(mc describe-entity --catalog "$CATALOG" --entity-id "$PID" --query 'DetailsDocument.Dimensions[0].Key' --output text)
+  echo "UpdatePricingTerms (Usage; \$$HOURLY_USD per dimension '$DIM_KEY'; no annual)..."
+  python3 - "$OFFER" "$CURRENCY" "$HOURLY_USD" "$DIM_KEY" > /tmp/cs-ferrostash-ctr-pricing.json <<'PY'
 import json, sys
-offer, ccy, price = sys.argv[1], sys.argv[2], sys.argv[3]
+offer, ccy, price, dimkey = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 print(json.dumps([{
   "ChangeType": "UpdatePricingTerms",
   "Entity": {"Type": "Offer@1.0", "Identifier": offer},
@@ -350,7 +355,7 @@ print(json.dumps([{
     "PricingModel": "Usage",
     "Terms": [{
       "Type": "UsageBasedPricingTerm", "CurrencyCode": ccy,
-      "RateCards": [{"RateCard": [{"DimensionKey": "Hours", "Price": price}]}],
+      "RateCards": [{"RateCard": [{"DimensionKey": dimkey, "Price": price}]}],
     }],
   },
 }]))
