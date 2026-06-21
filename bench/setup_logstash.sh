@@ -6,10 +6,10 @@
 # to export. Tested on Amazon Linux 2023 / Debian (needs curl, tar, a JDK is
 # bundled with the Logstash tarball).
 #
-# Usage:  source <(./bench/setup_logstash.sh 8.17.0)   # or just run + export
+# Usage:  source <(./bench/setup_logstash.sh 9.4.2)   # or just run + export
 set -euo pipefail
 
-VERSION="${1:-8.17.0}"
+VERSION="${1:-9.4.2}"
 DEST="${LS_DEST:-/opt}"
 HOME_DIR="$DEST/logstash-$VERSION"
 

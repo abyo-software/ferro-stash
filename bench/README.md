@@ -43,7 +43,7 @@ offers a native JIT `script{}` (Painless subset) for the hot path.
 cargo build --release -p ferro-stash --features ruby
 
 # Install a pinned Logstash (native tarball, bundled JDK)
-eval "$(./bench/setup_logstash.sh 8.17.0)"   # sets LS_HOME
+eval "$(./bench/setup_logstash.sh 9.4.2)"   # sets LS_HOME
 
 # Run: LINES RUNS WORKERS
 LS_HOME="$LS_HOME" ./bench/run_bench.sh 5000000 5 "$(nproc)"
