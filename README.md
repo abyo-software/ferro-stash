@@ -6,8 +6,8 @@
 
 ## Run your existing Logstash pipelines in Rust — no JVM, no config rewrite
 
-**FerroStash** runs your existing Logstash `pipeline.conf` **unchanged** —
-parsing the [Logstash](https://www.elastic.co/logstash) DSL natively (same
+**FerroStash** runs most production-common Logstash `pipeline.conf` files
+**unchanged** — parsing the [Logstash](https://www.elastic.co/logstash) DSL natively (same
 `input → filter → output` model, same event model: `@timestamp`, tags,
 `[a][b]` field references, `%{field}` interpolation) — but **without a JVM**.
 The result is a single ~14 MB static binary that starts in milliseconds and
@@ -35,8 +35,9 @@ holds tens of MB of RAM instead of ~1 GB.
   beats, redis, …   native `script`, …
 ```
 
-- **Drop-in config** — runs your `pipeline.conf` unchanged; output verified
-  byte-for-byte against Logstash 9.4.2 across 24 parity fixtures.
+- **Logstash-config compatible** — runs most `pipeline.conf` files unchanged;
+  output verified field-for-field against Logstash 9.4.2 across 24 parity
+  fixtures (runtime-only fields like `@timestamp`/`host` normalized).
 - **A fraction of the footprint** — ~8–13× lower RSS and ~700× faster cold start
   than Logstash in our benchmark (see [Performance](#performance)).
 - **Keep your Ruby, or go fast** — an embedded [Artichoke](https://www.artichokeruby.org/)
@@ -53,7 +54,8 @@ single-developer project, **no public production deployments yet** — run it
 beside your existing pipeline before trusting it with irreplaceable data.
 `cargo test --workspace` runs **1,400+ tests, 0 failing**, with `cargo clippy
 -D warnings`, `cargo fmt --check`, and `cargo deny check` clean, and output
-verified byte-for-byte against Logstash 9.4.2 (24/24 parity fixtures).
+verified field-for-field against Logstash 9.4.2 (24/24 parity fixtures,
+runtime-only fields normalized).
 
 The ten previously-stubbed connector plugins (input/output `kafka`,
 `redis`, `s3`; output `datadog`; filters `geoip`, `dns`,
@@ -78,7 +80,7 @@ caveats before deploying any connector.
 | Logstash's JVM holds ~1 GB RAM per pipeline | A native binary that holds tens of MB — pack far more shippers per host |
 | ~8–30 s JVM cold start hurts sidecars, autoscaling, short-lived jobs | Sub-second start (~10 ms in practice) |
 | ~350 MB install + a JDK to ship everywhere | One ~14 MB static binary, no runtime to install |
-| You can't rewrite hundreds of existing `pipeline.conf` files | They run unchanged — same DSL and event model, byte-eq verified against Logstash 9.4.2 |
+| You can't rewrite hundreds of existing `pipeline.conf` files | Most run unchanged — same DSL and event model, field-for-field verified against Logstash 9.4.2 |
 | Custom `ruby { }` logic is your escape hatch | mruby runs it as-is for migration; rewrite the hot path in native `script { }` for ~3.6× JRuby |
 | GC pauses jitter your tail latency | No GC — deterministic latency |
 
@@ -86,7 +88,7 @@ caveats before deploying any connector.
 
 | Property | Logstash (JVM) | FerroStash (native) |
 |----------|----------------|---------------------|
-| Migration cost | — (already running it) | Runs your existing `.conf` unchanged (byte-eq verified) |
+| Migration cost | — (already running it) | Most existing `.conf` run unchanged (field-for-field verified) |
 | Runtime | JVM (Java) + JRuby | Native Rust binary |
 | Idle memory (RSS) | ~0.5–1 GB+ | ~10–50 MB |
 | Cold start | ~8–30 s (JVM warm-up) | < 1 s (~10 ms) |
@@ -171,7 +173,7 @@ wholesale.
 `docker.elastic.co/logstash/logstash:9.4.2`, then asserts every event
 payload equal field-by-field after stripping only runtime-only fields
 (`@timestamp`, `@version`, `host`, `event.original`). **24/24 fixtures
-pass byte-equal**, covering `stdin → stdout(json)`, grok, mutate
+pass field-for-field**, covering `stdin → stdout(json)`, grok, mutate
 (rename/case/gsub/convert/copy/strip), json, kv, dissect, fingerprint,
 date, clone, csv, truncate, translate, split, urldecode, drop, conditional
 `if/else if/else`, and unicode inputs. These tests are `#[ignore]` (they
@@ -197,8 +199,8 @@ default. The difference is the **migration path**, not the runtime:
 - **Vector** asks you to rewrite your pipelines in **VRL** (Vector Remap
   Language) and its own config format. Great for greenfield; a real project if
   you already run Logstash.
-- **FerroStash** runs your **existing Logstash `pipeline.conf` unchanged**, with
-  output verified byte-for-byte against Logstash 9.4.2. It's built for teams with
+- **FerroStash** runs most of your **existing Logstash `pipeline.conf` unchanged**,
+  with output verified field-for-field against Logstash 9.4.2. It's built for teams with
   an existing Logstash investment who don't want to rewrite it just to drop the
   JVM.
 
@@ -233,7 +235,12 @@ Honest list of cases where FerroStash isn't the right call — better to know no
 
 Counts below reflect what is **registered in the plugin factories**
 (`create_input` / `create_filter` / `create_output` / `create_codec`),
-verified against source. The ten connector plugins that were formerly
+verified against source. These "registered" totals include FerroStash-only
+plugins and a few not bundled with Logstash, so they are **higher** than the
+"Logstash-9.4.2-bundled covered" figures in
+[Logstash compatibility scope](#logstash-compatibility-scope) /
+[COMPATIBILITY.md](docs/COMPATIBILITY.md) (codecs 19/19, filters 34/35) — the
+two count different things. The ten connector plugins that were formerly
 stubs now perform real external integrations and are **live-validated**
 (`live-validated` in the **Status** column) against real services via
 `#[ignore]`, env-gated smoke tests — run manually with the service
@@ -539,8 +546,9 @@ the Ruby crate.
 
 ### Prerequisites
 
-- Rust stable (`rust-version = 1.75` workspace-wide; `ferro-stash-ruby`
-  raises its own MSRV to 1.88 and uses edition 2024).
+- Rust stable — the **default build needs 1.75**; building `cargo build
+  --workspace` or `--features ruby` (the `ferro-stash-ruby` / Artichoke crate,
+  edition 2024) needs **1.88**. (The `rust-1.75` badge reflects the default build.)
 - **`cmake`** — required by the `kafka` plugins, which pull `rdkafka` and
   build a vendored `librdkafka` via CMake. (TLS in the connectors uses
   rustls, so no system OpenSSL is needed.)
@@ -668,7 +676,7 @@ Data sources → FerroStash → FerroSearch → Applications
 - **Single developer; no production deployments.** Bus factor 1; no
   operational history. Performance numbers come from one benchmark
   environment.
-- **Parity evidence is per-fixture.** The 24 byte-equal fixtures (run
+- **Parity evidence is per-fixture.** The 24 field-for-field fixtures (run
   in-process by `logstash_compat_test` and end-to-end by `runner.py`)
   cover ~17 filters and the stdin/stdout path against Logstash 9.4.2;
   they do not cover every implemented plugin, codec, or edge case. Each
