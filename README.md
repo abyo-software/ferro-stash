@@ -20,9 +20,9 @@ holds tens of MB of RAM instead of ~1 GB.
 > caveats first.
 
 > ☁️ **Run it on AWS Marketplace — AWS-billed, nothing to self-manage:**
-> **▶ [Container on Amazon EKS (Helm)](https://aws.amazon.com/marketplace/pp/prodview-jfvmee7a7vaw4)**
-> or **[AMI for EC2](https://aws.amazon.com/marketplace/pp/prodview-k7a5mm7shs6wa)** —
-> billed through your AWS account.
+> **▶ [AMI for EC2](https://aws.amazon.com/marketplace/pp/prodview-k7a5mm7shs6wa)** —
+> billed through your AWS account. (A Container listing for Amazon EKS / Helm is
+> coming soon.)
 > The open-source build is **free** for local and self-managed use and is the
 > **full engine**. Marketplace adds AWS procurement, consolidated billing, and
 > a supported commercial path; the Marketplace container and AMI use the default
@@ -381,15 +381,13 @@ by feature set:
   `cargo build --release` (see [Quick start](#quick-start)), or `docker build`
   the included [`Dockerfile`](Dockerfile) for a container image. Apache-2.0, no
   fee, no entitlement check — the full engine.
-- **AWS Marketplace — Container on Amazon EKS (Helm)** — the default no-Ruby
-  image plus AWS Marketplace entitlement metering, billed through your AWS
-  account per pod-hour, for teams that want it on their AWS bill with a
-  supported commercial path →
-  [listing](https://aws.amazon.com/marketplace/pp/prodview-jfvmee7a7vaw4). The
-  Marketplace container verifies entitlement once at startup (AWS
-  `RegisterUsage`) and fails closed if the copy is not entitled; the OSS image
-  has no such check and runs unrestricted. Use the OSS image/root Dockerfile or
-  AMI if you need the optional `ruby` filter.
+- **AWS Marketplace — Container on Amazon EKS (Helm)** *(listing coming soon)* —
+  the default no-Ruby image plus AWS Marketplace entitlement metering, billed
+  through your AWS account per pod-hour, for teams that want it on their AWS bill
+  with a supported commercial path. The Marketplace container verifies
+  entitlement once at startup (AWS `RegisterUsage`) and fails closed if the copy
+  is not entitled; the OSS image has no such check and runs unrestricted. Use the
+  OSS image/root Dockerfile or AMI if you need the optional `ruby` filter.
 - **AWS Marketplace — AMI (EC2)** — the default no-Ruby binary as a
   Graviton/arm64 AMI, metered by AWS per instance-hour (no entitlement code),
   for high-throughput or VM-based deployments →
