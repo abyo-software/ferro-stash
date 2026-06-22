@@ -156,8 +156,8 @@ oracle (`gen_expected.py`) and green on both runners (in-process
 | fingerprint_sha256 | fingerprint |
 | drop_conditional / conditional_branch | conditional `if/else if/else` (+ drop) |
 
-Last verified: 2026-06-20 against **Logstash 9.4.2** — all 24 fixtures green on
-both runners.
+Last verified: 2026-06-20 against **Logstash 9.4.2** — all 24 fixtures green
+in-process; the Docker side-by-side runner covers a 13-fixture subset.
 
 ## Docker side-by-side regression harness
 
