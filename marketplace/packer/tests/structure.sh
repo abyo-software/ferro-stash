@@ -115,15 +115,15 @@ for relpath in "${DISALLOWED_FILES[@]}"; do
 done
 
 # ---------------------------------------------------------------------
-# No github.com URL in the AMI-shipped files -- the source repo is
-# private, so a github link is dead weight (and a listing-reject smell).
+# No github.com URL in the AMI-shipped files -- keep AMI-shipped artifacts
+# link-free so support routes through the seller channel (listing hygiene).
 # ---------------------------------------------------------------------
 for relpath in \
     "files/ferro-stash.service" \
     "files/firstboot-systemd.service" \
     "files/pipeline.conf"; do
     if grep -qi 'github\.com' "${PACKER_DIR}/${relpath}"; then
-        fail "${relpath} contains a github.com URL (repo is private)"
+        fail "${relpath} contains a github.com URL"
     else
         ok "${relpath} free of github.com URL"
     fi

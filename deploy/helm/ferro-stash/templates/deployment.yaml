@@ -43,7 +43,7 @@ spec:
             - --path.data
             - /var/lib/ferro-stash
             - --api.http.host
-            - 0.0.0.0:{{ .Values.service.port }}
+            - {{ .Values.api.bind }}:{{ .Values.service.port }}
             {{- with .Values.extraArgs }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

@@ -4,13 +4,14 @@
 
 ### Prerequisites
 
-- Rust 1.75 or later (stable toolchain)
+- Rust 1.75 or later for the default build; Rust 1.88+ for `cargo build --workspace` or `--features ruby`
 - cargo, clippy, rustfmt (included with rustup)
 
 ### Build
 
 ```bash
-cargo build --workspace
+cargo build
+cargo build --workspace  # also builds the optional Ruby crate; needs Rust 1.88+
 ```
 
 ### Run
@@ -61,7 +62,7 @@ cargo test -p ferro-stash-filter
 cargo test -p ferro-stash-filter grok::tests::test_common_apache_log
 ```
 
-The test suite must pass completely before submitting a PR. The project currently has 670+ tests.
+The test suite must pass before submitting a PR. The default workspace has 1,400+ passing tests; external-service smoke tests are ignored unless explicitly enabled.
 
 ## Pull Request Process
 

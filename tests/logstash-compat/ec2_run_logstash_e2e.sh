@@ -44,8 +44,8 @@ echo '# Stubbed — no Java JARs needed for E2E binary tests' > logstash-core/li
 # Create versions.yml if not present
 if [ ! -f versions.yml ]; then
     cat > versions.yml << 'VER'
-logstash: 9.3.2
-logstash-core: 9.3.2
+logstash: 9.4.2
+logstash-core: 9.4.2
 logstash-core-plugin-api: 2.1.16
 VER
 fi

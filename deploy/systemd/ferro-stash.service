@@ -17,7 +17,7 @@
 
 [Unit]
 Description=FerroStash — Logstash-compatible data pipeline
-Documentation=https://github.com/ferrosearch/ferro-stash
+Documentation=https://github.com/abyo-software/ferro-stash
 After=network-online.target
 Wants=network-online.target
 

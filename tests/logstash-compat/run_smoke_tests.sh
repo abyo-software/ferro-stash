@@ -21,8 +21,8 @@ echo ""
 # -------------------------------------------------------
 echo "--- Test 1: --version ---"
 VERSION_OUT=$("$LOGSTASH_BIN" --version 2>&1)
-if echo "$VERSION_OUT" | grep -q "^logstash 9\.3\.2$"; then
-    pass "--version outputs 'logstash 9.3.2'"
+if echo "$VERSION_OUT" | grep -q "^logstash 9\.4\.2$"; then
+    pass "--version outputs 'logstash 9.4.2'"
 else
     fail "--version output: '$VERSION_OUT'"
 fi

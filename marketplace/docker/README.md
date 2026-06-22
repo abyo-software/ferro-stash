@@ -70,7 +70,7 @@ metadata):
 - RegisterUsage **succeeds** -> entitled; the pipeline starts.
 - **CustomerNotEntitled / InvalidProductCode / ...** -> logged and the process
   exits non-zero (fail closed).
-- **transient** AWS/network error -> bounded retry, then continue best-effort.
+- **transient** AWS/network error -> bounded retry, then exits non-zero (fail closed).
 
 In EKS the pod needs AWS credentials (IRSA / Pod Identity) with permission to
 call `aws-marketplace:RegisterUsage`, and the product code wired in via the Helm

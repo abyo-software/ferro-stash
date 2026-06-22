@@ -1,6 +1,6 @@
 # Third-Party License Summary
 
-Ferro-Stash is licensed under Apache-2.0. All third-party dependencies use permissive open-source licenses.
+FerroStash is licensed under Apache-2.0. `cargo deny check` is the authoritative dependency license gate; this file summarizes major dependencies and special cases.
 
 ## Dependency Licenses
 
@@ -22,19 +22,19 @@ Ferro-Stash is licensed under Apache-2.0. All third-party dependencies use permi
 | dashmap | 6 | MIT | Concurrent hashmap |
 | crossbeam-channel | 0.5 | Apache-2.0 OR MIT | Channel primitives |
 
-## Special: artichoke-backend
+## Special: Artichoke fork
 
-- **License**: MIT
-- **Status**: Forked (path dependency)
+- **License**: MIT / Apache-2.0 family across the Artichoke crates
+- **Status**: Forked rev-pinned git dependency (`abyo-software/artichoke-extended`)
 - **Purpose**: Embeds mruby for Logstash Ruby filter compatibility
-- **Note**: This is the only dependency that requires a C compiler at build time
+- **Note**: Optional and off by default; enabling the `ruby` feature requires a C compiler at build time
 
 ## License Policy Enforcement
 
 `deny.toml` enforces the following at build time:
 
 - **GPL-family licenses are blocked** -- any transitive dependency with GPL, LGPL, AGPL, or SSPL will fail the build
-- **Advisory database is checked** -- known security vulnerabilities cause build failure
+- **Advisory database is checked** -- known security vulnerabilities cause build failure unless explicitly justified in `deny.toml`
 - **Allowed licenses**: Apache-2.0, MIT, BSD-2-Clause, BSD-3-Clause, ISC, Unicode-DFS-2016, Zlib
 
 Run verification:

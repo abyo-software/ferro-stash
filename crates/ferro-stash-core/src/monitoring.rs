@@ -47,7 +47,7 @@ fn default_port() -> u16 {
     DEFAULT_PORT
 }
 fn default_bind() -> String {
-    "0.0.0.0".to_string()
+    "127.0.0.1".to_string()
 }
 
 impl Default for MonitoringConfig {
@@ -605,7 +605,7 @@ mod tests {
         let config = MonitoringConfig::default();
         assert!(config.enabled);
         assert_eq!(config.port, 9600);
-        assert_eq!(config.bind, "0.0.0.0");
+        assert_eq!(config.bind, "127.0.0.1");
     }
 
     #[tokio::test]

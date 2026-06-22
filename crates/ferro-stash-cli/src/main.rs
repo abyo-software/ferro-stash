@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Logstash-compatible data pipeline.
 //!
-//! A drop-in Logstash replacement written in Rust.
+//! A Logstash-compatible data pipeline written in Rust.
 //! Supports Logstash-compatible configuration files, CLI flags, monitoring API,
 //! and automatic configuration reloading.
 
@@ -30,7 +30,7 @@ mod marketplace;
 /// Can be overridden at build time via LOGSTASH_COMPAT_VERSION env var.
 const LOGSTASH_COMPAT_VERSION: &str = match option_env!("LOGSTASH_COMPAT_VERSION") {
     Some(v) => v,
-    None => "9.3.2",
+    None => "9.4.2",
 };
 
 // ---------------------------------------------------------------------------
@@ -104,6 +104,10 @@ struct Cli {
         default_value = "127.0.0.1:9600"
     )]
     api_bind: String,
+
+    /// Enable runtime logging changes via PUT /_node/logging (default: false)
+    #[arg(long = "api.runtime_logging.enabled", default_value = "false", num_args = 0..=1, default_missing_value = "true")]
+    api_runtime_logging_enabled: String,
 
     /// Path to directory containing logstash.yml settings
     #[arg(long = "path.settings")]
@@ -421,6 +425,7 @@ async fn run_multi_pipeline(cli: &Cli, pipelines_yml: &std::path::Path) -> Resul
             pipeline_id: entry.id.clone(),
             api_enabled: "false".to_string(), // API already started
             api_bind: cli.api_bind.clone(),
+            api_runtime_logging_enabled: cli.api_runtime_logging_enabled.clone(),
             path_settings: cli.path_settings.clone(),
             path_data: cli.path_data.clone(),
             path_logs: cli.path_logs.clone(),
@@ -658,6 +663,8 @@ async fn main() -> Result<()> {
         let api_pipeline_metrics = Arc::clone(&pipeline_metrics_handle);
         let api_plugins = Arc::clone(&plugins_handle);
         let api_bind = cli.api_bind.clone();
+        let api_runtime_logging_enabled =
+            cli.api_runtime_logging_enabled == "true" || cli.api_runtime_logging_enabled == "1";
         let api_instance_id = instance_id.clone();
         let api_pipeline_id = cli.pipeline_id.clone();
         let (api_ctrl, api_signal) = ShutdownController::new();
@@ -671,8 +678,11 @@ async fn main() -> Result<()> {
                 api_pipeline_metrics,
                 api_plugins,
                 api_signal,
-                api_instance_id,
-                api_pipeline_id,
+                api::ApiServerOptions {
+                    instance_id: api_instance_id,
+                    pipeline_id: api_pipeline_id,
+                    allow_runtime_logging: api_runtime_logging_enabled,
+                },
             )
             .await
             {
@@ -1210,6 +1220,7 @@ fn print_logstash_help() {
     println!("      --config.reload.interval INTERVAL Configuration reload check interval in seconds [default: 3]");
     println!("      --api.enabled API_ENABLED      Enable monitoring API (default: true)");
     println!("      --api.http.host API_BIND       Monitoring API bind address [default: 127.0.0.1:9600]");
+    println!("      --api.runtime_logging.enabled  Enable PUT /_node/logging (default: false)");
     println!("  -V, --version                      Show version and exit");
     println!("  -h, --help                         Print help");
 }

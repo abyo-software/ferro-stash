@@ -38,7 +38,7 @@ version = "1.0.0"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["abyo software 合同会社 (abyo software LLC) <dev@abyo.net>"]
-repository = "https://github.com/ferrosearch/ferro-stash"
+repository = "https://github.com/abyo-software/ferro-stash"
 rust-version = "1.75"
 
 [workspace.dependencies]

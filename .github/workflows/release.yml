@@ -53,8 +53,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # The release binary ships WITH the `ruby` filter for full Logstash
-      # drop-in compatibility. Artichoke is fetched from its rev-pinned git
+      # The release binary ships WITH the `ruby` filter for migration
+      # compatibility with pipelines that use ruby. Artichoke is fetched from its rev-pinned git
       # dependency (abyo-software/artichoke-extended) — no sibling checkout
       # needed. The build deps above (clang/llvm/cmake) cover the mruby FFI.
       - name: Build release binary

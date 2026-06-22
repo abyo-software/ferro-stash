@@ -50,7 +50,11 @@ resources:
     cpu: "2"
     memory: 1Gi
 
-# Monitoring / metrics API (default container port 9600).
+# Monitoring / metrics API. The chart binds all pod interfaces so Kubernetes
+# health probes can reach it; keep the Service private and use port-forward.
+api:
+  bind: 0.0.0.0
+
 service:
   type: ClusterIP
   port: 9600

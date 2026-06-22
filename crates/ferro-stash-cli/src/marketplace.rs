@@ -29,9 +29,9 @@
 //!   allowed to run" answer; log and exit NON-ZERO (fail closed). A
 //!   CustomerNotEntitled is NEVER treated as success.
 //! * transient (network / throttle / internal / timeout / unknown) ->
-//!   inconclusive; retry a bounded number of times and then continue
-//!   best-effort, so a transient AWS blip never takes down a paying customer's
-//!   pipeline.
+//!   inconclusive; retry a bounded number of times and then exit NON-ZERO
+//!   (fail closed). Marketplace containers must prove entitlement before
+//!   starting the pipeline.
 
 use std::time::Duration;
 
@@ -78,13 +78,13 @@ pub(crate) enum Decision {
 
 /// Pure mapping from a result category to a process decision.
 ///
-/// Only a DEFINITIVE not-entitled answer fails closed; an unset product code
-/// and an inconclusive (transient) error both continue so that neither a dev
-/// run nor a transient AWS outage blocks startup.
+/// Only an unset product code skips the Marketplace check. Once a product code
+/// is configured, both explicit denials and inconclusive RegisterUsage failures
+/// fail closed.
 pub(crate) fn decide(outcome: Outcome) -> Decision {
     match outcome {
-        Outcome::Unset | Outcome::Entitled | Outcome::Transient => Decision::Continue,
-        Outcome::NotEntitled => Decision::FailClosed,
+        Outcome::Unset | Outcome::Entitled => Decision::Continue,
+        Outcome::NotEntitled | Outcome::Transient => Decision::FailClosed,
     }
 }
 
@@ -122,22 +122,16 @@ pub async fn check_entitlement_or_exit() {
                     "ferro-stash: marketplace entitlement verified (RegisterUsage succeeded)"
                 );
             }
-            Outcome::Transient => {
-                eprintln!(
-                    "ferro-stash: marketplace entitlement check inconclusive after {MAX_ATTEMPTS} \
-                     attempts (transient AWS error); continuing best-effort"
-                );
-            }
-            // Unset is short-circuited above; Entitled/Transient are the only
-            // Continue outcomes that reach here.
-            Outcome::Unset | Outcome::NotEntitled => {}
+            // Unset is short-circuited above; Entitled is the only Continue
+            // outcome that reaches here.
+            Outcome::Unset | Outcome::NotEntitled | Outcome::Transient => {}
         },
         Decision::FailClosed => {
             eprintln!(
-                "ferro-stash: marketplace entitlement check FAILED: this copy is not entitled to \
-                 run (CustomerNotEntitled or an invalid product configuration). Exiting. Subscribe \
-                 to the product in AWS Marketplace and ensure the pod has the correct product code \
-                 and AWS credentials/region."
+                "ferro-stash: marketplace entitlement check FAILED: entitlement could not be \
+                 verified. Exiting. Subscribe to the product in AWS Marketplace and ensure the pod \
+                 has the correct product code, AWS credentials/region, and network access to AWS \
+                 Marketplace Metering."
             );
             std::process::exit(NOT_ENTITLED_EXIT_CODE);
         }
@@ -196,9 +190,9 @@ async fn register_usage(product_code: &str) -> Outcome {
 /// Map a modeled `RegisterUsage` service error to an [`Outcome`].
 ///
 /// Definitive "you may not run this" errors fail closed; service-side / quota
-/// errors are transient. The enum is `#[non_exhaustive]`; any future variant
-/// we don't recognise is treated as transient (continue) rather than as a
-/// silent success — only an explicit denial fails closed.
+/// errors are transient and fail closed after bounded retry. The enum is
+/// `#[non_exhaustive]`; any future variant we don't recognise is treated as
+/// transient rather than as a silent success.
 fn classify_service_error(
     err: &aws_sdk_marketplacemetering::operation::register_usage::RegisterUsageError,
 ) -> Outcome {
@@ -235,9 +229,8 @@ mod tests {
     }
 
     #[test]
-    fn decide_continues_on_transient() {
-        // A transient AWS error must never take down a paying customer.
-        assert_eq!(decide(Outcome::Transient), Decision::Continue);
+    fn decide_fails_closed_on_transient() {
+        assert_eq!(decide(Outcome::Transient), Decision::FailClosed);
     }
 
     #[test]

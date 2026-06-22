@@ -5,7 +5,8 @@ Namespace: {{ .Release.Namespace }}
 Image:     {{ include "ferro-stash.image" . }}
 
 The monitoring/metrics API is served on port {{ .Values.service.port }} via
-service "{{ include "ferro-stash.fullname" . }}".
+service "{{ include "ferro-stash.fullname" . }}". Keep this Service private; use
+port-forward or a trusted reverse proxy for access.
 
 Check it:
   kubectl --namespace {{ .Release.Namespace }} port-forward \

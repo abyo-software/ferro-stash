@@ -27,7 +27,7 @@ path = "../../tests/e2e/compatibility_test.rs"
 name = "logstash_compat_test"
 path = "../../tests/e2e/logstash_compat_test.rs"
 
-# Side-by-side regression vs Logstash 8.x reference (docker-driven).
+# Side-by-side regression vs Logstash 9.4.2 reference (docker-driven).
 # All tests are #[ignore]; run with:
 #   cargo test -p ferro-stash-e2e --test logstash_docker_compat_test -- --ignored --nocapture
 [[test]]

@@ -21,10 +21,9 @@
 > in the listing copy or be folded verbatim into the long description.
 >
 > **Two hard rules for this listing:**
-> 1. **No github.com URL anywhere in the listing or support text.** The
->    source repository is private; a github link 404s for the AWS reviewer
->    and gets the listing rejected (the FerroDruid / FerroSCA lesson).
->    Support is **email only**: `aws-support@abyo.net`.
+> 1. **No github.com URL anywhere in the listing or support text.** Marketplace
+>    copy should avoid repository links and route support through the seller
+>    support channel. Support is **email only**: `aws-support@abyo.net`.
 > 2. **Do not position FerroStash as an alternative or replacement to any
 >    named AWS service.** "Logstash-compatible" is fine (Logstash is
 >    Elastic's product, not an AWS service) -- but describe it as **config /
@@ -76,8 +75,8 @@ you can pack far more shippers per host.
     unix, generator, heartbeat, stdin, dead_letter_queue, pipeline.
   - **Filters**: grok, dissect, kv, json, mutate, date, geoip, dns, csv,
     xml, useragent, cidr, fingerprint, translate, prune, split, truncate,
-    aggregate, throttle, anonymize, syslog_pri, uuid, ruby, and a native
-    Painless-style `script` filter (a fast alternative to ruby).
+    aggregate, throttle, anonymize, syslog_pri, uuid, and a native
+    Painless-style `script` filter.
   - **Outputs**: elasticsearch / opensearch, kafka, s3, http, tcp, udp,
     file, redis, sqs, sns, cloudwatch, email, datadog, csv, stdout, null,
     pipeline.
@@ -95,8 +94,9 @@ workspace-wide (with narrow, audited exceptions for the optional mruby FFI
 and the script-filter JIT), clippy is clean at `-D warnings` with
 `unwrap()` denied in production code, an SPDX header is on every source
 file, a `cargo deny` supply-chain gate runs in CI, and the test suite runs
-**1,400+ tests** with output **verified byte-for-byte against Logstash
-9.4.2 across 24 parity fixtures**.
+**1,400+ tests** with output **verified against Logstash 9.4.2 expected fields
+across 24 parity fixtures** (runtime-only fields normalized; Docker
+side-by-side covers a 13-fixture subset).
 
 **Honest scope (read before you buy):** FerroStash is Logstash **config /
 pipeline compatible, not a byte-identical drop-in**. Coverage is
@@ -252,6 +252,6 @@ deliberate downgrade of a claim a less honest listing might make:
 6. **No named-AWS-service positioning**: do not describe FerroStash as an
    alternative/replacement to any named AWS service. "Logstash-compatible"
    (Elastic's product) is the only compatibility claim.
-7. **No github URL**: the source repo is private; the listing and all
-   support text are email-only (`aws-support@abyo.net`) with zero
-   github.com links.
+7. **No github URL in the listing**: the listing and all support text are
+   email-only (`aws-support@abyo.net`) with zero github.com links, even though
+   the source is public on GitHub.

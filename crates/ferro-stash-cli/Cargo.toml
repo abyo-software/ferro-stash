@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 [package]
 name = "ferro-stash"
-description = "High-performance data pipeline — drop-in Logstash replacement written in Rust"
+description = "High-performance Logstash-compatible data pipeline written in Rust"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

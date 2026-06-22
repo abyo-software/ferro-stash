@@ -9,8 +9,10 @@ path. Connector breadth (AWS, enterprise messaging) is the main gap.
 Two distinct claims, don't conflate them:
 
 - **Behaviour parity (verified):** for the filters covered by the
-  [parity fixtures](../tests/logstash-compat/), FerroStash output is
-  **byte-for-byte identical** to Logstash 9.4.2 (24/24 fixtures, ~17 filters).
+  [parity fixtures](../tests/logstash-compat/), FerroStash output matches
+  Logstash 9.4.2 for the expected event fields after normalizing runtime-only
+  fields (24/24 fixtures, ~17 filters; Docker side-by-side covers a 13-fixture
+  subset).
 - **Plugin coverage (this document):** *which* Logstash 9.4.2 plugins exist at
   all in FerroStash. This is plugin-level, **not** option-level — a "covered"
   plugin may still implement only a subset of that plugin's Logstash options

@@ -51,9 +51,9 @@ fields of note: geoip `database` (path to the `.mmdb`), s3 output
 |-------|---------|
 | `ferro-stash-core` | Event model, pipeline engine, conditions, buffering, DLQ, metrics |
 | `ferro-stash-config` | Logstash DSL + YAML config parsing |
-| `ferro-stash-input` | Input plugins (15 registered: stdin, file, tcp, udp, http, syslog, generator, heartbeat, beats, elasticsearch, dead_letter_queue, pipeline + real kafka/redis/s3, compile-validated) |
-| `ferro-stash-filter` | Filter plugins (29 registered: grok, mutate, json, date, dissect, kv, drop, clone, ruby, script, aggregate, throttle, … + real geoip/dns (live-validated), elasticsearch (mock-validated)) |
-| `ferro-stash-output` | Output plugins (11 registered: stdout, elasticsearch, file, http, tcp, null, pipeline + real kafka/redis (compile-validated), s3/datadog (mock-validated)) |
+| `ferro-stash-input` | Input plugins (25 registered: stdin, file, tcp, udp, http, syslog, generator, heartbeat, beats, elasticsearch, dead_letter_queue, pipeline + real kafka/redis/s3/sqs/jdbc/rabbitmq/cloudwatch integrations) |
+| `ferro-stash-filter` | Filter plugins (37 registered: grok, mutate, json, date, dissect, kv, drop, clone, ruby, script, aggregate, throttle, … + real geoip/dns/elasticsearch/memcached/jdbc integrations) |
+| `ferro-stash-output` | Output plugins (21 registered: stdout, elasticsearch, file, http, tcp, null, pipeline + real kafka/redis/s3/datadog/rabbitmq/email/sqs/sns/jdbc/cloudwatch integrations) |
 | `ferro-stash-codec` | Codecs (21 registered: json, plain, multiline, csv, msgpack, cef, netflow, avro, protobuf, edn, …) |
 | `ferro-stash-ruby` | Artichoke (mruby) Ruby interpreter bridge for the `ruby` filter |
 | `ferro-script` | Native Painless-style scripting engine (Cranelift JIT) for the `script` filter/codec |

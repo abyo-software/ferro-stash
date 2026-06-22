@@ -20,8 +20,7 @@ pipeline). Three delivery methods are provided:
 | Health endpoint | `GET /_health_report` (also `/_node`, `/_node/stats`) |
 | Version / help | `--version` / `-V`, `--help` / `-h` |
 
-The monitoring API defaults to **127.0.0.1**, so containers/pods bind
-`0.0.0.0:9600` instead (the provided Docker `CMD` and Helm args do this).
+The monitoring API defaults to **127.0.0.1**. Read-only stats endpoints are unauthenticated for Logstash compatibility; runtime log-level changes via `PUT /_node/logging` are disabled unless `--api.runtime_logging.enabled=true` is set. Expose port 9600 only through a trusted tunnel, reverse proxy, port-forward, or private cluster network.
 
 `--path.data` holds a per-instance lock file, the instance `uuid`, and any
 persistent queue / DLQ state. It must be unique per instance and writable.
@@ -44,8 +43,8 @@ The fork is public at <https://github.com/abyo-software/artichoke-extended>
   doesn't fetch it at all.
 - **CI / the release workflow / Docker** build with `--features ruby` and rely
   on cargo to fetch the fork; there is no sibling-checkout or repo-nesting hack.
-- The release binary and Docker image ship **with** the `ruby` filter enabled
-  for full Logstash drop-in compatibility.
+- The repo-root Docker image ships **with** the `ruby` filter enabled for
+  migration compatibility. Marketplace artifacts use the default no-Ruby build.
 
 Build toolchain needed: Rust stable, **cmake** (vendored librdkafka for the
 kafka plugins). The `ruby` feature additionally needs **clang/gcc** (mruby FFI)
@@ -60,11 +59,16 @@ required. At runtime only `ca-certificates` is needed for outbound TLS.
 # Build (slow first time: compiles rdkafka, aws-sdk, mruby).
 docker build -t ferro-stash:latest .
 
-# Run with a mounted pipeline config + metrics API on 9600.
+# Run with a mounted pipeline config.
+docker run --rm -it \
+  -v "$PWD/config/example.conf:/etc/ferro-stash/pipeline.conf:ro" \
+  ferro-stash:latest
+
+# To publish the monitoring API deliberately, bind all interfaces.
 docker run --rm -it \
   -v "$PWD/config/example.conf:/etc/ferro-stash/pipeline.conf:ro" \
   -p 9600:9600 \
-  ferro-stash:latest
+  ferro-stash:latest -f /etc/ferro-stash/pipeline.conf --path.data /var/lib/ferro-stash --api.http.host 0.0.0.0:9600
 
 # Check the API.
 curl http://127.0.0.1:9600/_node
@@ -75,7 +79,7 @@ The image:
 - runs as non-root uid/gid `65532`,
 - ships `ca-certificates` + `tini` (signal forwarding / zombie reaping),
 - uses the writable volume `/var/lib/ferro-stash` as `path.data`,
-- binds the API on `0.0.0.0:9600`,
+- binds the API on `127.0.0.1:9600` by default,
 - default `CMD` reads `/etc/ferro-stash/pipeline.conf`.
 
 ### Optional GeoIP database
@@ -151,7 +155,7 @@ helm lint deploy/helm/ferro-stash
 # Install (set your image + pipeline).
 helm install fs deploy/helm/ferro-stash \
   --set image.repository=myrepo/ferro-stash \
-  --set image.tag=0.1.0 \
+  --set image.tag=1.0.0 \
   --set-file pipelineConf=./my-pipeline.conf
 ```
 

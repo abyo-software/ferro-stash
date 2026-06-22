@@ -60,17 +60,17 @@ ferro-stash-cli
 |-------|---------|
 | `ferro-stash-core` | Event model, plugin traits, pipeline orchestration, conditions, buffering, DLQ, metrics |
 | `ferro-stash-config` | Logstash DSL parser and YAML config parser, config validation |
-| `ferro-stash-input` | Input plugins (15 registered; some — kafka/redis/s3 — are stubs) |
-| `ferro-stash-filter` | Filter plugins (29 registered; geoip/dns/elasticsearch are stubs) |
-| `ferro-stash-output` | Output plugins (11 registered; kafka/redis/s3/datadog are stubs) |
+| `ferro-stash-input` | Input plugins (25 registered, including real Kafka/Redis/S3/SQS/JDBC/RabbitMQ/CloudWatch integrations with validation levels documented in the README) |
+| `ferro-stash-filter` | Filter plugins (37 registered, including real GeoIP/DNS/Elasticsearch/Memcached/JDBC enrichment integrations) |
+| `ferro-stash-output` | Output plugins (21 registered, including real Kafka/Redis/S3/Datadog/SQS/SNS/JDBC/CloudWatch/RabbitMQ/email integrations) |
 | `ferro-stash-codec` | Codec implementations (21 registered) |
 | `ferro-stash-cli` | `ferro-stash` binary: CLI, signal handling, `_node/*` metrics API |
-| `ferro-stash-ruby` | Artichoke (mruby) Ruby interpreter bridge for the ruby filter (local fork, path dep) |
+| `ferro-stash-ruby` | Optional Artichoke (mruby) Ruby interpreter bridge for the ruby filter via a rev-pinned git dependency |
 | `ferro-script` | Native Painless-style scripting engine (Cranelift JIT) for the `script` filter/codec |
 | `ferro-stash-e2e` | Integration / Logstash-parity test harness |
 
 (See the README and Compatibility Matrix for the authoritative per-plugin
-status, including which plugins are stubs.)
+status and validation scope.)
 
 ## Plugin Trait Architecture
 

@@ -7,7 +7,7 @@ Phase 2 / external-infra-required. Runs every fixture under
 ``tests/logstash-compat/fixtures/`` against BOTH:
 
   1. ferro-stash binary (located via ``--ferro-binary`` or ``FERRO_STASH_BIN``)
-  2. JRuby Logstash 9.3.x (located via ``--logstash-bin`` or ``LOGSTASH_HOME``)
+  2. JRuby Logstash 9.4.2 (located via ``--logstash-bin`` or ``LOGSTASH_HOME``)
 
 For each fixture:
   - Run pipeline.conf with input.txt against each binary
@@ -27,9 +27,9 @@ is not redistributable here, so you supply your own install.
 
 To wire this harness:
 
-  1. Download the Logstash 9.3.x tarball from elastic.co
+  1. Download the Logstash 9.4.2 tarball from elastic.co
   2. Extract it anywhere on disk
-  3. Set ``LOGSTASH_HOME=/path/to/logstash-9.3.x``
+  3. Set ``LOGSTASH_HOME=/path/to/logstash-9.4.2``
   4. Run ``python3 tests/logstash-compat/jruby_parity.py``
 
 The harness will start, walk every fixture, and report parity per
@@ -150,7 +150,7 @@ def main() -> int:
 
     if not logstash_bin or not Path(logstash_bin).exists():
         print(
-            "SKIPPED: requires JRuby Logstash 9.3.x. Set LOGSTASH_HOME or pass --logstash-bin.\n"
+            "SKIPPED: requires JRuby Logstash 9.4.2. Set LOGSTASH_HOME or pass --logstash-bin.\n"
             "  See module docstring for how to obtain.",
             file=sys.stderr,
         )
@@ -198,7 +198,10 @@ def main() -> int:
     if failures:
         print(f"\n{failures} fixture(s) diverge from upstream Logstash.")
         return 1
-    print(f"\nAll {len(fixtures)} fixtures match upstream Logstash byte-for-byte.")
+    print(
+        f"\nAll {len(fixtures)} fixtures match upstream Logstash field-by-field "
+        "(runtime-only fields normalized)."
+    )
     return 0
 
 

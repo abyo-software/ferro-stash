@@ -7,7 +7,7 @@
 # Build notes
 # -----------
 # * The image is built WITH the optional `ruby` filter (`--features ruby`) for
-#   full Logstash drop-in compatibility. Its Artichoke (mruby) dependency is a
+#   migration compatibility with pipelines that use ruby. Its Artichoke (mruby) dependency is a
 #   rev-pinned git dependency (abyo-software/artichoke-extended), fetched by
 #   cargo — no sibling checkout or submodule needed.
 # * mruby FFI (the ruby feature) needs a C compiler (clang) + cmake; the
@@ -21,7 +21,7 @@
 # Run:
 #   docker run --rm -it \
 #     -v "$PWD/config/example.conf:/etc/ferro-stash/pipeline.conf:ro" \
-#     -p 9600:9600 ferro-stash:latest
+#     ferro-stash:latest
 
 # ---------------------------------------------------------------------------
 # Stage 1 — builder
@@ -82,8 +82,8 @@ COPY --from=builder /build/target/release/ferro-stash \
 #   docker run -v ./GeoLite2-City.mmdb:/etc/ferro-stash/GeoLite2-City.mmdb:ro ...
 VOLUME ["/var/lib/ferro-stash"]
 
-# Monitoring / metrics API. Inside a container the default 127.0.0.1 bind would
-# not be reachable, so we bind 0.0.0.0 via the ENTRYPOINT default args below.
+# Monitoring / metrics API. It binds to loopback by default; publish it only
+# behind a trusted tunnel, reverse proxy, or Kubernetes port-forward.
 EXPOSE 9600
 
 USER 65532:65532
@@ -91,8 +91,8 @@ ENV RUST_LOG=info
 
 # tini reaps zombies and forwards signals so SIGTERM triggers graceful shutdown.
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/ferro-stash"]
-# Default args: read the mounted pipeline, persist runtime state under the
-# writable volume, expose the API on all interfaces. Override at `docker run`.
+# Default args: read the mounted pipeline and persist runtime state under the
+# writable volume. Override at `docker run` to expose the API deliberately.
 CMD ["-f", "/etc/ferro-stash/pipeline.conf", \
      "--path.data", "/var/lib/ferro-stash", \
-     "--api.http.host", "0.0.0.0:9600"]
+     "--api.http.host", "127.0.0.1:9600"]

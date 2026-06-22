@@ -27,9 +27,8 @@
 # The accuracy contract from docs/marketplace/LISTING.md is honoured: FerroStash
 # is marketed as "Logstash-compatible" (config / pipeline compatibility), NEVER as
 # "100% compatible" or "drop-in", and the listing positions it against no named
-# AWS service. The source repository is PRIVATE, so NO github.com URL appears in
-# any listing/support field (a github link 404s for the AWS reviewer and gets the
-# listing rejected - the FerroDruid lesson). Support is EMAIL ONLY.
+# AWS service. NO github.com URL appears in any listing/support field; support is
+# EMAIL ONLY through the seller support channel.
 #
 # PREREQUISITE: AWS Marketplace seller registration complete (it is for `as`).
 # A logo is REQUIRED by UpdateInformation; if LOGO_URL is unset we stage the
@@ -125,8 +124,8 @@ long = ("FerroStash is a Rust-native, Logstash-compatible log and event pipeline
   "beats, file, tcp, udp, http, http_poller, syslog, kafka, redis, s3, sqs, jdbc, "
   "elasticsearch, cloudwatch, rabbitmq, and the dead-letter-queue. Filters include "
   "grok, dissect, kv, json, mutate, date, geoip, dns, csv, xml, useragent, cidr, "
-  "fingerprint, translate, aggregate, throttle, and ruby, plus a native "
-  "Painless-style script filter (a fast alternative to ruby). Outputs include "
+  "fingerprint, translate, aggregate, throttle, plus a native "
+  "Painless-style script filter. Outputs include "
   "elasticsearch / opensearch, kafka, s3, http, tcp, udp, file, redis, sqs, sns, "
   "cloudwatch, email, and datadog. Codecs include json, json_lines, multiline, "
   "cef, netflow, avro, msgpack, and protobuf. "
@@ -138,8 +137,8 @@ long = ("FerroStash is a Rust-native, Logstash-compatible log and event pipeline
   "narrow, audited exceptions for the optional mruby FFI and the script-filter "
   "JIT), clippy is clean at -D warnings with unwrap() denied in production code, "
   "an SPDX header is on every source file, a cargo deny supply-chain gate runs in "
-  "CI, and the test suite runs 1,400+ tests with output verified byte-for-byte "
-  "against Logstash 9.4.2 across 24 parity fixtures. "
+  "CI, and the test suite runs 1,400+ tests with output verified against "
+  "Logstash 9.4.2 expected fields across 24 parity fixtures. "
   "Honest scope (read before you buy): FerroStash is Logstash config / pipeline "
   "compatible, NOT a byte-identical 100 percent drop-in - coverage is plugin-level "
   "(about 88 percent of bundled plugins), and a covered plugin may implement only "
@@ -175,9 +174,8 @@ det = {
   "SearchKeywords": ["logstash","log pipeline","observability","etl","grok",
     "elasticsearch","opensearch","kafka","data pipeline","log shipping",
     "rust","siem"],
-  # Email-only support: the source repository is private, so any GitHub URL in
-  # the listing 404s for the AWS reviewer and gets the listing rejected (the
-  # FerroDruid lesson). Mirror the Published FerroSCA / S4 Embed: email only.
+  # Email-only support: Marketplace listing/support copy intentionally avoids
+  # GitHub URLs and routes support through the seller support channel.
   "SupportDescription": ("Marketplace subscribers receive support by email at "
     "aws-support@abyo.net under the published SLA. Include your AWS account id and "
     "the EC2 instance id when you open a ticket. A limitations document, a Logstash "
@@ -195,9 +193,9 @@ PY
 if LC_ALL=C grep -qP '[^\x09\x0a\x0d\x20-\x7e]' /tmp/cs-ferrostash-info.json; then
   echo "ERROR: non-ASCII byte in the UpdateInformation document; aborting." >&2; exit 1
 fi
-# github.com guard: the repo is private; a github URL gets the listing rejected.
+# github.com guard: Marketplace listing/support copy stays email-only.
 if grep -qi 'github\.com' /tmp/cs-ferrostash-info.json; then
-  echo "ERROR: github.com URL in the UpdateInformation document; the repo is private - aborting." >&2; exit 1
+  echo "ERROR: github.com URL in the UpdateInformation document; listing/support copy must be email-only - aborting." >&2; exit 1
 fi
 UCID=$(mc start-change-set --catalog "$CATALOG" --change-set-name ferrostash-info \
   --change-set "file:///tmp/cs-ferrostash-info.json" --query ChangeSetId --output text)

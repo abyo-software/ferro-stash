@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Monitoring API — Logstash-compatible HTTP endpoints.
 //!
-//! Implements the full Logstash monitoring API surface:
+//! Implements the Logstash-style monitoring API endpoints FerroStash supports:
 //!   GET /                              — instance info + id
 //!   GET /_node/stats                   — node statistics
 //!   GET /_node/stats/pipelines         — all pipeline stats
@@ -41,6 +41,12 @@ pub type PipelineMetricsHandle = Arc<RwLock<Arc<PipelineMetrics>>>;
 
 /// Shared handle for currently-loaded plugin info (updated on reload).
 pub type PluginsHandle = Arc<RwLock<Vec<PluginInfo>>>;
+
+pub struct ApiServerOptions {
+    pub instance_id: String,
+    pub pipeline_id: String,
+    pub allow_runtime_logging: bool,
+}
 
 #[derive(Clone)]
 struct ApiState {
@@ -84,8 +90,11 @@ pub async fn run_api_server(
         pipeline_metrics,
         plugins_handle,
         shutdown,
-        instance_id,
-        pipeline_id,
+        ApiServerOptions {
+            instance_id,
+            pipeline_id,
+            allow_runtime_logging: false,
+        },
     )
     .await
 }
@@ -107,8 +116,11 @@ pub async fn run_api_server_with_plugins(
         pipeline_metrics,
         plugins_handle,
         shutdown,
-        instance_id,
-        pipeline_id,
+        ApiServerOptions {
+            instance_id,
+            pipeline_id,
+            allow_runtime_logging: false,
+        },
     )
     .await
 }
@@ -121,19 +133,18 @@ pub async fn run_api_server_full(
     pipeline_metrics_handle: PipelineMetricsHandle,
     plugins_handle: PluginsHandle,
     mut shutdown: ShutdownSignal,
-    instance_id: String,
-    pipeline_id: String,
+    options: ApiServerOptions,
 ) -> anyhow::Result<()> {
     let state = ApiState {
         metrics,
         pipeline_metrics: pipeline_metrics_handle,
-        instance_id,
-        pipeline_id,
+        instance_id: options.instance_id,
+        pipeline_id: options.pipeline_id,
         plugins: plugins_handle,
         logger_levels: Arc::new(RwLock::new(default_logger_levels())),
     };
 
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/", get(root))
         .route("/_node", get(node_info))
         .route("/_node/stats", get(node_stats))
@@ -142,10 +153,16 @@ pub async fn run_api_server_full(
         .route("/_node/hot_threads", get(hot_threads))
         .route("/_node/pipelines", get(node_stats))
         .route("/_node/plugins", get(node_plugins))
-        .route("/_node/logging", get(get_logging).put(put_logging))
-        .route("/_node/logging/reset", put(reset_logging))
-        .route("/_health_report", get(health_report))
-        .with_state(state);
+        .route("/_node/logging", get(get_logging))
+        .route("/_health_report", get(health_report));
+
+    if options.allow_runtime_logging {
+        app = app
+            .route("/_node/logging", put(put_logging))
+            .route("/_node/logging/reset", put(reset_logging));
+    }
+
+    let app = app.with_state(state);
 
     // Try the requested port, then auto-increment up to +9 (Logstash behavior)
     let listener = try_bind_with_increment(bind_addr, 10).await?;

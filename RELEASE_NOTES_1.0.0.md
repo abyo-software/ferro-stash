@@ -13,9 +13,10 @@ irreplaceable data.
 
 ## Highlights
 
-- **Logstash 9.4.2 parity, verified.** Output is byte-for-byte identical to real
-  Logstash 9.4.2 across **24 parity fixtures** (~17 filters), checked both
-  in-process (CI) and via a Docker side-by-side harness. Reproduce with
+- **Logstash 9.4.2 parity, verified.** Output matches real Logstash 9.4.2 for
+  expected event fields across **24 parity fixtures** (~17 filters), with
+  runtime-only fields normalized. The in-process harness runs in CI; the Docker
+  side-by-side harness covers a 13-fixture subset. Reproduce with
   `tests/logstash-compat/`.
 - **A fraction of the footprint.** Benchmarked vs Logstash 9.4.2 on one host
   (`c7i.2xlarge`, 8 vCPU): native filters at **~1.4–1.7× throughput** (csv

@@ -184,7 +184,7 @@ details = {
       "from the default build. Engineering: unsafe_code denied workspace-wide "
       "(narrow audited exceptions), clippy clean at -D warnings, unwrap() denied "
       "in production code, cargo deny gate, 1,400+ tests with output verified "
-      "byte-for-byte against Logstash 9.4.2 across 24 fixtures. Metered "
+      "against Logstash 9.4.2 expected fields across 24 fixtures. Metered "
       "automatically by AWS per instance-hour (no metering code in the AMI)."),
   },
   "DeliveryOptions": [{
@@ -231,7 +231,7 @@ if LC_ALL=C grep -qP '[^\x09\x0a\x0d\x20-\x7e]' /tmp/cs-ferrostash-ami.json; the
   echo "ERROR: non-ASCII byte in the AddDeliveryOptions document; aborting." >&2; exit 1
 fi
 if grep -qi 'github\.com' /tmp/cs-ferrostash-ami.json; then
-  echo "ERROR: github.com URL in the AddDeliveryOptions document; the repo is private - aborting." >&2; exit 1
+  echo "ERROR: github.com URL in the AddDeliveryOptions document; listing/support copy must be email-only - aborting." >&2; exit 1
 fi
 DID=$(mc start-change-set --catalog "$CATALOG" --change-set-name ferrostash-ami \
   --change-set "file:///tmp/cs-ferrostash-ami.json" --query ChangeSetId --output text)

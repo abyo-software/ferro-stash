@@ -45,7 +45,7 @@ left to publish.
 | B8 | **Claims do not over-state capability** | Done | Cross-checked against `README.md` (Honest limitations) + `docs/COMPATIBILITY.md`; see `LISTING.md` 8. **Must not market "100% compatible" / "drop-in", and must not position against any named AWS service.** |
 | B9 | **Support contact** surfaced | Done | **Email only**: `aws-support@abyo.net` (`SupportDescription` in `marketplace-create.sh`). |
 | B10 | **Refund policy** | Done (text) / 🔒 OWNER (console) | `marketplace-pricing.sh` sets a `SupportTerm` RefundPolicy (<= 500 chars). |
-| B11 | **No github.com URL anywhere** | Done | The repo is private. `marketplace-create.sh` and `marketplace-ami.sh` each `grep`-guard the generated JSON and abort on any github.com URL; `LISTING.md` and the AMI-shipped files are github-free. |
+| B11 | **No github.com URL in listing/support copy** | Done | Marketplace listing/support text stays email-only. `marketplace-create.sh` and `marketplace-ami.sh` each `grep`-guard the generated JSON and abort on any github.com URL; `LISTING.md` and the AMI-shipped files are github-free. |
 
 ## C. AMI product -- self-service AMI scanning policy
 

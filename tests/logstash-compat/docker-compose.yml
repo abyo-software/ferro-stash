@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 #
-# Convenience compose file — declares the Logstash 8.x reference image
+# Convenience compose file — declares the Logstash 9.4.2 reference image
 # the docker-driven regression harness pins. The actual harness
 # (`tests/e2e/logstash_docker_compat_test.rs`) shells out to `docker run`
 # directly so it can pipe stdin/stdout per-fixture; this compose file

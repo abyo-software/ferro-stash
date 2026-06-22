@@ -108,8 +108,8 @@ ENV RUST_LOG=info
 # ENTRYPOINT = the binary (via tini); CMD = the default args so a Kubernetes
 # `args:` override (the Helm chart sets its own) cleanly replaces them without
 # duplicating `-f`. The effective default command is:
-#   ferro-stash -f /etc/ferro-stash/pipeline.conf --path.data /var/lib/ferro-stash --api.http.host 0.0.0.0:9600
+#   ferro-stash -f /etc/ferro-stash/pipeline.conf --path.data /var/lib/ferro-stash --api.http.host 127.0.0.1:9600
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/ferro-stash"]
 CMD ["-f", "/etc/ferro-stash/pipeline.conf", \
      "--path.data", "/var/lib/ferro-stash", \
-     "--api.http.host", "0.0.0.0:9600"]
+     "--api.http.host", "127.0.0.1:9600"]

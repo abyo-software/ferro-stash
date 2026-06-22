@@ -44,7 +44,7 @@ cargo build --release
 ## Running Tests
 
 ```bash
-cargo test --workspace              # ~1,165 tests (16 ignored)
+cargo test --workspace              # 1,400+ passing tests; live smokes are ignored by default
 cargo test -p ferro-stash-core      # single crate
 ```
 
@@ -58,10 +58,10 @@ The workspace contains 10 members:
 | `ferro-stash-core` | Pipeline engine, event model, plugin traits, conditions, buffering, DLQ, metrics |
 | `ferro-stash-config` | Logstash-compatible config file parsing and validation |
 | `ferro-stash-codec` | Codecs (json, plain, multiline, msgpack, cef, netflow, avro, …) |
-| `ferro-stash-input` | Input plugins (stdin, file, beats, http, tcp, udp, syslog, … + kafka/redis/s3 stubs) |
-| `ferro-stash-output` | Output plugins (stdout, elasticsearch, file, http, tcp, null, … + kafka/redis/s3/datadog stubs) |
-| `ferro-stash-filter` | Filter plugins (grok, mutate, date, dissect, kv, … + geoip/dns/elasticsearch stubs) |
-| `ferro-stash-ruby` | Ruby filter bridge via artichoke-backend (local fork, path dep) |
+| `ferro-stash-input` | Input plugins (stdin, file, beats, http, tcp, udp, syslog, Kafka, Redis, S3, SQS, JDBC, RabbitMQ, CloudWatch, …) |
+| `ferro-stash-output` | Output plugins (stdout, elasticsearch, file, http, tcp, null, Kafka, Redis, S3, Datadog, SQS, SNS, JDBC, CloudWatch, RabbitMQ, email, …) |
+| `ferro-stash-filter` | Filter plugins (grok, mutate, date, dissect, kv, geoip, dns, elasticsearch, memcached, JDBC enrichment, …) |
+| `ferro-stash-ruby` | Optional Ruby filter bridge via a rev-pinned Artichoke git dependency |
 | `ferro-script` | Native Painless-style scripting engine (Cranelift JIT) for the `script` filter/codec |
 | `ferro-stash-e2e` | Integration / Logstash-parity test harness |
 

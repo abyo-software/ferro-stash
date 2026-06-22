@@ -42,9 +42,8 @@
 # All field text is plain ASCII. The accuracy contract from
 # docs/marketplace/LISTING.md is honoured: FerroStash is "Logstash-compatible"
 # (config/pipeline), NEVER "100% compatible" or "drop-in", positioned against no
-# named AWS service. The repo is PRIVATE, so NO github.com URL appears in any
-# listing field (a github link 404s for the reviewer and gets the listing
-# rejected). Support is EMAIL ONLY (aws-support@abyo.net).
+# named AWS service. NO github.com URL appears in any listing/support field;
+# support is EMAIL ONLY (aws-support@abyo.net).
 #
 # Usage:
 #   PROFILE=as REGION=us-east-1 deploy/marketplace-container.sh
@@ -101,14 +100,14 @@ wait_done() {
     esac
   done
 }
-# Guard a generated JSON doc: plain ASCII only, and no github.com URL (private repo).
+# Guard a generated JSON doc: plain ASCII only, and no github.com URL in listing copy.
 guard_json() {
   local f="$1"
   if LC_ALL=C grep -qP '[^\x09\x0a\x0d\x20-\x7e]' "$f"; then
     echo "ERROR: non-ASCII byte in $f; aborting." >&2; exit 1
   fi
   if grep -qi 'github\.com' "$f"; then
-    echo "ERROR: github.com URL in $f; the repo is private - aborting." >&2; exit 1
+    echo "ERROR: github.com URL in $f; listing/support copy must be email-only - aborting." >&2; exit 1
   fi
 }
 # Best-effort extraction of the container ProductCode from describe-entity.
@@ -205,7 +204,7 @@ long = ("FerroStash is a Rust-native, Logstash-compatible log and event pipeline
   "beats, file, tcp, udp, http, http_poller, syslog, kafka, redis, s3, sqs, jdbc, "
   "elasticsearch, cloudwatch, rabbitmq, and the dead-letter-queue. Filters include "
   "grok, dissect, kv, json, mutate, date, geoip, dns, csv, xml, useragent, cidr, "
-  "fingerprint, translate, aggregate, throttle, and ruby, plus a native "
+  "fingerprint, translate, aggregate, throttle, plus a native "
   "Painless-style script filter. Outputs include elasticsearch / opensearch, "
   "kafka, s3, http, tcp, udp, file, redis, sqs, sns, cloudwatch, email, and "
   "datadog. Codecs include json, json_lines, multiline, cef, netflow, avro, "
@@ -223,7 +222,7 @@ long = ("FerroStash is a Rust-native, Logstash-compatible log and event pipeline
   "narrow, audited exceptions for the optional mruby FFI and the script-filter "
   "JIT), clippy is clean at -D warnings with unwrap() denied in production code, a "
   "cargo deny supply-chain gate runs in CI, and the test suite runs 1,400+ tests "
-  "with output verified byte-for-byte against Logstash 9.4.2 across 24 parity "
+  "with output verified against Logstash 9.4.2 expected fields across 24 parity "
   "fixtures. "
   "Honest scope (read before you buy): FerroStash is Logstash config / pipeline "
   "compatible, NOT a byte-identical 100 percent drop-in - coverage is plugin-level "
@@ -256,8 +255,8 @@ det = {
   "SearchKeywords": ["logstash","log pipeline","observability","etl","grok",
     "elasticsearch","opensearch","kafka","data pipeline","log shipping",
     "rust","eks","kubernetes","helm"],
-  # Email-only support: the source repository is private, so a GitHub URL 404s
-  # for the AWS reviewer and gets the listing rejected.
+  # Email-only support: Marketplace listing/support copy intentionally avoids
+  # GitHub URLs and routes support through the seller support channel.
   "SupportDescription": ("Marketplace subscribers receive support by email at "
     "aws-support@abyo.net under the published SLA. Include your AWS account id and "
     "the EKS cluster / pod details when you open a ticket. A limitations document, "

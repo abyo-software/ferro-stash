@@ -20,12 +20,14 @@ holds tens of MB of RAM instead of ~1 GB.
 > caveats first.
 
 > ☁️ **Run it on AWS Marketplace — AWS-billed, nothing to self-manage:**
-> **▶ [Container on EKS / ECS / Fargate](https://aws.amazon.com/marketplace/pp/prodview-jfvmee7a7vaw4)**
+> **▶ [Container on Amazon EKS (Helm)](https://aws.amazon.com/marketplace/pp/prodview-jfvmee7a7vaw4)**
 > or **[AMI for EC2](https://aws.amazon.com/marketplace/pp/prodview-k7a5mm7shs6wa)** —
-> the same binary as the free build, billed through your AWS account.
+> billed through your AWS account.
 > The open-source build is **free** for local and self-managed use and is the
-> **full engine** — Marketplace doesn't unlock features, it adds AWS
-> procurement, consolidated billing, and a supported commercial path.
+> **full engine**. Marketplace adds AWS procurement, consolidated billing, and
+> a supported commercial path; the Marketplace container and AMI use the default
+> no-Ruby build, while the repo-root Dockerfile includes the optional Ruby
+> filter.
 
 ```
   inputs  ──▶   filters   ──▶   outputs
@@ -54,8 +56,8 @@ single-developer project, **no public production deployments yet** — run it
 beside your existing pipeline before trusting it with irreplaceable data.
 `cargo test --workspace` runs **1,400+ tests, 0 failing**, with `cargo clippy
 -D warnings`, `cargo fmt --check`, and `cargo deny check` clean, and output
-verified field-for-field against Logstash 9.4.2 (24/24 parity fixtures,
-runtime-only fields normalized).
+verified against Logstash 9.4.2 fixture outputs (24/24 parity fixtures,
+runtime-only fields normalized; Docker side-by-side covers a 13-fixture subset).
 
 The ten previously-stubbed connector plugins (input/output `kafka`,
 `redis`, `s3`; output `datadog`; filters `geoip`, `dns`,
@@ -69,9 +71,10 @@ conformance. See [Honest limitations](#honest-limitations) for exactly
 what was validated and the feature residuals per plugin; read those
 caveats before deploying any connector.
 
-> The OSS build (Apache-2.0) and the AWS Marketplace builds are the **same
-> engine**; Marketplace adds AWS-native procurement, billing, and commercial
-> support, not features.
+> The OSS build (Apache-2.0) is the **full engine**. AWS Marketplace adds
+> AWS-native procurement, billing, and commercial support; the Marketplace
+> container and AMI intentionally follow the default no-Ruby feature set (the
+> repo-root Dockerfile builds with the optional Ruby filter).
 
 ## Why teams use FerroStash
 
@@ -168,16 +171,20 @@ wholesale.
 
 ### Verified parity evidence
 
-`tests/e2e/logstash_docker_compat_test.rs` pipes the same `pipeline.conf`
-+ input through both `target/debug/ferro-stash` and
-`docker.elastic.co/logstash/logstash:9.4.2`, then asserts every event
-payload equal field-by-field after stripping only runtime-only fields
-(`@timestamp`, `@version`, `host`, `event.original`). **24/24 fixtures
-pass field-for-field**, covering `stdin → stdout(json)`, grok, mutate
+Two harnesses run the same fixtures. The in-process
+`tests/e2e/logstash_compat_test.rs` runs **all 24 fixtures** against committed
+golden files (each golden file is generated from the real Logstash oracle),
+covering `stdin → stdout(json)`, grok, mutate
 (rename/case/gsub/convert/copy/strip), json, kv, dissect, fingerprint,
 date, clone, csv, truncate, translate, split, urldecode, drop, conditional
-`if/else if/else`, and unicode inputs. These tests are `#[ignore]` (they
-require Docker); run them with:
+`if/else if/else`, and unicode inputs. The Docker side-by-side harness
+`tests/e2e/logstash_docker_compat_test.rs` pipes the same `pipeline.conf`
++ input through both `target/debug/ferro-stash` and
+`docker.elastic.co/logstash/logstash:9.4.2` and asserts each event payload
+equal field-by-field after stripping only runtime-only fields
+(`@timestamp`, `@version`, `host`, `event.original`); it currently wires a
+**13-fixture subset** of the 24. The in-process harness runs in default CI; the
+Docker harness is `#[ignore]` (it requires Docker). Run the Docker harness with:
 
 ```bash
 cargo build --bin ferro-stash
@@ -374,16 +381,18 @@ by feature set:
   `cargo build --release` (see [Quick start](#quick-start)), or `docker build`
   the included [`Dockerfile`](Dockerfile) for a container image. Apache-2.0, no
   fee, no entitlement check — the full engine.
-- **AWS Marketplace — Container (EKS / ECS / Fargate)** — the same image,
-  billed through your AWS account per pod-hour, for teams that want it on their
-  AWS bill with a supported commercial path →
+- **AWS Marketplace — Container on Amazon EKS (Helm)** — the default no-Ruby
+  image plus AWS Marketplace entitlement metering, billed through your AWS
+  account per pod-hour, for teams that want it on their AWS bill with a
+  supported commercial path →
   [listing](https://aws.amazon.com/marketplace/pp/prodview-jfvmee7a7vaw4). The
   Marketplace container verifies entitlement once at startup (AWS
   `RegisterUsage`) and fails closed if the copy is not entitled; the OSS image
-  has no such check and runs unrestricted.
-- **AWS Marketplace — AMI (EC2)** — the same binary as a Graviton/arm64 AMI,
-  metered by AWS per instance-hour (no entitlement code), for high-throughput
-  or VM-based deployments →
+  has no such check and runs unrestricted. Use the OSS image/root Dockerfile or
+  AMI if you need the optional `ruby` filter.
+- **AWS Marketplace — AMI (EC2)** — the default no-Ruby binary as a
+  Graviton/arm64 AMI, metered by AWS per instance-hour (no entitlement code),
+  for high-throughput or VM-based deployments →
   [listing](https://aws.amazon.com/marketplace/pp/prodview-k7a5mm7shs6wa).
 
 ## Quick start
@@ -405,14 +414,17 @@ cargo build --release
 # Validate a config without running it
 ./target/release/ferro-stash --config.test_and_exit -f config/example.conf
 
-# Enable the metrics API
+# Enable the metrics API on loopback
 ./target/release/ferro-stash -f config/example.conf --api.enabled --api.http.host 127.0.0.1:9600
 ```
 
 The CLI mirrors Logstash flag names (`-f`/`--path.config`,
 `-e`/`--config.string`, `-w`/`--pipeline.workers`,
 `-b`/`--pipeline.batch.size`, `--log.level`, `--config.reload.automatic`,
-etc.).
+etc.). The monitoring API exposes unauthenticated read-only stats for Logstash
+compatibility; keep it on loopback or a trusted network. Runtime log-level
+changes via `PUT /_node/logging` are off by default and require
+`--api.runtime_logging.enabled=true`.
 
 ### Logstash DSL example
 
@@ -622,9 +634,9 @@ Data sources → FerroStash → FerroSearch → Applications
   conditionals, hash/array literals, interpolation, field references) is
   supported; exotic operators and unusual array-indexing forms are not
   exhaustively covered.
-- **Ruby filter is slower than JRuby and depends on a local fork.** See
-  the Ruby/Artichoke section. The fork is a path dependency with no
-  in-repo pin or vendored copy.
+- **Ruby filter is slower than JRuby and depends on a maintained fork.** See
+  the Ruby/Artichoke section. The fork is pulled as a rev-pinned git dependency
+  and is optional/off by default.
 - **Enterprise features absent.** No centralized/Kibana management, no
   X-Pack security, no keystore. A persistent queue and DLQ exist in the
   core crate but are not a full Logstash-parity feature set.

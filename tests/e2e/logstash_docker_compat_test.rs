@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Side-by-side regression harness — ferro-stash vs Logstash 8.x reference.
+//! Side-by-side regression harness — ferro-stash vs Logstash 9.4.2 reference.
 //!
 //! Each fixture under `tests/logstash-compat/fixtures/<name>/` carries a
 //! `pipeline.conf`, an `input.txt`, and a hand-curated `expected.json`.
 //! For the docker compat test we additionally drive **the same pipeline
-//! and the same input** through the upstream Logstash 8.x docker image
+//! and the same input** through the upstream Logstash 9.4.2 docker image
 //! and compare the two output sets event-by-event.
 //!
 //! The point is not byte-equality of `@timestamp`, `host`, or `@version`
@@ -15,7 +15,7 @@
 //! ## Status
 //!
 //! All tests are `#[ignore]` because they require:
-//!   1. `docker` available + the Logstash 8.x image pulled
+//!   1. `docker` available + the Logstash 9.4.2 image pulled
 //!      (`docker pull docker.elastic.co/logstash/logstash:9.4.2`)
 //!   2. The `ferro-stash` binary built (`cargo build --bin ferro-stash`)
 //!
@@ -162,7 +162,7 @@ fn run_ferro(pipeline_conf: &str, input: &[u8]) -> Result<Vec<Map<String, Value>
     Ok(parse_events(&String::from_utf8_lossy(&output.stdout)))
 }
 
-/// Run the upstream Logstash 8.x docker image with the same pipeline + input.
+/// Run the upstream Logstash 9.4.2 docker image with the same pipeline + input.
 fn run_logstash(pipeline_conf: &str, input: &[u8]) -> Result<Vec<Map<String, Value>>, String> {
     let mut child = Command::new("docker")
         .args([
@@ -352,79 +352,79 @@ fn run_fixture(name: &str) {
 // ----- one #[test] per fixture so cargo test reports per-fixture status -----
 
 #[test]
-#[ignore = "requires docker + Logstash 8.x image (cargo test --ignored logstash_compat)"]
+#[ignore = "requires docker + Logstash 9.4.2 image (cargo test --ignored logstash_compat)"]
 fn logstash_compat_passthrough() {
     run_fixture("passthrough");
 }
 
 #[test]
-#[ignore = "requires docker + Logstash 8.x image (cargo test --ignored logstash_compat)"]
+#[ignore = "requires docker + Logstash 9.4.2 image (cargo test --ignored logstash_compat)"]
 fn logstash_compat_grok_syslog() {
     run_fixture("grok_syslog");
 }
 
 #[test]
-#[ignore = "requires docker + Logstash 8.x image (cargo test --ignored logstash_compat)"]
+#[ignore = "requires docker + Logstash 9.4.2 image (cargo test --ignored logstash_compat)"]
 fn logstash_compat_json_parse() {
     run_fixture("json_parse");
 }
 
 #[test]
-#[ignore = "requires docker + Logstash 8.x image (cargo test --ignored logstash_compat)"]
+#[ignore = "requires docker + Logstash 9.4.2 image (cargo test --ignored logstash_compat)"]
 fn logstash_compat_mutate_basic() {
     run_fixture("mutate_basic");
 }
 
 #[test]
-#[ignore = "requires docker + Logstash 8.x image (cargo test --ignored logstash_compat)"]
+#[ignore = "requires docker + Logstash 9.4.2 image (cargo test --ignored logstash_compat)"]
 fn logstash_compat_kv_extract() {
     run_fixture("kv_extract");
 }
 
 #[test]
-#[ignore = "requires docker + Logstash 8.x image (cargo test --ignored logstash_compat)"]
+#[ignore = "requires docker + Logstash 9.4.2 image (cargo test --ignored logstash_compat)"]
 fn logstash_compat_dissect_pipe() {
     run_fixture("dissect_pipe");
 }
 
 #[test]
-#[ignore = "requires docker + Logstash 8.x image (cargo test --ignored logstash_compat)"]
+#[ignore = "requires docker + Logstash 9.4.2 image (cargo test --ignored logstash_compat)"]
 fn logstash_compat_fingerprint_sha256() {
     run_fixture("fingerprint_sha256");
 }
 
 #[test]
-#[ignore = "requires docker + Logstash 8.x image (cargo test --ignored logstash_compat)"]
+#[ignore = "requires docker + Logstash 9.4.2 image (cargo test --ignored logstash_compat)"]
 fn logstash_compat_drop_conditional() {
     run_fixture("drop_conditional");
 }
 
 #[test]
-#[ignore = "requires docker + Logstash 8.x image (cargo test --ignored logstash_compat)"]
+#[ignore = "requires docker + Logstash 9.4.2 image (cargo test --ignored logstash_compat)"]
 fn logstash_compat_dissect_skip() {
     run_fixture("dissect_skip");
 }
 
 #[test]
-#[ignore = "requires docker + Logstash 8.x image (cargo test --ignored logstash_compat)"]
+#[ignore = "requires docker + Logstash 9.4.2 image (cargo test --ignored logstash_compat)"]
 fn logstash_compat_conditional_branch() {
     run_fixture("conditional_branch");
 }
 
 #[test]
-#[ignore = "requires docker + Logstash 8.x image (cargo test --ignored logstash_compat)"]
+#[ignore = "requires docker + Logstash 9.4.2 image (cargo test --ignored logstash_compat)"]
 fn logstash_compat_unicode_grok() {
     run_fixture("unicode_grok");
 }
 
 #[test]
-#[ignore = "requires docker + Logstash 8.x image (cargo test --ignored logstash_compat)"]
+#[ignore = "requires docker + Logstash 9.4.2 image (cargo test --ignored logstash_compat)"]
 fn logstash_compat_malformed_json() {
     run_fixture("malformed_json");
 }
 
 #[test]
-#[ignore = "requires docker + Logstash 8.x image (cargo test --ignored logstash_compat)"]
+#[ignore = "requires docker + Logstash 9.4.2 image (cargo test --ignored logstash_compat)"]
 fn logstash_compat_date_iso8601() {
     // Wave 5.3 divergence #1 closed: `date` target now formats as
     // `%Y-%m-%dT%H:%M:%S%.3fZ` to match Logstash's `LogStash::Timestamp`

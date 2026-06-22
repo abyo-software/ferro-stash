@@ -191,9 +191,9 @@ cargo test -p ferro-stash-e2e --test logstash_docker_compat_test \
 
 `--test-threads=1` is recommended: each fixture spawns a fresh JVM via
 `docker run --rm -i`, and serialising avoids the ~3 GB peak RSS spikes
-otherwise. Each fixture pays a Logstash cold-start (~7–12 s), so the full
-24-fixture docker suite takes several minutes; the in-process
-`logstash_compat_test` (no Docker) runs the same fixtures in milliseconds.
+otherwise. Each fixture pays a Logstash cold-start (~7–12 s), so the Docker
+subset takes several minutes; the in-process `logstash_compat_test` (no Docker)
+runs all 24 fixtures in milliseconds.
 
 ### Comparison policy (docker harness)
 
@@ -208,11 +208,11 @@ otherwise. Each fixture pays a Logstash cold-start (~7–12 s), so the full
 
 ### Known divergences
 
-None as of 2026-06-20. The 24 bundled fixtures cover stdin input, ~17 filter
-plugins (grok, dissect, json, kv, mutate, date, translate, csv, truncate,
-split, clone, urldecode, fingerprint, drop, conditionals), and stdout JSON
-output. They produce **byte-identical event payloads** between Logstash 9.4.2
-and ferro-stash 1.0.0, modulo the runtime-only fields above.
+None as of 2026-06-20 for the expected fields covered by the fixtures. The 24
+bundled fixtures cover stdin input, ~17 filter plugins (grok, dissect, json, kv,
+mutate, date, translate, csv, truncate, split, clone, urldecode, fingerprint,
+drop, conditionals), and stdout JSON output. They match Logstash 9.4.2 for
+expected event fields, modulo the runtime-only fields above.
 
 This does *not* substantiate full Logstash compat — it substantiates
 the surface tested (43 of 165+ Logstash plugins implemented; the

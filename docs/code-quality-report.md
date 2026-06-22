@@ -1,16 +1,16 @@
 # Ferro-Stash Code Quality Report
 
-Generated: 2026-04-15. Counts re-verified against source: 2026-06-18.
+Generated: 2026-04-15. Counts re-verified against source: 2026-06-22.
 
 ## Static Analysis
 
-| Check | Status (2026-06-18) |
+| Check | Status (2026-06-22) |
 |-------|--------|
-| `cargo clippy --workspace -- -D warnings` | 0 warnings (the `clippy::pedantic` group is set to `allow` under Rust 1.95; `unwrap_used` kept `deny`) |
-| `cargo fmt --check` | Clean |
+| `cargo clippy --all-targets` | 0 warnings (the `clippy::pedantic` group is set to `allow` under Rust 1.95; `unwrap_used` kept `deny`) |
+| `cargo fmt --all -- --check` | Clean |
 | `unsafe_code` | `deny` workspace-wide, `allow` override in 2 crates (see below) |
 | `unwrap()` in production code | enforced by `unwrap_used = "deny"` |
-| SPDX-License-Identifier headers | 119/119 `.rs` files (100%) |
+| SPDX-License-Identifier headers | Required on source files |
 
 ### unsafe_code Exception
 
@@ -35,11 +35,11 @@ cargo deny check
 
 ## Test Coverage
 
-| Metric | Value (measured 2026-06-18) |
+| Metric | Value (measured 2026-06-22) |
 |--------|-------|
-| Total tests | 1,165 passing / 16 ignored / 0 failing |
+| Total tests | 1,600+ passing / 40+ ignored / 0 failing with `cargo test --workspace` |
 | Workspace members | 10 (8 `ferro-stash-*` + `ferro-script` + `ferro-stash-e2e`) |
-| Integration / parity suites | `tests/e2e/` + `tests/logstash-compat/` (docker fixtures are `#[ignore]`) |
+| Integration / parity suites | `tests/e2e/` + `tests/logstash-compat/` (external-service and Docker fixtures are `#[ignore]`) |
 
 Run all tests:
 
@@ -67,4 +67,4 @@ All permissively licensed:
 | uuid | 1 | Apache-2.0 OR MIT |
 | dashmap | 6 | MIT |
 | crossbeam-channel | 0.5 | Apache-2.0 OR MIT |
-| artichoke-backend | path (forked) | MIT |
+| artichoke-backend / artichoke-core | rev-pinned git fork | MIT / Apache-2.0 family |
