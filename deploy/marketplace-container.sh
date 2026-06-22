@@ -224,20 +224,16 @@ long = ("FerroStash is a Rust-native, Logstash-compatible log and event pipeline
   "cargo deny supply-chain gate runs in CI, and the test suite runs 1,400+ tests "
   "with output verified against Logstash 9.4.2 expected fields across 24 parity "
   "fixtures. "
-  "Honest scope (read before you buy): FerroStash is Logstash config / pipeline "
-  "compatible, NOT a byte-identical 100 percent drop-in - coverage is plugin-level "
-  "(about 88 percent of bundled plugins), and a covered plugin may implement only "
-  "a subset of that plugin's options; a config that uses a missing plugin fails "
-  "fast at load with a clear error rather than silently dropping events. The "
-  "remaining gaps are mostly enterprise / niche connectors (for example jms, "
-  "azure_event_hubs, snmp, lumberjack, webhdfs). This is a single-developer "
-  "project with a SemVer-stable surface but NO public production deployments yet - "
-  "run it beside your existing pipeline before trusting it with irreplaceable "
-  "data. The supported deployment topology is single-node. The optional ruby "
-  "filter (Artichoke/mruby) is excluded from this container build. "
-  "This listing sells a hardened, scanned, supported distribution built from the "
-  "Apache-2.0 source at a pinned release version (a standard open-core commercial "
-  "model); the code itself stays Apache-2.0 and the listing does not relicense it.")
+  "Compatibility scope: FerroStash is Logstash config / pipeline compatible across "
+  "the covered plugin set. It is not a 100 percent drop-in - a covered plugin may "
+  "implement a subset of that plugin's options, and a config that uses an "
+  "unsupported plugin fails fast at load with a clear error rather than silently "
+  "dropping events. The remaining gaps are mostly enterprise / niche connectors "
+  "(for example jms, azure_event_hubs, snmp, lumberjack, webhdfs). The supported "
+  "topology is single-node, and the optional ruby filter (Artichoke/mruby) is "
+  "excluded from this container build. "
+  "This Marketplace product is a hardened, security-scanned distribution at a "
+  "pinned, SemVer-stable release version.")
 highlights = [
   ("Rust-native with no JVM: a single static container runs Logstash-style "
    "pipeline configs (DSL or YAML) on EKS with low memory use and fast startup."),
@@ -394,7 +390,7 @@ offer, price = sys.argv[1], sys.argv[2]
 name = "FerroStash - hourly metered container (EKS / Helm)"
 desc = ("Pay-as-you-go pricing for the FerroStash container on Amazon EKS, metered by AWS per "
   "running pod-hour at $" + price + "/hour (no annual commitment). Delivered as a Helm chart. "
-  "Apache-2.0 open-core; hardened, scanned distribution.")
+  "Hardened, security-scanned distribution at a pinned release version.")
 assert len(desc) <= 255, len(desc)
 print(json.dumps([{"ChangeType":"UpdateInformation","Entity":{"Type":"Offer@1.0","Identifier":offer},
   "DetailsDocument":{"Name":name,"Description":desc}}]))
@@ -446,11 +442,11 @@ details = {
       "separate agent runtime - that starts in milliseconds and holds tens of MB of RAM. "
       "Implements about 88 percent of the bundled Logstash 9.x plugins (98 of 111), weighted "
       "toward the parsing and filtering hot path. Optional on-disk persistent queue with "
-      "at-least-once delivery and a dead-letter queue; built-in monitoring API. Honest scope: "
-      "Logstash config / pipeline compatible, NOT a byte-identical 100 percent drop-in; a "
-      "config using a missing plugin fails fast at load. Single-developer project, single-node "
-      "topology, no public production deployments yet; the optional ruby filter is excluded "
-      "from this build. Metered per pod-hour via RegisterUsage."),
+      "at-least-once delivery and a dead-letter queue; built-in monitoring API. Compatibility: "
+      "Logstash config / pipeline compatible across the covered plugin set, not a 100 percent "
+      "drop-in; a config using an unsupported plugin fails fast at load. Single-node topology; "
+      "the optional ruby filter is excluded from this build. Metered per pod-hour via "
+      "RegisterUsage."),
   },
   "DeliveryOptions": [{
     "DeliveryOptionTitle": "FerroStash on Amazon EKS (Helm)",
