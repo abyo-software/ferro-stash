@@ -5,6 +5,66 @@ All notable changes to `ferro-stash` are documented here. The format follows
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) for the 1.x line.
 Pre-1.0 releases may introduce breaking changes between minor tags.
 
+## [1.0.2] — 2026-06-24
+
+Marketplace E2E hardening. Found by running the published
+1.0.1 container image through real Beats / file / TCP pipelines.
+
+### Fixed
+
+- **grok: compound patterns and inline named regex now actually populate
+  fields.** `%{COMBINEDAPACHELOG}`, `%{COMMONAPACHELOG}` and any other
+  pattern that expands to a regex with embedded `(?P<name>...)` groups
+  silently extracted **zero** fields in 1.0.1 — and never even tagged
+  `_grokparsefailure`. Same for inline `(?<name>regex)` syntax. The cause
+  was `compile_grok_pattern` only registering names from the top-level
+  `%{PATTERN:name}` tokens; it now reconciles against
+  `regex.capture_names()` so any named capture in the compiled regex is
+  read back. Real Logstash configs using `COMBINEDAPACHELOG` etc. went from
+  silently lossy to byte-for-byte field-equivalent.
+- **TCP input: `codec` setting is now honored.** The TCP input bypassed
+  codec resolution entirely in 1.0.1 — `codec => "json_lines"` left every
+  line as a raw string in `message`. It now decodes via the same
+  `LineCodec` helper the `exec` / `unix` / `pipe` inputs already used.
+- **TCP input: `host` field is the peer IP only, not `IP:port`.** Matches
+  Logstash's TCP input so multiple connections from one client collapse to
+  one host value (and downstream `geoip` / `dns` lookups see an actual IP).
+- **Event has `@version: "1"` and `@timestamp` in millisecond `Z` form.**
+  1.0.1 omitted `@version` (downstream tooling that filters on it silently
+  dropped or misindexed events) and emitted `@timestamp` with nanosecond
+  precision plus a `+00:00` zone offset
+  (`2026-06-23T15:14:53.874328255+00:00`). The wire form is now
+  `2026-06-23T15:14:53.874Z`, matching real Logstash output.
+- **File input: `mode => "read"` + `exit_after_read => true` now exits.**
+  Previously this hung indefinitely waiting for SIGTERM, so a
+  drain-and-stop config could never terminate cleanly.
+
+### Changed
+
+- **Binary identifies itself by name + version.** `ferro-stash --version`
+  prints `ferro-stash 1.0.2 (logstash-compat 9.4.2)` instead of the
+  trademark-ambiguous `logstash 9.4.2`; the help banner is `ferro-stash
+  [OPTIONS]` and the startup logs say `ferro-stash starting`. The
+  Logstash compatibility version is still surfaced so tooling that scrapes
+  it (Beats, dashboards) keeps working. Removed the misleading
+  `Using bundled JDK:` / `Sending Logstash logs to …` lines — neither was
+  truthful (no JDK ships in this binary).
+- **Monitoring API: real `build_sha` and `build_date`.** A new build
+  script captures the short git SHA (with a `-dirty` suffix when the tree
+  has local changes) and the build timestamp, exposed at `GET /` as
+  `build_sha`, `build_date`, and a new `ferro_stash_version` /
+  `ferro_stash_build_sha` / `ferro_stash_build_date` triad — replacing the
+  hard-coded `"ferrostash"` / `"2026-01-01"` placeholders. A Marketplace
+  buyer can now `curl /` to verify which build they actually got.
+- **Marketplace entitlement gate: specific, actionable failure messages.**
+  The fail-closed line in 1.0.1 was a single generic "entitlement could
+  not be verified" regardless of cause. It now distinguishes a definitive
+  denial (with a per-error-type hint: subscribe, fix product code, switch
+  region, run on EKS, …) from a transient failure (network/throttle, with
+  guidance to check egress / IAM / region), and surfaces the underlying
+  AWS error message via the cause chain rather than the SDK's top-level
+  "service error" wrapper.
+
 ## [1.0.0] — 2026-06-20
 
 First stable release: SemVer-stable surface (config DSL, event model, CLI

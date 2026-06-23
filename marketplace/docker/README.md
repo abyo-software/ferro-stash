@@ -19,12 +19,20 @@ Always build with attestations OFF and a single platform, from the **repo root**
 (the build context is the whole workspace):
 
 ```bash
-TAG=709825985650.dkr.ecr.us-east-1.amazonaws.com/abyo-software/ferro-stash:1.0.0
+TAG=709825985650.dkr.ecr.us-east-1.amazonaws.com/abyo-software/ferro-stash-container:1.0.2
 docker build \
   --provenance=false --sbom=false --platform linux/amd64 \
+  --build-arg FERROSTASH_BUILD_SHA="$(git rev-parse --short=12 HEAD)" \
+  --build-arg FERROSTASH_BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   -f marketplace/docker/Dockerfile.marketplace \
   -t "$TAG" .
 ```
+
+The two `--build-arg`s feed the build script (`crates/ferro-stash-cli/build.rs`)
+so the monitoring API and `--version` line carry the actual commit + build
+timestamp, not the `unknown` placeholder. `.git/` is `.dockerignore`d (its size
+inflates the build context), so without these the in-container build cannot
+shell out to git.
 
 Verify it is a single manifest (NOT an index) before pushing:
 

@@ -66,6 +66,22 @@ RUN apt-get update \
 WORKDIR /build
 COPY . /build
 
+# Build provenance: .git/ is excluded by .dockerignore (it would blow up the
+# build context), so the build.rs git-rev-parse fallback prints "unknown" inside
+# the container. Pass the SHA + date in as build args, exported as env vars the
+# build.rs reads first, so the monitoring API and `--version` carry the real
+# commit a Marketplace buyer can match against the changelog.
+#
+#   docker build \
+#     --build-arg FERROSTASH_BUILD_SHA=$(git rev-parse --short=12 HEAD) \
+#     --build-arg FERROSTASH_BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+#     --provenance=false --sbom=false --platform linux/amd64 \
+#     -f marketplace/docker/Dockerfile.marketplace -t <tag> .
+ARG FERROSTASH_BUILD_SHA=unknown
+ARG FERROSTASH_BUILD_DATE=unknown
+ENV FERROSTASH_BUILD_SHA=${FERROSTASH_BUILD_SHA}
+ENV FERROSTASH_BUILD_DATE=${FERROSTASH_BUILD_DATE}
+
 # Release build of the CLI with the Marketplace entitlement gate. The `ruby`
 # feature is intentionally NOT enabled.
 RUN cargo build --release --bin ferro-stash --features marketplace \

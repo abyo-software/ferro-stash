@@ -2158,7 +2158,7 @@ checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
 name = "ferro-script"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "cranelift",
  "cranelift-jit",
@@ -2174,7 +2174,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-stash"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -2206,7 +2206,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-stash-codec"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "bytes",
  "chrono",
@@ -2226,7 +2226,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-stash-config"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "criterion",
  "ferro-stash-core",
@@ -2243,7 +2243,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-stash-core"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "async-channel",
  "async-trait",
@@ -2276,7 +2276,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-stash-e2e"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "ferro-stash-config",
  "ferro-stash-core",
@@ -2287,7 +2287,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-stash-filter"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "async-trait",
  "base64",
@@ -2322,7 +2322,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-stash-input"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -2360,7 +2360,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-stash-output"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -2395,7 +2395,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-stash-ruby"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "artichoke-backend",
  "artichoke-core",
