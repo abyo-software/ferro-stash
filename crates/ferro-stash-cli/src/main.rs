@@ -37,10 +37,32 @@ const LOGSTASH_COMPAT_VERSION: &str = match option_env!("LOGSTASH_COMPAT_VERSION
 // CLI definition — Logstash-compatible flags
 // ---------------------------------------------------------------------------
 
+/// The product's own version string. Identifies the build to operators and to
+/// the AWS Marketplace buyer who runs `--version`/`curl /` to confirm they
+/// installed the right artifact. Logstash compatibility is reported separately
+/// (`LOGSTASH_COMPAT_VERSION`) so tooling that scrapes `9.4.2` still works.
+pub(crate) const FERROSTASH_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Short git SHA of the source tree the binary was built from, or `"unknown"`
+/// when the build script could not consult git (e.g. a vendored tarball). A
+/// `-dirty` suffix means the working tree had local modifications.
+pub(crate) const FERROSTASH_BUILD_SHA: &str = env!("FERROSTASH_BUILD_SHA");
+
+/// RFC3339 UTC timestamp captured when the binary was built. Replaces the
+/// prior `"2026-01-01T00:00:00Z"` placeholder in the monitoring API.
+pub(crate) const FERROSTASH_BUILD_DATE: &str = env!("FERROSTASH_BUILD_DATE");
+
+/// Format the `ferro-stash --version` / monitoring-API version line.
+/// Keeps the Logstash-compat marker visible so existing tooling still sees a
+/// recognisable Logstash version.
+fn ferrostash_version_line() -> String {
+    format!("ferro-stash {FERROSTASH_VERSION} (logstash-compat {LOGSTASH_COMPAT_VERSION})")
+}
+
 #[derive(Parser)]
 #[command(
-    name = "logstash",
-    about = "bin/logstash [OPTIONS]",
+    name = "ferro-stash",
+    about = "ferro-stash [OPTIONS]",
     long_about = None,
     disable_version_flag = true,
     disable_help_flag = true,
@@ -566,7 +588,7 @@ async fn main() -> Result<()> {
 
     // --version
     if cli.version {
-        println!("logstash {LOGSTASH_COMPAT_VERSION}");
+        println!("{}", ferrostash_version_line());
         return Ok(());
     }
 
@@ -577,7 +599,7 @@ async fn main() -> Result<()> {
                 return run_config_test(config);
             }
             Commands::Version => {
-                println!("logstash {LOGSTASH_COMPAT_VERSION}");
+                println!("{}", ferrostash_version_line());
                 return Ok(());
             }
         }
@@ -601,8 +623,14 @@ async fn main() -> Result<()> {
     // Instance ID
     let instance_id = get_or_create_instance_id(&path_data);
 
-    // Logstash-compatible startup messages
-    println!("Using bundled JDK:");
+    // Startup banner. Identifies the binary by its own name + version while
+    // keeping the Logstash compatibility marker visible (operators / tooling
+    // that grep for "9.4.2" still match). Prior builds printed
+    // "Using bundled JDK:" and "Sending Logstash logs to ..." which both
+    // misrepresented the runtime (no JVM ships in this binary) and made the
+    // product indistinguishable from upstream Logstash for an AWS Marketplace
+    // buyer trying to verify provenance.
+    println!("{}", ferrostash_version_line());
 
     // Initialize logging
     let filter = EnvFilter::try_new(&cli.log_level).unwrap_or_else(|_| EnvFilter::new("info"));
@@ -618,7 +646,7 @@ async fn main() -> Result<()> {
             .to_string()
     });
     let _ = std::fs::create_dir_all(&log_dir);
-    println!("Sending Logstash logs to {log_dir}/logstash-plain.log");
+    println!("Sending ferro-stash logs to {log_dir}/ferro-stash.log");
 
     // --config.test_and_exit
     if cli.config_test_and_exit {
@@ -640,7 +668,11 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    info!(version = LOGSTASH_COMPAT_VERSION, "Logstash starting");
+    info!(
+        ferro_stash_version = FERROSTASH_VERSION,
+        logstash_compat = LOGSTASH_COMPAT_VERSION,
+        "ferro-stash starting"
+    );
 
     // Check for multi-pipeline mode (pipelines.yml in path.settings)
     let pipelines_yml = cli
@@ -1196,7 +1228,7 @@ fn load_config(path: &str) -> Result<Config> {
 }
 
 fn print_logstash_help() {
-    println!("bin/logstash [OPTIONS]");
+    println!("ferro-stash [OPTIONS]");
     println!();
     println!("Options:");
     println!("  -f, --path.config CONFIG          Path to pipeline configuration file(s)");

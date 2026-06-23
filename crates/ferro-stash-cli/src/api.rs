@@ -242,7 +242,15 @@ async fn root(State(state): State<ApiState>) -> impl IntoResponse {
     let body = serde_json::json!({
         "host": hostname::get()
             .map_or_else(|_| "unknown".to_string(), |h| h.to_string_lossy().to_string()),
+        // `version` keeps the Logstash compatibility string so tooling that
+        // scrapes a numeric Logstash version (Filebeat, Metricbeat, dashboards)
+        // still matches. The product's own SemVer is exposed alongside via
+        // `ferro_stash_version` so a Marketplace buyer can verify which build
+        // they actually got from a single `curl /`.
         "version": super::LOGSTASH_COMPAT_VERSION,
+        "ferro_stash_version": super::FERROSTASH_VERSION,
+        "ferro_stash_build_sha": super::FERROSTASH_BUILD_SHA,
+        "ferro_stash_build_date": super::FERROSTASH_BUILD_DATE,
         "http_address": "127.0.0.1:9600",
         "id": state.instance_id,
         "name": hostname::get()
@@ -255,6 +263,11 @@ async fn root(State(state): State<ApiState>) -> impl IntoResponse {
             "batch_size": 500,
             "batch_delay": 5000,
         },
+        // No JVM ships in this binary, but Logstash clients (Metricbeat, Kibana
+        // monitoring UI) reach for `jvm.*` keys at the root. We expose a
+        // truthful stub: `vm_vendor` names the runtime, `version` reports a
+        // recognisable JVM version string (so probes that parse it don't choke),
+        // and the heap counters stay zero because there is no heap.
         "jvm": {
             "pid": std::process::id(),
             "version": "21.0.0",
@@ -264,8 +277,10 @@ async fn root(State(state): State<ApiState>) -> impl IntoResponse {
                 "heap_max_in_bytes": 0,
             }
         },
-        "build_date": "2026-01-01T00:00:00Z",
-        "build_sha": "ferrostash",
+        // Build provenance — real values from the build script, not the
+        // hard-coded "ferrostash" / "2026-01-01" placeholders shipped in 1.0.1.
+        "build_date": super::FERROSTASH_BUILD_DATE,
+        "build_sha": super::FERROSTASH_BUILD_SHA,
         "build_snapshot": false,
     });
     // Logstash returns 200 with content-type application/json

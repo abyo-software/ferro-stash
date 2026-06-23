@@ -111,6 +111,21 @@ pub(crate) enum Outcome {
     Transient,
 }
 
+/// Specific reason behind a `NotEntitled` outcome, kept SDK-free so we can
+/// surface an actionable hint to the operator without leaking the verbose
+/// AWS error display into a buyer-facing message. `Other` is a catch-all for
+/// new modeled errors AWS may add later (the enum is `#[non_exhaustive]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DenialReason {
+    CustomerNotEntitled,
+    InvalidProductCode,
+    InvalidPublicKeyVersion,
+    InvalidRegion,
+    PlatformNotSupported,
+    DisabledApi,
+    Other,
+}
+
 /// What the process should do, derived purely from an [`Outcome`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Decision {
@@ -143,6 +158,56 @@ fn outcome_for_product_code(product_code: Option<&str>) -> Option<Outcome> {
     }
 }
 
+/// Outcome of one full RegisterUsage attempt sequence — the [`Outcome`]
+/// category plus diagnostic context (the specific denial reason for a
+/// definitive denial, or the last error string for a transient failure) so
+/// the fail-closed message can tell the operator *what* to fix rather than
+/// printing the same generic "could not be verified" line for every failure
+/// mode (1.0.1 buyer-UX gap).
+struct RegisterResult {
+    outcome: Outcome,
+    /// Set only when `outcome == NotEntitled`.
+    denial: Option<DenialReason>,
+    /// The most recent SDK error string (any outcome that wasn't immediate
+    /// success). Truncated for log hygiene.
+    last_error: Option<String>,
+}
+
+/// Operator-facing hint for a specific denial reason. Stays short, actionable,
+/// and free of AWS SDK jargon — these strings appear in the buyer's pod logs.
+fn denial_hint(reason: DenialReason) -> &'static str {
+    match reason {
+        DenialReason::CustomerNotEntitled => {
+            "this AWS account is not subscribed to the product. \
+             Subscribe in AWS Marketplace and retry."
+        }
+        DenialReason::InvalidProductCode => {
+            "the configured FERROSTASH_MARKETPLACE_PRODUCT_CODE is not a \
+             valid Marketplace product code for this listing. \
+             Check the Helm chart's marketplace.productCode value."
+        }
+        DenialReason::InvalidPublicKeyVersion => {
+            "the RegisterUsage public-key version is not accepted (AWS \
+             today defines only version 1). Upgrade ferro-stash."
+        }
+        DenialReason::InvalidRegion => {
+            "this AWS region is not supported for the listing. \
+             Set AWS_REGION to a region the product is published in \
+             (see the listing's region availability)."
+        }
+        DenialReason::PlatformNotSupported => {
+            "the runtime platform is not eligible for AWS Marketplace \
+             metering (the container must run on Amazon EKS with IRSA \
+             or Pod Identity granting aws-marketplace:RegisterUsage)."
+        }
+        DenialReason::DisabledApi => "AWS Marketplace Metering API is disabled for this account.",
+        DenialReason::Other => {
+            "AWS Marketplace returned a definitive denial. See the error \
+             line above for the AWS error code."
+        }
+    }
+}
+
 /// Entry point: run the entitlement gate, exiting the process non-zero if this
 /// copy is definitively not entitled. Called once at the very start of `main`.
 pub async fn check_entitlement_or_exit() {
@@ -158,9 +223,9 @@ pub async fn check_entitlement_or_exit() {
     let product_code = product_code.unwrap_or_default();
     let product_code = product_code.trim();
 
-    let outcome = register_usage(product_code).await;
-    match decide(outcome) {
-        Decision::Continue => match outcome {
+    let result = register_usage(product_code).await;
+    match decide(result.outcome) {
+        Decision::Continue => match result.outcome {
             Outcome::Entitled => {
                 eprintln!(
                     "ferro-stash: marketplace entitlement verified (RegisterUsage succeeded)"
@@ -177,27 +242,54 @@ pub async fn check_entitlement_or_exit() {
             Outcome::Unset | Outcome::NotEntitled | Outcome::Transient => {}
         },
         Decision::FailClosed => {
-            eprintln!(
-                "ferro-stash: marketplace entitlement check FAILED: entitlement could not be \
-                 verified. Exiting. Subscribe to the product in AWS Marketplace and ensure the pod \
-                 has the correct product code, AWS credentials/region, and network access to AWS \
-                 Marketplace Metering."
-            );
+            // Distinguish a *definitive* denial (operator must change subscription /
+            // config) from an *inconclusive* failure (network/throttle, retry-able).
+            // The 1.0.1 build collapsed both into a single generic line, leaving
+            // the operator guessing whether to subscribe, fix env vars, or check
+            // egress.
+            match result.outcome {
+                Outcome::NotEntitled => {
+                    let reason = result.denial.unwrap_or(DenialReason::Other);
+                    eprintln!(
+                        "ferro-stash: marketplace entitlement check FAILED (denied: {reason:?}): {hint} \
+                         AWS error: {err}",
+                        hint = denial_hint(reason),
+                        err = result.last_error.as_deref().unwrap_or("<no detail>"),
+                    );
+                }
+                Outcome::Transient => {
+                    eprintln!(
+                        "ferro-stash: marketplace entitlement check FAILED (could not reach AWS \
+                         Marketplace Metering after {MAX_ATTEMPTS} attempts). Verify the pod has \
+                         egress to *.marketplacemetering.amazonaws.com on 443, AWS credentials \
+                         (IRSA / Pod Identity) with aws-marketplace:RegisterUsage, and a valid \
+                         AWS_REGION. Last error: {err}",
+                        err = result.last_error.as_deref().unwrap_or("<no detail>"),
+                    );
+                }
+                // Decision::FailClosed only fires for NotEntitled / Transient.
+                Outcome::Unset | Outcome::Entitled => unreachable!(),
+            }
             std::process::exit(NOT_ENTITLED_EXIT_CODE);
         }
     }
 }
 
 /// Call AWS Marketplace Metering `RegisterUsage` (with a bounded retry on
-/// transient failures) and reduce the result to an [`Outcome`].
-async fn register_usage(product_code: &str) -> Outcome {
+/// transient failures) and reduce the result to a [`RegisterResult`] —
+/// outcome + the most-specific denial reason + a short rendering of the
+/// triggering SDK error, so the caller can build an actionable fail-closed
+/// message instead of the generic "could not be verified" line that 1.0.1
+/// shipped.
+async fn register_usage(product_code: &str) -> RegisterResult {
     use aws_sdk_marketplacemetering::error::SdkError;
 
     // Region + credentials come from the standard AWS provider chain.
     let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
     let client = aws_sdk_marketplacemetering::Client::new(&config);
 
-    let mut last = Outcome::Transient;
+    let mut last_outcome = Outcome::Transient;
+    let mut last_error: Option<String> = None;
     for attempt in 1..=MAX_ATTEMPTS {
         match client
             .register_usage()
@@ -206,23 +298,39 @@ async fn register_usage(product_code: &str) -> Outcome {
             .send()
             .await
         {
-            Ok(_) => return Outcome::Entitled,
+            Ok(_) => {
+                return RegisterResult {
+                    outcome: Outcome::Entitled,
+                    denial: None,
+                    last_error: None,
+                };
+            }
             Err(err) => {
                 // An SdkError is either a modeled service error (which carries an
                 // entitlement verdict) or a transport-level failure (timeout,
                 // dispatch, response parse) which is always inconclusive.
-                let outcome = match &err {
-                    SdkError::ServiceError(ctx) => classify_service_error(ctx.err()),
-                    _ => Outcome::Transient,
+                let (outcome, denial) = match &err {
+                    SdkError::ServiceError(ctx) => {
+                        let denial = denial_reason_for(ctx.err());
+                        let outcome = classify_service_error(ctx.err());
+                        (outcome, denial)
+                    }
+                    _ => (Outcome::Transient, None),
                 };
+                last_error = Some(short_err(&err));
                 // A definitive denial is final — never retry it into a "maybe".
                 if outcome == Outcome::NotEntitled {
+                    let reason = denial.unwrap_or(DenialReason::Other);
                     eprintln!(
-                        "ferro-stash: RegisterUsage returned a definitive not-entitled error: {err}"
+                        "ferro-stash: RegisterUsage returned a definitive denial ({reason:?}): {err}"
                     );
-                    return Outcome::NotEntitled;
+                    return RegisterResult {
+                        outcome: Outcome::NotEntitled,
+                        denial: Some(reason),
+                        last_error,
+                    };
                 }
-                last = outcome;
+                last_outcome = outcome;
                 if attempt < MAX_ATTEMPTS {
                     let backoff = Duration::from_millis(500 * u64::from(attempt));
                     eprintln!(
@@ -234,7 +342,64 @@ async fn register_usage(product_code: &str) -> Outcome {
             }
         }
     }
-    last
+    RegisterResult {
+        outcome: last_outcome,
+        denial: None,
+        last_error,
+    }
+}
+
+/// Render an SDK error to a single short line for log/UX use.
+///
+/// `SdkError`'s top-level `Display` is just "service error" / "dispatch
+/// failure" with no detail — useless on its own. The actual error message
+/// (e.g. "You are not subscribed", a region name, a credential failure
+/// reason) lives in the cause chain. We walk `source()` to surface the
+/// deepest "; cause: …" link, trimmed for log hygiene so a fail-closed line
+/// stays readable in `kubectl logs` / CloudWatch UI.
+fn short_err<E>(err: &E) -> String
+where
+    E: std::error::Error,
+{
+    const MAX: usize = 320;
+    let mut parts = vec![err.to_string()];
+    let mut src: Option<&dyn std::error::Error> = err.source();
+    let mut seen = 0;
+    while let Some(e) = src {
+        parts.push(e.to_string());
+        src = e.source();
+        seen += 1;
+        if seen >= 4 {
+            // Defensive cap: deep cause chains do exist (transport → tls →
+            // io) but four levels is plenty of context without flooding logs.
+            break;
+        }
+    }
+    let s = parts.join(": ");
+    if s.len() <= MAX {
+        s
+    } else {
+        format!("{}... [truncated]", &s[..MAX])
+    }
+}
+
+/// Map a modeled RegisterUsage service error to its [`DenialReason`] only when
+/// the error is in the "definitive denial" set; returns `None` for transient
+/// service errors (those have no operator-facing denial reason).
+fn denial_reason_for(
+    err: &aws_sdk_marketplacemetering::operation::register_usage::RegisterUsageError,
+) -> Option<DenialReason> {
+    use aws_sdk_marketplacemetering::operation::register_usage::RegisterUsageError as E;
+    match err {
+        E::CustomerNotEntitledException(_) => Some(DenialReason::CustomerNotEntitled),
+        E::InvalidProductCodeException(_) => Some(DenialReason::InvalidProductCode),
+        E::InvalidPublicKeyVersionException(_) => Some(DenialReason::InvalidPublicKeyVersion),
+        E::InvalidRegionException(_) => Some(DenialReason::InvalidRegion),
+        E::PlatformNotSupportedException(_) => Some(DenialReason::PlatformNotSupported),
+        E::DisabledApiException(_) => Some(DenialReason::DisabledApi),
+        // Transient (Internal/Throttling) or future variants: no denial reason.
+        _ => None,
+    }
 }
 
 /// Map a modeled `RegisterUsage` service error to an [`Outcome`].
@@ -515,6 +680,150 @@ mod tests {
     fn present_product_code_triggers_the_call() {
         // None => "go make the live RegisterUsage call".
         assert_eq!(outcome_for_product_code(Some("abc123productcode")), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Denial-reason classification + hints (fail-closed message specificity)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn denial_reason_for_each_modeled_denial_variant() {
+        use aws_sdk_marketplacemetering::operation::register_usage::RegisterUsageError;
+        use aws_sdk_marketplacemetering::types::error::{
+            CustomerNotEntitledException, DisabledApiException, InvalidProductCodeException,
+            InvalidPublicKeyVersionException, InvalidRegionException,
+            PlatformNotSupportedException,
+        };
+
+        let cases: Vec<(RegisterUsageError, DenialReason)> = vec![
+            (
+                RegisterUsageError::CustomerNotEntitledException(
+                    CustomerNotEntitledException::builder().build(),
+                ),
+                DenialReason::CustomerNotEntitled,
+            ),
+            (
+                RegisterUsageError::InvalidProductCodeException(
+                    InvalidProductCodeException::builder().build(),
+                ),
+                DenialReason::InvalidProductCode,
+            ),
+            (
+                RegisterUsageError::InvalidPublicKeyVersionException(
+                    InvalidPublicKeyVersionException::builder().build(),
+                ),
+                DenialReason::InvalidPublicKeyVersion,
+            ),
+            (
+                RegisterUsageError::InvalidRegionException(
+                    InvalidRegionException::builder().build(),
+                ),
+                DenialReason::InvalidRegion,
+            ),
+            (
+                RegisterUsageError::PlatformNotSupportedException(
+                    PlatformNotSupportedException::builder().build(),
+                ),
+                DenialReason::PlatformNotSupported,
+            ),
+            (
+                RegisterUsageError::DisabledApiException(DisabledApiException::builder().build()),
+                DenialReason::DisabledApi,
+            ),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(
+                denial_reason_for(&err),
+                Some(expected),
+                "denial classification mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn denial_reason_none_for_transient_service_errors() {
+        use aws_sdk_marketplacemetering::operation::register_usage::RegisterUsageError;
+        use aws_sdk_marketplacemetering::types::error::{
+            InternalServiceErrorException, ThrottlingException,
+        };
+        assert!(denial_reason_for(&RegisterUsageError::ThrottlingException(
+            ThrottlingException::builder().build()
+        ))
+        .is_none());
+        assert!(
+            denial_reason_for(&RegisterUsageError::InternalServiceErrorException(
+                InternalServiceErrorException::builder().build()
+            ))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn denial_hint_text_is_actionable_for_every_reason() {
+        // Each denial reason gets a non-empty operator-facing hint. Future
+        // additions to DenialReason MUST add a hint here too (the compiler
+        // will surface a missing arm via the `match` in `denial_hint`).
+        for reason in [
+            DenialReason::CustomerNotEntitled,
+            DenialReason::InvalidProductCode,
+            DenialReason::InvalidPublicKeyVersion,
+            DenialReason::InvalidRegion,
+            DenialReason::PlatformNotSupported,
+            DenialReason::DisabledApi,
+            DenialReason::Other,
+        ] {
+            let hint = denial_hint(reason);
+            assert!(!hint.is_empty(), "empty hint for {reason:?}");
+            // No mention of generic "could not be verified" — that was the
+            // 1.0.1 buyer-UX gap we're fixing.
+            assert!(
+                !hint.contains("could not be verified"),
+                "{reason:?} hint must be specific, not the old generic message"
+            );
+        }
+    }
+
+    #[test]
+    fn short_err_surfaces_cause_chain_not_just_top_display() {
+        // SdkError::Display alone is unhelpful ("service error" / "dispatch
+        // failure"); short_err must reach the deepest source for the real
+        // reason. Use a hand-built chained error to keep the test SDK-free.
+        #[derive(Debug)]
+        struct Wrapper {
+            msg: &'static str,
+            cause: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
+        }
+        impl std::fmt::Display for Wrapper {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.msg)
+            }
+        }
+        impl std::error::Error for Wrapper {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.cause
+                    .as_deref()
+                    .map(|e| e as &(dyn std::error::Error + 'static))
+            }
+        }
+
+        let leaf = Wrapper {
+            msg: "AccessDeniedException: not authorized to call aws-marketplace:RegisterUsage",
+            cause: None,
+        };
+        let mid = Wrapper {
+            msg: "unhandled error",
+            cause: Some(Box::new(leaf)),
+        };
+        let top = Wrapper {
+            msg: "service error",
+            cause: Some(Box::new(mid)),
+        };
+        let rendered = short_err(&top);
+        assert!(
+            rendered.contains("AccessDeniedException")
+                && rendered.contains("aws-marketplace:RegisterUsage"),
+            "short_err must surface the leaf cause; got: {rendered}"
+        );
     }
 
     // -----------------------------------------------------------------------
