@@ -458,12 +458,30 @@ impl Event {
         &mut self.fields
     }
 
+    /// Format a chrono UTC instant the way Logstash serialises `@timestamp`:
+    /// RFC3339 with millisecond precision and a `Z` zone suffix, e.g.
+    /// `2026-06-23T15:14:53.874Z`. The default `DateTime::to_rfc3339()`
+    /// emits nanoseconds and a `+00:00` offset, which downstream consumers
+    /// (Elasticsearch index templates, Beats clients, Kibana time filters)
+    /// can misparse or sort differently from Logstash output.
+    pub fn format_logstash_timestamp(ts: &DateTime<Utc>) -> String {
+        ts.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    }
+
     /// Converts the event to a JSON Value for output.
     pub fn to_json(&self) -> serde_json::Value {
         let mut map = serde_json::Map::new();
         map.insert(
             "@timestamp".to_string(),
-            serde_json::Value::String(self.timestamp.to_rfc3339()),
+            serde_json::Value::String(Self::format_logstash_timestamp(&self.timestamp)),
+        );
+        // Every Logstash event carries `@version: "1"`. Downstream tooling
+        // (Elasticsearch index templates, Beats, dashboards filtering on
+        // @version) silently drops or misindexes events that lack it, so we
+        // always emit it.
+        map.insert(
+            "@version".to_string(),
+            serde_json::Value::String("1".to_string()),
         );
         if !self.tags.is_empty() {
             map.insert(
@@ -507,7 +525,7 @@ impl Event {
                     field_name.push(ch);
                 }
                 if field_name == "@timestamp" {
-                    result.push_str(&self.timestamp.to_rfc3339());
+                    result.push_str(&Self::format_logstash_timestamp(&self.timestamp));
                 } else if field_name == "tags" {
                     // Logstash format: tags are rendered as comma-joined
                     result.push_str(&self.tags.join(","));

@@ -12,6 +12,8 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+use crate::exec::{event_from_line, LineCodec};
+
 /// Maximum number of bytes a single line may accumulate before a newline is
 /// seen on an accepted TCP connection.
 ///
@@ -111,6 +113,7 @@ pub struct TcpInput {
     host: String,
     port: u16,
     tags: Vec<String>,
+    codec: LineCodec,
 }
 
 impl TcpInput {
@@ -145,7 +148,14 @@ impl TcpInput {
             })
             .unwrap_or_default();
 
-        Ok(Self { host, port, tags })
+        let codec = LineCodec::from_settings(settings);
+
+        Ok(Self {
+            host,
+            port,
+            tags,
+            codec,
+        })
     }
 }
 
@@ -178,7 +188,14 @@ impl InputPlugin for TcpInput {
                             debug!(peer = %peer_addr, "new TCP connection");
                             let tx = sender.clone();
                             let tags = self.tags.clone();
-                            let peer = peer_addr.to_string();
+                            // Logstash's tcp input sets `host` to the peer's hostname/IP
+                            // (no port). We use the IP so multiple connections from the
+                            // same client collapse to a single value, matching Logstash.
+                            let peer_host = peer_addr.ip().to_string();
+                            // Keep the full peer (IP:port) for log lines so an operator
+                            // can still correlate connections in error / overflow logs.
+                            let peer_log = peer_addr.to_string();
+                            let codec = self.codec;
                             tokio::spawn(async move {
                                 let mut reader = tokio::io::BufReader::new(stream);
                                 let mut buf: Vec<u8> = Vec::new();
@@ -193,10 +210,10 @@ impl InputPlugin for TcpInput {
                                         Ok(LineRead::Line) => {
                                             if let Some(line) = decode_line(&buf) {
                                                 if !line.is_empty() {
-                                                    let mut event = Event::new(&line);
+                                                    let mut event = event_from_line(&line, codec);
                                                     event.set(
                                                         "host",
-                                                        EventValue::String(peer.clone()),
+                                                        EventValue::String(peer_host.clone()),
                                                     );
                                                     for tag in &tags {
                                                         event.add_tag(tag);
@@ -211,10 +228,10 @@ impl InputPlugin for TcpInput {
                                             // Final line without a trailing newline (within cap).
                                             if let Some(line) = decode_line(&buf) {
                                                 if !line.is_empty() {
-                                                    let mut event = Event::new(&line);
+                                                    let mut event = event_from_line(&line, codec);
                                                     event.set(
                                                         "host",
-                                                        EventValue::String(peer.clone()),
+                                                        EventValue::String(peer_host.clone()),
                                                     );
                                                     for tag in &tags {
                                                         event.add_tag(tag);
@@ -226,19 +243,19 @@ impl InputPlugin for TcpInput {
                                         }
                                         Ok(LineRead::Overflow) => {
                                             warn!(
-                                                peer = %peer,
+                                                peer = %peer_log,
                                                 cap = MAX_LINE_BYTES,
                                                 "TCP line exceeds max length; dropping connection"
                                             );
                                             break;
                                         }
                                         Err(e) => {
-                                            warn!(peer = %peer, error = %e, "TCP read error");
+                                            warn!(peer = %peer_log, error = %e, "TCP read error");
                                             break;
                                         }
                                     }
                                 }
-                                debug!(peer = %peer, "TCP connection closed");
+                                debug!(peer = %peer_log, "TCP connection closed");
                             });
                         }
                         Err(e) => {
@@ -300,6 +317,84 @@ mod tests {
         let settings = serde_json::json!({ "port": 5000, "tags": ["tcp_input"] });
         let input = TcpInput::from_config(&settings).expect("config");
         assert_eq!(input.tags, vec!["tcp_input"]);
+    }
+
+    #[test]
+    fn test_tcp_config_codec_defaults_to_plain() {
+        let settings = serde_json::json!({ "port": 5000 });
+        let input = TcpInput::from_config(&settings).expect("config");
+        assert_eq!(input.codec, LineCodec::Plain);
+    }
+
+    #[test]
+    fn test_tcp_config_codec_json_and_json_lines() {
+        let s_json = TcpInput::from_config(&serde_json::json!({ "port": 5000, "codec": "json" }))
+            .expect("config json");
+        assert_eq!(s_json.codec, LineCodec::Json);
+        let s_jl =
+            TcpInput::from_config(&serde_json::json!({ "port": 5000, "codec": "json_lines" }))
+                .expect("config json_lines");
+        assert_eq!(s_jl.codec, LineCodec::Json);
+    }
+
+    /// Round-trip: send NDJSON over a real TCP socket with `codec => "json_lines"`
+    /// and verify that the JSON object's keys become top-level fields on the
+    /// event (the bug the Marketplace E2E surfaced: TCP input was emitting the
+    /// raw JSON text as `message` regardless of codec).
+    #[tokio::test]
+    async fn test_tcp_json_lines_codec_decodes_to_top_level_fields() {
+        use ferro_stash_core::shutdown::ShutdownController;
+        // Reserve an ephemeral port without holding it: bind, read, drop.
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind probe");
+        let port = probe.local_addr().expect("local_addr").port();
+        drop(probe);
+
+        let mut input = TcpInput::from_config(&serde_json::json!({
+            "host": "127.0.0.1",
+            "port": port,
+            "codec": "json_lines"
+        }))
+        .expect("config");
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let (controller, signal) = ShutdownController::new();
+        let task = tokio::spawn(async move { input.run(tx, signal).await });
+
+        // Wait until the listener is up by retrying connect briefly.
+        let mut stream = None;
+        for _ in 0..50 {
+            if let Ok(s) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+                stream = Some(s);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        use tokio::io::AsyncWriteExt;
+        let mut stream = stream.expect("connect");
+        stream
+            .write_all(b"{\"id\":42,\"msg\":\"hello\"}\n")
+            .await
+            .expect("write_all");
+        stream.flush().await.expect("flush");
+        drop(stream);
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("event timeout")
+            .expect("event");
+
+        assert_eq!(event.get("id"), Some(&EventValue::Integer(42)));
+        assert_eq!(event.get("msg"), Some(&EventValue::String("hello".into())));
+        // host is the peer IP only (no port), matching Logstash's tcp input.
+        assert_eq!(
+            event.get("host"),
+            Some(&EventValue::String("127.0.0.1".into()))
+        );
+
+        controller.shutdown();
+        let _ = task.await;
     }
 
     #[test]

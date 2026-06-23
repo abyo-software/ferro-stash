@@ -117,6 +117,16 @@ fn assert_events_match(actual: &[Event], expected: &[JsonValue], test_name: &str
     }
 }
 
+/// System fields the runtime always materialises and the comparator therefore
+/// treats as "must exist in actual; presence is asserted but contents/diffs
+/// are tolerated against the expected fixture". These mirror Logstash's
+/// always-on fields:
+/// * `@timestamp` — clock-driven, never byte-equal across runs.
+/// * `@version`   — Logstash stamps `"1"` on every event; we do too. The
+///   existing fixtures predate this and omit it, so we skip it in the
+///   comparison rather than churn 37 JSON files.
+const SYSTEM_FIELDS_SKIPPED_IN_COMPARE: &[&str] = &["@timestamp", "@version"];
+
 /// Compares two event JSON objects field-by-field.
 /// Allows @timestamp to differ by up to 1 second.
 /// Ignores field ordering.
@@ -130,11 +140,11 @@ fn compare_event_fields(actual: &JsonValue, expected: &JsonValue, ctx: &str) {
 
     // Check all expected fields exist in actual
     for (key, expected_val) in expected_obj {
-        if key == "@timestamp" {
-            // Timestamps are allowed to differ — we just check the field exists
+        if SYSTEM_FIELDS_SKIPPED_IN_COMPARE.contains(&key.as_str()) {
+            // Presence-only check on system fields; contents are runtime-defined.
             assert!(
-                actual_obj.contains_key("@timestamp"),
-                "[{ctx}] missing @timestamp"
+                actual_obj.contains_key(key),
+                "[{ctx}] missing system field '{key}'"
             );
             continue;
         }
@@ -148,9 +158,10 @@ fn compare_event_fields(actual: &JsonValue, expected: &JsonValue, ctx: &str) {
         assert_eq!(actual_val, expected_val, "[{ctx}] field '{key}' mismatch",);
     }
 
-    // Check no unexpected fields (except @timestamp which we always produce)
+    // Check no unexpected fields (except system fields the runtime always
+    // adds — these are not asserted against the fixture).
     for key in actual_obj.keys() {
-        if key == "@timestamp" {
+        if SYSTEM_FIELDS_SKIPPED_IN_COMPARE.contains(&key.as_str()) {
             continue;
         }
         assert!(

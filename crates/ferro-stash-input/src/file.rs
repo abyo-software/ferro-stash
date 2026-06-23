@@ -35,12 +35,26 @@ pub struct FileInput {
     delimiter: String,
     tags: Vec<String>,
     add_field: Vec<(String, String)>,
+    mode: Mode,
+    exit_after_read: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 enum StartPosition {
     Beginning,
     End,
+}
+
+/// Read mode, mirroring Logstash's file input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Tail mode: keep watching for new lines after EOF, the historical default.
+    Tail,
+    /// Read mode: read each file to EOF once. Combined with
+    /// [`FileInput::exit_after_read`] the input terminates as soon as every
+    /// currently-discovered file has been read, letting a finite pipeline
+    /// (`generator { count => N }`-style) shut down cleanly instead of hanging.
+    Read,
 }
 
 impl FileInput {
@@ -127,6 +141,27 @@ impl FileInput {
             })
             .unwrap_or_default();
 
+        // Read mode + exit_after_read: matches the Logstash file input's
+        // "read it once and stop" mode. `tail` (the default) keeps watching for
+        // appends after EOF. `read` walks each file to EOF once; combined with
+        // `exit_after_read => true` the input returns from `run()` as soon as
+        // every discovered file has been fully read, which the pipeline reads
+        // as "all inputs done" and shuts down cleanly. Without this, a config
+        // that says "ingest this batch and exit" hung on SIGTERM (E2E
+        // regression observed in Marketplace 1.0.1).
+        let mode = match settings
+            .get("mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("tail")
+        {
+            "read" => Mode::Read,
+            _ => Mode::Tail,
+        };
+        let exit_after_read = settings
+            .get("exit_after_read")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+
         Ok(Self {
             paths,
             exclude,
@@ -137,6 +172,8 @@ impl FileInput {
             delimiter,
             tags,
             add_field,
+            mode,
+            exit_after_read,
         })
     }
 
@@ -249,6 +286,20 @@ impl InputPlugin for FileInput {
             }
 
             self.save_sincedb(&positions);
+
+            // `mode => "read"` + `exit_after_read => true` is Logstash's
+            // "drain it and stop" mode. We've just walked every discovered
+            // file to EOF; returning from `run()` signals "input done" to the
+            // pipeline, which then drains buffers and triggers a clean
+            // shutdown. Anything else (tail mode, or `exit_after_read = false`)
+            // keeps looping in case new appends or new files arrive.
+            if self.mode == Mode::Read && self.exit_after_read {
+                info!(
+                    files = files.len(),
+                    "file input read all discovered files; exiting (mode=read, exit_after_read=true)"
+                );
+                return Ok(());
+            }
 
             // Wait before next check
             tokio::select! {
@@ -523,6 +574,66 @@ mod tests {
             }
         }
         assert_eq!(messages, vec!["line1", "line2", "line3"]);
+    }
+
+    #[test]
+    fn test_file_config_mode_defaults_to_tail() {
+        let settings = serde_json::json!({ "path": "/tmp/x.log" });
+        let input = FileInput::from_config(&settings).expect("config");
+        assert_eq!(input.mode, Mode::Tail);
+        assert!(!input.exit_after_read);
+    }
+
+    #[test]
+    fn test_file_config_mode_read_and_exit_after_read() {
+        let settings = serde_json::json!({
+            "path": "/tmp/x.log",
+            "mode": "read",
+            "exit_after_read": true
+        });
+        let input = FileInput::from_config(&settings).expect("config");
+        assert_eq!(input.mode, Mode::Read);
+        assert!(input.exit_after_read);
+    }
+
+    /// Regression: `mode => "read"` + `exit_after_read => true` must let the
+    /// input's `run()` return on its own once every discovered file has been
+    /// read. Before the fix this hung indefinitely, requiring SIGTERM, so a
+    /// `ferro-stash -f drain-batch.conf` could never exit cleanly.
+    #[tokio::test]
+    async fn test_file_run_exits_after_read_when_configured() {
+        use ferro_stash_core::shutdown::ShutdownController;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_path = dir.path().join("batch.log");
+        std::fs::write(&file_path, "a\nb\nc\n").expect("write");
+
+        let mut input = FileInput::from_config(&serde_json::json!({
+            "path": file_path.to_string_lossy().to_string(),
+            "start_position": "beginning",
+            "mode": "read",
+            "exit_after_read": true,
+            "sincedb_path": "/dev/null",
+            "discover_interval": 1
+        }))
+        .expect("config");
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let (_controller, signal) = ShutdownController::new();
+        // Bound the test so a hang on the bug is surfaced quickly.
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_secs(5), input.run(tx, signal))
+                .await
+                .expect("file input run() should return on its own with exit_after_read");
+        outcome.expect("run() returned an error");
+
+        let mut messages = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let Some(m) = event.message() {
+                messages.push(m.to_string());
+            }
+        }
+        assert_eq!(messages, vec!["a", "b", "c"]);
     }
 
     #[test]
