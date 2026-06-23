@@ -15,6 +15,7 @@ bench/data/
 
 # Marketplace AMI build staging (cross-compiled binaries; rebuilt by build.sh)
 marketplace/packer/build/
+marketplace/packer/manifest.json
 
 # Packaged Helm chart artifact (rebuilt by helm package)
 *.tgz

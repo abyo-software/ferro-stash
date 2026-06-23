@@ -430,23 +430,22 @@ fi
 if [ "${DELIVERY:-0}" = "1" ]; then
   IMG_REF="$ECR_REGISTRY/$ECR_NAMESPACE/$IMAGE_REPO:$IMAGE_TAG"
   HELM_REF="$ECR_REGISTRY/$ECR_NAMESPACE/$HELM_REPO:$CHART_VERSION"
+  # Release notes: per-version override via env, else the v1.0-line baseline.
+  # The baseline stays stable across versions so a missing override never lies
+  # about what shipped; pass `RELEASE_NOTES=...` (or load from a file with
+  # `RELEASE_NOTES="$(cat notes.txt)"`) to surface version-specific changes.
+  DEFAULT_NOTES="FerroStash v1.0 line, container for Amazon EKS (Helm). Rust-native, Logstash-compatible log and event pipeline: a single static binary - no JVM, no separate agent runtime - that starts in milliseconds and holds tens of MB of RAM. Implements about 88 percent of the bundled Logstash 9.x plugins (98 of 111), weighted toward the parsing and filtering hot path. Optional on-disk persistent queue with at-least-once delivery and a dead-letter queue; built-in monitoring API. Compatibility: Logstash config / pipeline compatible across the covered plugin set, not a 100 percent drop-in; a config using an unsupported plugin fails fast at load. Single-node topology; the optional ruby filter is excluded from this build. Metered per pod-hour via RegisterUsage."
+  RELEASE_NOTES="${RELEASE_NOTES:-$DEFAULT_NOTES}"
   echo "DELIVERY: AddDeliveryOptions (image $IMG_REF + helm $HELM_REF, EKS)..."
-  python3 - "$PID" "$IMG_REF" "$HELM_REF" "$IMAGE_TAG" > /tmp/cs-ferrostash-ctr-delivery.json <<'PY'
+  python3 - "$PID" "$IMG_REF" "$HELM_REF" "$IMAGE_TAG" "$RELEASE_NOTES" > /tmp/cs-ferrostash-ctr-delivery.json <<'PY'
 import json, sys
-pid, img, helm, vtitle = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+pid, img, helm, vtitle, release_notes = (
+    sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+)
 details = {
   "Version": {
     "VersionTitle": vtitle,
-    "ReleaseNotes": ("FerroStash v1.0 line, container for Amazon EKS (Helm). Rust-native, "
-      "Logstash-compatible log and event pipeline: a single static binary - no JVM, no "
-      "separate agent runtime - that starts in milliseconds and holds tens of MB of RAM. "
-      "Implements about 88 percent of the bundled Logstash 9.x plugins (98 of 111), weighted "
-      "toward the parsing and filtering hot path. Optional on-disk persistent queue with "
-      "at-least-once delivery and a dead-letter queue; built-in monitoring API. Compatibility: "
-      "Logstash config / pipeline compatible across the covered plugin set, not a 100 percent "
-      "drop-in; a config using an unsupported plugin fails fast at load. Single-node topology; "
-      "the optional ruby filter is excluded from this build. Metered per pod-hour via "
-      "RegisterUsage."),
+    "ReleaseNotes": release_notes,
   },
   "DeliveryOptions": [{
     "DeliveryOptionTitle": "FerroStash on Amazon EKS (Helm)",

@@ -157,35 +157,24 @@ done
 # 3. AddDeliveryOptions (registers the AMI + ingestion role -> triggers AWS scan).
 # ---------------------------------------------------------------------------
 echo "3/3 AddDeliveryOptions (AMI $AMI_ID via $INGEST_ROLE_ARN -> triggers AWS scan)..."
-python3 - "$PID" "$AMI_ID" "$INGEST_ROLE_ARN" "$VERSION_TITLE" "$RECOMMENDED_INSTANCE_TYPE" \
+
+# Release notes: per-version override via env, else the v1.0-line baseline.
+# The baseline stays stable across versions so a missing override never lies
+# about what shipped; pass `RELEASE_NOTES=...` to surface version-specific
+# changes. The baseline is buyer-facing and intentionally omits the
+# production-readiness hedges AWS flagged on the container submission
+# (those stay in README.md per docs/marketplace/LISTING.md group B).
+DEFAULT_AMI_NOTES="FerroStash v1.0 line. Rust-native, Logstash-compatible log and event pipeline. A single static binary - no JVM, no separate agent runtime - that starts in milliseconds and holds tens of MB of RAM. Parses the Logstash pipeline.conf DSL (and an equivalent YAML form) natively and implements about 88 percent of the bundled Logstash 9.x plugins (98 of 111), weighted toward the parsing and filtering hot path: inputs such as beats, file, tcp/udp, http, syslog, kafka, redis, s3, sqs, and jdbc; filters such as grok, dissect, kv, json, mutate, date, geoip, and a native Painless-style script filter; outputs such as Elasticsearch/OpenSearch, kafka, s3, http, and file. Reliability: an optional on-disk persistent queue with at-least-once delivery and a dead-letter queue, plus opt-in fsync durability; a built-in monitoring API. Compatibility: Logstash config / pipeline compatible, not a byte-identical 100 percent drop-in; coverage is plugin-level and a covered plugin may implement a subset of its options; a config using a missing plugin fails fast at load. The supported Marketplace topology is single-node; the optional ruby filter is excluded from the default build. Engineering posture: unsafe_code denied workspace-wide (narrow audited exceptions), clippy clean at -D warnings, unwrap() denied in production code, cargo deny gate, output verified against Logstash 9.4.2 expected fields across 24 parity fixtures. Metered automatically by AWS per instance-hour (no metering code in the AMI)."
+RELEASE_NOTES="${RELEASE_NOTES:-$DEFAULT_AMI_NOTES}"
+
+python3 - "$PID" "$AMI_ID" "$INGEST_ROLE_ARN" "$VERSION_TITLE" "$RECOMMENDED_INSTANCE_TYPE" "$RELEASE_NOTES" \
   > /tmp/cs-ferrostash-ami.json <<'PY'
 import json, sys
-pid, ami, role, vtitle, rec = sys.argv[1:6]
+pid, ami, role, vtitle, rec, release_notes = sys.argv[1:7]
 details = {
   "Version": {
     "VersionTitle": vtitle,
-    "ReleaseNotes": ("FerroStash v1.0 line. Rust-native, Logstash-compatible log "
-      "and event pipeline. A single static binary - no JVM, no separate agent "
-      "runtime - that starts in milliseconds and holds tens of MB of RAM. Parses "
-      "the Logstash pipeline.conf DSL (and an equivalent YAML form) natively and "
-      "implements about 88 percent of the bundled Logstash 9.x plugins (98 of "
-      "111), weighted toward the parsing and filtering hot path: inputs such as "
-      "beats, file, tcp/udp, http, syslog, kafka, redis, s3, sqs, and jdbc; "
-      "filters such as grok, dissect, kv, json, mutate, date, geoip, and a native "
-      "Painless-style script filter; outputs such as Elasticsearch/OpenSearch, "
-      "kafka, s3, http, and file. Reliability: an optional on-disk persistent "
-      "queue with at-least-once delivery and a dead-letter queue, plus opt-in "
-      "fsync durability; a built-in monitoring API. Honest scope: Logstash config "
-      "/ pipeline compatible, NOT a byte-identical 100 percent drop-in; coverage "
-      "is plugin-level and a covered plugin may implement a subset of its options; "
-      "a config using a missing plugin fails fast at load. Single-developer "
-      "project with no public production deployments yet; the supported "
-      "Marketplace topology is single-node; the optional ruby filter is excluded "
-      "from the default build. Engineering: unsafe_code denied workspace-wide "
-      "(narrow audited exceptions), clippy clean at -D warnings, unwrap() denied "
-      "in production code, cargo deny gate, 1,400+ tests with output verified "
-      "against Logstash 9.4.2 expected fields across 24 fixtures. Metered "
-      "automatically by AWS per instance-hour (no metering code in the AMI)."),
+    "ReleaseNotes": release_notes,
   },
   "DeliveryOptions": [{
     "Details": {"AmiDeliveryOptionDetails": {
