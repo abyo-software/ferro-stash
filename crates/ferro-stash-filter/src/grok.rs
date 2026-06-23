@@ -175,10 +175,37 @@ fn compile_grok_pattern(pattern: &str) -> Result<CompiledPattern> {
             message: format!("invalid pattern regex '{regex_str}': {e}"),
         })?;
 
+    // Reconcile `field_names` against every named capture group present in the
+    // compiled regex. Without this, named captures introduced by *expansion*
+    // (compound patterns like `%{COMBINEDAPACHELOG}` whose body already
+    // contains `(?P<clientip>...)`) or by inline named-regex syntax
+    // (`(?<num>\d+)`) are matched by the engine but never read back, so the
+    // filter silently extracts nothing while still reporting success (no
+    // `_grokparsefailure` tag). Walk `regex.capture_names()` — which yields
+    // names in declaration order, with `None` for anonymous groups — and
+    // keep any type hint already attached via the `%{PATTERN:name:type}`
+    // syntax; everything else defaults to `String`.
+    let explicit_types: std::collections::HashMap<&str, FieldType> = field_names
+        .iter()
+        .zip(field_types.iter())
+        .map(|(n, t)| (n.as_str(), t.clone()))
+        .collect();
+    let mut final_names = Vec::new();
+    let mut final_types = Vec::new();
+    for name in regex.capture_names().flatten() {
+        final_names.push(name.to_string());
+        final_types.push(
+            explicit_types
+                .get(name)
+                .cloned()
+                .unwrap_or(FieldType::String),
+        );
+    }
+
     Ok(CompiledPattern {
         regex,
-        field_names,
-        field_types,
+        field_names: final_names,
+        field_types: final_types,
     })
 }
 
@@ -552,6 +579,98 @@ mod tests {
         assert_eq!(
             result[0].get("val"),
             Some(&EventValue::String("notanumber".into()))
+        );
+    }
+
+    // --- regressions for silent no-op on compound + inline named captures ---
+
+    #[tokio::test]
+    async fn test_grok_combinedapachelog_extracts_subfields() {
+        // Without the capture_names() reconciliation in compile_grok_pattern,
+        // %{COMBINEDAPACHELOG} matches but populates ZERO fields and (worse)
+        // does not even tag _grokparsefailure.
+        let settings = serde_json::json!({
+            "match": { "message": "%{COMBINEDAPACHELOG}" }
+        });
+        let filter = GrokFilter::from_config(&settings, None).expect("config");
+        let line = r#"192.168.1.42 - alice [23/Jun/2026:14:50:01 +0900] "GET /index.html HTTP/1.1" 200 1234 "https://example.com/" "Mozilla/5.0""#;
+        let event = Event::new(line);
+        let result = filter.filter(event).await.expect("filter");
+        assert!(!result[0].has_tag("_grokparsefailure"));
+        assert_eq!(
+            result[0].get("clientip"),
+            Some(&EventValue::String("192.168.1.42".into()))
+        );
+        assert_eq!(
+            result[0].get("verb"),
+            Some(&EventValue::String("GET".into()))
+        );
+        assert_eq!(
+            result[0].get("request"),
+            Some(&EventValue::String("/index.html".into()))
+        );
+        assert_eq!(
+            result[0].get("httpversion"),
+            Some(&EventValue::String("1.1".into()))
+        );
+        assert_eq!(
+            result[0].get("response"),
+            Some(&EventValue::String("200".into()))
+        );
+        assert_eq!(
+            result[0].get("bytes"),
+            Some(&EventValue::String("1234".into()))
+        );
+        assert_eq!(
+            result[0].get("referrer"),
+            Some(&EventValue::String("https://example.com/".into()))
+        );
+        assert_eq!(
+            result[0].get("agent"),
+            Some(&EventValue::String("Mozilla/5.0".into()))
+        );
+        assert_eq!(
+            result[0].get("timestamp"),
+            Some(&EventValue::String("23/Jun/2026:14:50:01 +0900".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_grok_inline_named_regex_extracts() {
+        // Inline (?<name>...) named-regex syntax must populate fields too;
+        // before the fix this silently extracted nothing.
+        let settings = serde_json::json!({
+            "match": { "message": r"ABC(?<num>\d+)XYZ" }
+        });
+        let filter = GrokFilter::from_config(&settings, None).expect("config");
+        let event = Event::new("ABC123XYZ");
+        let result = filter.filter(event).await.expect("filter");
+        assert_eq!(
+            result[0].get("num"),
+            Some(&EventValue::String("123".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_grok_commonapachelog_extracts_subfields() {
+        let settings = serde_json::json!({
+            "match": { "message": "%{COMMONAPACHELOG}" }
+        });
+        let filter = GrokFilter::from_config(&settings, None).expect("config");
+        let line = r#"10.0.0.7 - - [23/Jun/2026:14:50:02 +0900] "POST /api/login HTTP/1.1" 401 87"#;
+        let event = Event::new(line);
+        let result = filter.filter(event).await.expect("filter");
+        assert_eq!(
+            result[0].get("clientip"),
+            Some(&EventValue::String("10.0.0.7".into()))
+        );
+        assert_eq!(
+            result[0].get("verb"),
+            Some(&EventValue::String("POST".into()))
+        );
+        assert_eq!(
+            result[0].get("response"),
+            Some(&EventValue::String("401".into()))
         );
     }
 }
