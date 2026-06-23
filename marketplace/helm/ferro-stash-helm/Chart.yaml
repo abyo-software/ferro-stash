@@ -10,9 +10,9 @@ description: FerroStash (AWS Marketplace) -- a Logstash-compatible data pipeline
 type: application
 # Chart version -- this is also the Helm OCI push tag. Bump on chart changes
 # (ECR tags are immutable; a wrong push cannot be overwritten).
-version: 1.0.0
+version: 1.0.1
 # Application version -- tracks the ferro-stash container image tag.
-appVersion: "1.0.0"
+appVersion: "1.0.1"
 maintainers:
   - name: abyo software 合同会社 (abyo software LLC)
     email: aws-support@abyo.net
