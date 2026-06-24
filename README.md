@@ -155,7 +155,9 @@ The JRuby custom-logic figure is corroborated across runs (~143–147k); see
 > **TL;DR — drop an instance class, pay less, ship more events.**
 > FerroStash on `c7g.medium` outperforms OSS Logstash on `c7g.large` by
 > **4.2× throughput at 33 % the cost** (Marketplace software fee
-> included), using **20× less RAM**.
+> included), using **20× less RAM**. With **OpenSearch as the sink** the
+> ratio is **1.7× throughput / 2.5× events-per-dollar / 14× less RAM** on
+> the same smaller instance.
 
 Real bench on freshly-launched AWS EC2 Graviton (us-east-1, 2026-06-24),
 500 k Apache-combined-log lines through `grok COMBINEDAPACHELOG → date →
@@ -191,8 +193,27 @@ host:
 FerroStash pods per node (~50 MB each) widens the dollar gap further;
 Logstash's ~1 GB / pod floor makes that impractical below `c7g.2xlarge`.
 
+#### Output → OpenSearch (the real-life pipeline)
+
+The file-out numbers above isolate the engine. Real Logstash deployments
+mostly write to Elasticsearch / OpenSearch — so we ran the same workload
+with each engine pushing into a shared **OpenSearch 2.18** sink on a
+dedicated `c7g.xlarge` node (sink is fast enough that neither engine is
+sink-starved at this load). Result:
+
+| Client setup | Sink | Throughput *(indexed in OpenSearch)* | RSS | $/hr | Events per $ |
+|---|---|---:|---:|---:|---:|
+| **FerroStash `c7g.medium`** 🏆 | OpenSearch 2.18 | **11 655 ev/s** | **79 MB** | **$0.0481** | **872 M** |
+| Logstash `c7g.large` (`logstash-output-opensearch`) | OpenSearch 2.18 | 6 922 ev/s | 1 098 MB | $0.0723 | 345 M |
+
+`500 000 / 500 000` docs verified via `_count` on every iteration, both
+engines, no drops. Even with OpenSearch as the sink (where the JVM client
+should be at its most competitive), FerroStash on the smaller instance
+still delivers **1.7× more indexed events per second** and **2.5× more
+indexed events per dollar**, at **14× less RAM**.
+
 > Full methodology, per-iteration numbers, `t4g.nano` row, CPU-credit
-> caveats, harness scripts, reproduction guide —
+> caveats, OpenSearch sink details, harness scripts, reproduction guide —
 > **[`docs/aws-benchmarks.md`](docs/aws-benchmarks.md)**.
 
 ## Logstash compatibility scope

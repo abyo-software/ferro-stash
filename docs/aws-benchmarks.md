@@ -21,7 +21,7 @@ section.
 > Cost of producing every number on this page: **~$0.20** of EC2 time.
 
 ```
-Events per dollar-hour (higher is better)
+Events per dollar-hour, file sink (higher is better)
 ─────────────────────────────────────────────────────────────────
 FerroStash c7g.medium 🏆 ████████████████████████████████  3 953 M
 FerroStash t4g.small      ████████████████████              2 420 M
@@ -32,6 +32,12 @@ Logstash   c7g.medium     ███████████                     
 Logstash   c7g.large  ─   █████ (baseline)                     632 M
 Logstash   container  ─   ████                                547 M
 ─────────────────────────────────────────────────────────────────
+
+Events per dollar-hour, OpenSearch sink (real production pipeline)
+─────────────────────────────────────────────────────────────────
+FerroStash c7g.medium 🏆 ████████████████████████          872 M
+Logstash   c7g.large  ─  █████████ (baseline)              345 M
+─────────────────────────────────────────────────────────────────
 ```
 
 ---
@@ -40,11 +46,12 @@ Logstash   container  ─   ████                                547 M
 
 1. [Run details](#1-run-details)
 2. [Workload](#2-workload)
-3. [Results — AMI by instance class](#3-results--ami-by-instance-class)
-4. [Results — cost per throughput](#4-results--cost-per-throughput)
-5. [Results — container](#5-results--container)
-6. [Notes & honest caveats](#6-notes--honest-caveats)
-7. [Reproduce](#7-reproduce)
+3. [Results — AMI by instance class (file sink)](#3-results--ami-by-instance-class-file-sink)
+4. [Results — cost per throughput (file sink)](#4-results--cost-per-throughput-file-sink)
+5. [Results — container (file sink)](#5-results--container-file-sink)
+6. [Results — OpenSearch sink (real-life pipeline)](#6-results--opensearch-sink-real-life-pipeline)
+7. [Notes & honest caveats](#7-notes--honest-caveats)
+8. [Reproduce](#8-reproduce)
 
 ---
 
@@ -88,7 +95,7 @@ The pipeline config is **byte-identical** across both engines.
 
 ---
 
-## 3. Results — AMI by instance class
+## 3. Results — AMI by instance class (file sink)
 
 | Instance | RAM | vCPU | Engine | Median ev/s | Peak RSS | Out / In | Notes |
 |---|---|---|---|---:|---:|---:|---|
@@ -119,7 +126,7 @@ FerroStash is **4.2× to 7.5× faster** on the same hardware and uses
 
 ---
 
-## 4. Results — cost per throughput
+## 4. Results — cost per throughput (file sink)
 
 #### Pricing assumptions (us-east-1, on-demand, June 2026)
 
@@ -156,7 +163,7 @@ it many times over on any non-trivial pipeline.
 
 ---
 
-## 5. Results — container
+## 5. Results — container (file sink)
 
 **Setup.** Same workload, same instance (`c7g.large`), Docker 29 on
 Amazon Linux 2023, `--network none`, 3 GB cgroup memory cap.
@@ -195,7 +202,65 @@ impractical below `c7g.2xlarge`.
 
 ---
 
-## 6. Notes & honest caveats
+## 6. Results — OpenSearch sink (real-life pipeline)
+
+The file-out numbers above isolate the engine. Real Logstash deployments
+mostly write to **Elasticsearch or OpenSearch**, so we ran the same
+workload with each engine pushing into a shared **OpenSearch 2.18**
+single-node cluster on a dedicated `c7g.xlarge` node (4 vCPU / 8 GB,
+3 GB JVM heap, default index settings, security plugin disabled for
+bench-only HTTP). The sink is intentionally larger than either client
+so a single client never starves it; both clients hit the same warm
+OpenSearch in sequence.
+
+The Logstash output plugin used is the **official AWS
+`logstash-output-opensearch`** (Apache-2.0, installed via
+`logstash-plugin install` on the bench host) — this is what real
+"Logstash → OpenSearch" deployments use. FerroStash uses its built-in
+`elasticsearch` output plugin (the wire protocol is shared).
+
+#### Bench setup
+
+| Role | Instance | RAM | vCPU |
+|---|---|---|---|
+| OpenSearch sink | `c7g.xlarge` (Docker `opensearchproject/opensearch:2.18.0`) | 8 GB (3 GB heap) | 4 |
+| **FerroStash client** | `c7g.medium` (Marketplace AMI 1.0.2) | 2 GB | 1 |
+| Logstash client | `c7g.large` (AL2023 + Logstash 9.4.2 + `logstash-output-opensearch`) | 4 GB | 2 |
+
+#### Throughput + integrity (3 iterations each, median bolded)
+
+| Client | Iter 1 | Iter 2 | Iter 3 | Median ev/s | Peak RSS | OS `_count` verify |
+|---|---:|---:|---:|---:|---:|---:|
+| **FerroStash `c7g.medium`** 🏆 | 11 619 | **11 655** | 11 797 | **11 655** |    79 MB | **500 000 / 500 000** ✓ |
+| Logstash `c7g.large`           |  6 987 | **6 922**  |  6 866 |  **6 922** | 1 098 MB | **500 000 / 500 000** ✓ |
+
+#### Cost-throughput (same Marketplace + EC2 pricing as §4)
+
+| Client setup | $/hr | Median ev/s | Events per $1-hour |
+|---|---:|---:|---:|
+| Logstash `c7g.large` *(baseline)* | $0.0723 | 6 922 ev/s |   345 M |
+| **FerroStash `c7g.medium` (Marketplace)** 🏆 | **$0.0481** | **11 655 ev/s** | **872 M** |
+
+**Even with OpenSearch as the sink** — where the JVM client should be at
+its most competitive (mature bulk API, well-tuned connection pool, same
+JVM as the server) — FerroStash on the smaller instance delivers
+**1.7× the indexing throughput, 14× less client RAM, and 2.5× more
+indexed documents per dollar**. Both engines pass the same `_count`
+verification: every event submitted ended up in the index.
+
+#### Why sink-bound numbers are *lower* than file-out
+
+File sink (§3) measured 53 k ev/s for FerroStash `c7g.medium`; here
+it's 12 k. The OpenSearch bulk path adds JSON serialisation,
+HTTP/1.1 overhead, server-side parsing, primary-shard write,
+near-real-time refresh, etc. — none of which the engines control.
+Both engines hit the same ceiling on the same OpenSearch node;
+FerroStash gets closer to it (and stays there at 79 MB vs 1.1 GB
+of client RAM).
+
+---
+
+## 7. Notes & honest caveats
 
 ### A — `t4g.nano` (0.5 GB) is a memory-pressure illustration, not a recommendation
 
@@ -288,7 +353,7 @@ minutes** of EC2 wall-clock across 7 small Graviton instances +
 
 ---
 
-## 7. Reproduce
+## 8. Reproduce
 
 The harness scripts (`bench.sh` per iteration, `container-bench.sh`,
 the synthetic log generator, the SSH orchestrator) live under
