@@ -150,6 +150,49 @@ same input:
 The JRuby custom-logic figure is corroborated across runs (~143–147k); see
 [`bench/`](bench/) for the full methodology and configs.
 
+### Smaller instance, lower bill: AWS Marketplace AMI vs OSS Logstash
+
+Headline numbers from a real AWS Marketplace AMI / container bench against
+Logstash 9.4.2 on identical EC2 Graviton hosts (us-east-1, 2026-06-24,
+500 k Apache combined-log lines through `grok COMBINEDAPACHELOG` →
+`date` → `mutate` → file out, 3 iterations per cell, median reported,
+output verified byte-equivalent down to `@timestamp` / `@version` /
+COMBINEDAPACHELOG sub-fields):
+
+| Configuration | $ / hr *(EC2 + MP software)* | Throughput | Peak RSS | Events / $ |
+|---|---:|---:|---:|---:|
+| OSS Logstash on `c7g.large` (baseline) | $0.0723 | 12.7 k ev/s | 1 058 MB | 632 M |
+| **FerroStash AMI on `c7g.medium`** *(Marketplace)* | **$0.0481** | **52.8 k ev/s** | **49 MB** | **3 953 M** |
+| FerroStash AMI on `t4g.small` *(Marketplace)* | $0.0568 | 38.2 k ev/s | 116 MB | 2 420 M |
+| FerroStash AMI on `c7g.large` *(Marketplace)* | $0.1323 | 61.1 k ev/s | 61 MB | 1 663 M |
+
+- **One step smaller, 4.2× faster, 33 % cheaper** — `FerroStash on c7g.medium`
+  beats `Logstash on c7g.large` on raw throughput while costing less per hour
+  (EC2 + the Marketplace software fee combined).
+- **6.3× more events per dollar** than the OSS Logstash baseline.
+- **20× less RAM** — FerroStash fits where Logstash cannot (the smallest size
+  we can recommend is `t4g.small` / `c7g.medium`; Logstash needs ~1 GB JVM
+  heap to even start).
+
+#### Container — same picture, 6× smaller image
+
+On a `c7g.large` EKS-style node, the published Marketplace container
+(`ferro-stash-container:1.0.2`) vs the official
+`docker.elastic.co/logstash/logstash:9.4.2`:
+
+| Container | Image size | Throughput | Peak RSS | Pod-hour cost *(MP fee + node share)* | Events / $ |
+|---|---:|---:|---:|---:|---:|
+| **FerroStash 1.0.2** | **142 MB** | **54.9 k ev/s** |   51 MB | $0.04 + $0.0723 = $0.1123 | **1 762 M** |
+| Logstash 9.4.2       |    899 MB  | 11.0 k ev/s     | 1 044 MB | $0.0723 (OSS, EC2 only)   | 547 M |
+
+**5.0× throughput, 20× less RAM, 6.3× smaller image, ~3.2× more events per
+dollar** — even with the per-pod Marketplace meter, packing more
+FerroStash pods per node (~50 MB each) widens the gap.
+
+Full methodology, instance-by-instance tables (incl. `t4g.nano`), CPU-credit
+balances, honest limitations, and the harness scripts are in
+**[docs/aws-benchmarks.md](docs/aws-benchmarks.md)**.
+
 ## Logstash compatibility scope
 
 FerroStash targets the **production-common subset** of Logstash, not its
